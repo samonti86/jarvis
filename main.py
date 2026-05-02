@@ -1,7 +1,13 @@
 """Jarvis — top-level entry point.
 
-Milestone 2: wake word → STT → Claude (streaming) → print. No TTS yet.
+Milestone 3: wake word → STT → Claude (streaming) → TTS → speakers.
 One AudioSession owns the mic for the run; wake_word and STT both consume from it.
+
+Echo handling: while TTS plays through the speakers, the mic still captures it.
+session.drain() at the top of each loop iteration discards that buffered echo so
+the wake-word detector starts each turn on fresh, live audio. Tradeoff: a user
+who interrupts during playback ("Hey Jarvis stop") will be drained too — they
+need to wait for the response to finish before re-triggering. Acceptable for v1.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from src.audio import AudioSession
 from src.config import load
 from src.llm import stream_response
 from src.speech_to_text import transcribe_after_wake
+from src.text_to_speech import speak
 from src.wake_word import wait_for_wake_word
 
 
@@ -40,17 +47,24 @@ def main() -> None:
 
             print(f"\n[user, {transcript.language}] {transcript.text}")
             print("[jarvis] ", end="", flush=True)
+            response_chunks: list[str] = []
             try:
                 for chunk in stream_response(
                     api_key=cfg.anthropic_api_key,
                     user_text=transcript.text,
                     model=cfg.claude_model,
                 ):
+                    response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
             except Exception as exc:
                 print(f"\n[main] LLM failed: {exc}")
                 continue
-            print("\n")
+            print()
+
+            full_response = "".join(response_chunks).strip()
+            if full_response:
+                speak(full_response, language=transcript.language)
+            print()
 
 
 if __name__ == "__main__":

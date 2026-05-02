@@ -14,6 +14,7 @@ pyttsx3>=2.90         # fallback: offline Windows SAPI
 # Audio I/O
 sounddevice>=0.4.6
 numpy>=1.24
+miniaudio>=1.59     # MP3 decoder (edge-tts returns mp3) — pure pip, no ffmpeg needed
 
 # System tray icon
 pystray>=0.19.5
