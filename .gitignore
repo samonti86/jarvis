@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model caches (openWakeWord and faster-whisper download models on first run)
+.cache/
+models/
+*.onnx
+*.tflite
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Claude Code local settings (per-user permission overrides)
+.claude/settings.local.json
+
+# Build artifacts
+build/
+dist/
+*.log

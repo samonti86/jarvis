@@ -1,0 +1,23 @@
+# Core LLM
+anthropic>=0.40.0
+
+# Wake-word detection (local, MIT licensed)
+openwakeword>=0.6.0
+
+# Speech-to-text (CTranslate2-backed Whisper, CPU-friendly)
+faster-whisper>=1.0.0
+
+# Text-to-speech
+edge-tts>=6.1.0       # primary: Microsoft online voices
+pyttsx3>=2.90         # fallback: offline Windows SAPI
+
+# Audio I/O
+sounddevice>=0.4.6
+numpy>=1.24
+
+# System tray icon
+pystray>=0.19.5
+Pillow>=10.0          # required by pystray for icon rendering
+
+# Config
+python-dotenv>=1.0.0
