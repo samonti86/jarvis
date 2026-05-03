@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -115,13 +116,30 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
     return audio
 
 
-def transcribe_after_wake(session: AudioSession, model_name: str = "small") -> Transcript:
-    """Record from `session` until silence, then transcribe."""
+def transcribe_after_wake(
+    session: AudioSession,
+    model_name: str = "small",
+    on_speech_ended: "Callable[[], None] | None" = None,
+) -> Transcript:
+    """Record from `session` until silence, then transcribe.
+
+    `on_speech_ended` fires after audio capture ends (silence detected) but
+    before transcription starts — useful for flipping a UI state pill from
+    LISTENING to THINKING right when the user stops talking, instead of
+    letting it linger through Whisper's ~1-2s of work. Only fires if real
+    speech was captured; not on the no-speech-detected timeout path.
+    """
     model = _get_model(model_name)
     audio_i16 = _record_until_silence(session)
 
     if audio_i16.size == 0:
         return Transcript(text="", language="")
+
+    if on_speech_ended is not None:
+        try:
+            on_speech_ended()
+        except Exception:
+            pass  # never let a UI callback break STT
 
     audio_f32 = audio_i16.astype(np.float32) / 32768.0
     segments, info = model.transcribe(

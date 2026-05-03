@@ -1,12 +1,18 @@
 """Jarvis — top-level entry point.
 
-Threading: pystray's icon loop hooks Win32 and must run on the main thread; the
-wake-word→STT→LLM→TTS pipeline runs in a daemon worker that posts state
-transitions to the tray via tray.set_state().
+Threading layout (M8):
+- Main thread:    Tk's mainloop (JarvisConsole window). Tk strongly prefers
+                  the main thread, so this is its home.
+- Worker thread:  pystray icon loop (started by JarvisUI). Win32 lets pystray
+                  run on any thread; we put it here so Tk can have main.
+- Worker thread:  listen_loop (started here in main()). Posts state +
+                  transcript updates to the UI; both UI surfaces are
+                  thread-safe (Tk via .after(), pystray via attribute writes).
 
 Conversation memory: listen_loop owns `history` (alternating user/assistant
 messages). Trimmed in pairs to MAX_PAIRS most recent exchanges. Reset paths:
-(a) tray menu "Reset conversation" — fires reset_event, cleared next loop top
+(a) tray menu "Reset conversation" — fires reset_event, applied at the next
+    wake-word + STT
 (b) idle timeout — IDLE_RESET_SEC since last completed turn → forget
 (c) app restart — history is in-process only, never persisted
 
@@ -33,7 +39,8 @@ from src.config import Config, load
 from src.llm import stream_response
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak_streaming
-from src.tray import JarvisTray, State
+from src.tray import State
+from src.ui import JarvisUI
 from src.wake_word import wait_for_wake_word
 
 
@@ -74,24 +81,30 @@ def _trim_history(history: list[dict]) -> None:
         del history[:2]  # drop oldest user + assistant
 
 
-def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> None:
-    """Daemon worker. Owns conversation history and updates tray state per phase."""
+def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None:
+    """Daemon worker. Owns conversation history and updates UI state per phase."""
     history: list[dict] = []
     last_turn_time = 0.0
 
     with AudioSession(sample_rate=cfg.sample_rate) as session:
-        while not tray.shutdown.is_set():
-            tray.set_state(State.IDLE)
+        while not ui.shutdown.is_set():
+            ui.set_state(State.IDLE)
             session.drain()
 
             wait_for_wake_word(session, threshold=cfg.wake_word_threshold)
-            if tray.shutdown.is_set():
+            if ui.shutdown.is_set():
                 break
 
-            tray.set_state(State.LISTENING)
+            ui.set_state(State.LISTENING)
 
             try:
-                transcript = transcribe_after_wake(session, model_name=cfg.whisper_model)
+                transcript = transcribe_after_wake(
+                    session,
+                    model_name=cfg.whisper_model,
+                    # Flip state the moment audio capture ends — don't let the
+                    # LISTENING pill linger through Whisper's ~1-2s transcription.
+                    on_speech_ended=lambda: ui.set_state(State.THINKING),
+                )
             except Exception as exc:
                 print(f"[main] STT failed: {exc}")
                 continue
@@ -105,16 +118,21 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
             # turn the user is asking right now (not the next one).
             if reset_event.is_set():
                 if history:
-                    print(f"[main] conversation reset (manual; cleared {len(history)} msgs)")
+                    msg = f"[main] conversation reset (manual; cleared {len(history)} msgs)"
+                    print(msg)
+                    ui.add_system_text("conversation reset.")
                 history.clear()
                 reset_event.clear()
             elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
-                print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
+                msg = f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)"
+                print(msg)
+                ui.add_system_text("conversation reset (idle).")
                 history.clear()
 
             print(f"\n[user, {transcript.language}] {transcript.text}")
             print("[jarvis] ", end="", flush=True)
-            tray.set_state(State.THINKING)
+            ui.add_user_text(transcript.text, transcript.language)
+            # State is already THINKING (set by on_speech_ended callback inside STT).
 
             history.append({"role": "user", "content": transcript.text})
 
@@ -138,7 +156,7 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
                 speak_streaming(
                     llm_stream(),
                     language=transcript.language,
-                    on_first_audio=lambda: tray.set_state(State.SPEAKING),
+                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
                 )
             except Exception as exc:
                 history.pop()  # keep history alternating user/assistant cleanly
@@ -154,6 +172,8 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
             history.append({"role": "assistant", "content": full_response})
             _trim_history(history)
             last_turn_time = time.time()
+
+            ui.add_jarvis_text(full_response)
             print()
 
 
@@ -165,7 +185,7 @@ def main() -> None:
         print("ERROR: ANTHROPIC_API_KEY missing. Add it to .env and try again.", file=sys.stderr)
         sys.exit(1)
 
-    print("Jarvis ready. Tray icon active — right-click for menu. Say 'Hey Jarvis' to begin.\n")
+    print("Jarvis ready. Tray icon active — left-click to show window. Say 'Hey Jarvis' to begin.\n")
 
     reset_event = threading.Event()
 
@@ -176,16 +196,13 @@ def main() -> None:
         reset_event.set()
         print("[tray] reset queued — applies to your next 'Hey Jarvis'")
 
-    tray = JarvisTray(
-        on_quit=lambda: print("\nGoodbye."),
-        on_reset=_on_reset,
-        log_path=log_path,
-    )
+    ui = JarvisUI(log_path=log_path)
+    ui.set_on_reset(_on_reset)
 
-    worker = threading.Thread(target=listen_loop, args=(cfg, tray, reset_event), daemon=True)
+    worker = threading.Thread(target=listen_loop, args=(cfg, ui, reset_event), daemon=True)
     worker.start()
 
-    tray.run()  # blocks until Quit
+    ui.run()  # blocks main thread on Tk's mainloop until Quit is clicked
 
 
 if __name__ == "__main__":

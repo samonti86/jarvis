@@ -1,14 +1,18 @@
 """System tray icon with state indicator. SPEAKING state pulses to look alive.
 
-Threading: pystray's Icon.run() owns the main thread (Windows Win32 requirement).
-A daemon animation thread updates icon.icon and icon.title on state changes,
-and pulses brightness while in SPEAKING. State transitions from the listen
-loop arrive via set_state(); we wake the animation thread with an Event so it
-re-renders immediately rather than waiting on its sleep timer.
+Threading: pystray's Icon.run() blocks the calling thread, hooking the Win32
+message pump. On Windows it can run on either the main thread or a worker
+thread; in the M8+ architecture it runs on a worker so the main thread is
+free for Tk's mainloop (which strongly prefers the main thread).
 
-Menu callbacks (Reset, Open log) run on pystray's own thread. They post
-intent via callbacks the caller wires up — we don't touch listen-loop state
-directly from here.
+A daemon animation thread updates icon.icon and icon.title on state changes,
+and pulses brightness while in SPEAKING. State transitions arrive via
+set_state(); we wake the animation thread with an Event so it re-renders
+immediately rather than waiting on its sleep timer.
+
+Menu callbacks (Reset, Open log, Show window, Quit) run on pystray's own
+thread. They post intent via callbacks the caller wires up — we don't touch
+listen-loop or UI state directly from here.
 """
 
 from __future__ import annotations
@@ -48,16 +52,23 @@ class JarvisTray:
         self,
         on_quit: Callable[[], None],
         on_reset: Callable[[], None] | None = None,
+        on_show_window: Callable[[], None] | None = None,
         log_path: Path | None = None,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
-        self.shutdown = threading.Event()
+        # Allow caller to share a shutdown event (UI coordinator) so a single
+        # signal coordinates listen_loop, tray animation, and Tk teardown.
+        self.shutdown = shutdown_event if shutdown_event is not None else threading.Event()
         self._state = State.IDLE
         self._state_changed = threading.Event()
         self._on_quit = on_quit
         self._on_reset = on_reset
+        self._on_show_window = on_show_window
         self._log_path = log_path
 
         menu_items: list[pystray.MenuItem] = []
+        if on_show_window is not None:
+            menu_items.append(pystray.MenuItem("Show window", self._handle_show_window, default=True))
         if on_reset is not None:
             menu_items.append(pystray.MenuItem("Reset conversation", self._handle_reset))
         if log_path is not None:
@@ -84,6 +95,10 @@ class JarvisTray:
     def _handle_reset(self) -> None:
         if self._on_reset is not None:
             self._on_reset()
+
+    def _handle_show_window(self) -> None:
+        if self._on_show_window is not None:
+            self._on_show_window()
 
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():

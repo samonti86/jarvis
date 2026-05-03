@@ -20,5 +20,8 @@ miniaudio>=1.59     # MP3 decoder (edge-tts returns mp3) — pure pip, no ffmpeg
 pystray>=0.19.5
 Pillow>=10.0          # required by pystray for icon rendering
 
+# Console window (dark-themed Tk wrapper)
+customtkinter>=5.2.0
+
 # Config
 python-dotenv>=1.0.0
