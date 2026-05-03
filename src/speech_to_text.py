@@ -15,7 +15,7 @@ from src.audio import AudioSession
 SPEECH_RMS = 1000          # RMS above this = user is speaking
 SILENCE_RMS = 700          # RMS below this = silence (raised to clear C920e AGC floor)
 MAX_PRE_SPEECH_SEC = 5.0   # give up if user never starts speaking
-SILENCE_HANG_SEC = 1.0     # consecutive silence after speech to stop
+SILENCE_HANG_SEC = 1.2     # consecutive silence after speech to stop
 MAX_RECORDING_SEC = 15.0   # absolute cap
 
 

@@ -1,8 +1,11 @@
 """TTS: edge-tts (primary, online) with pyttsx3 (offline) fallback.
 
-Tier A — buffered: synthesizes the full text into a single audio clip and plays
-it through the default speakers, blocking until playback completes. Streaming
-TTS (sentence-by-sentence) is a follow-up if perceived latency is too high.
+Buffered (Tier A): synthesizes the full text into a single audio clip and plays
+it through the default speakers, blocking until playback completes. We tried a
+sentence-streaming variant (Tier B) and reverted: the per-sentence edge-tts
+round trip (~300-500ms each) made multi-sentence replies feel choppier than
+the single-shot Tier A playback, and the perceived first-word win didn't
+materialize in real testing.
 """
 
 from __future__ import annotations
