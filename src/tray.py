@@ -54,6 +54,8 @@ class JarvisTray:
         on_reset: Callable[[], None] | None = None,
         on_show_window: Callable[[], None] | None = None,
         log_path: Path | None = None,
+        autostart_enabled: Callable[[], bool] | None = None,
+        on_autostart_toggle: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
         # Allow caller to share a shutdown event (UI coordinator) so a single
@@ -65,6 +67,8 @@ class JarvisTray:
         self._on_reset = on_reset
         self._on_show_window = on_show_window
         self._log_path = log_path
+        self._autostart_enabled = autostart_enabled
+        self._on_autostart_toggle = on_autostart_toggle
 
         menu_items: list[pystray.MenuItem] = []
         if on_show_window is not None:
@@ -73,6 +77,14 @@ class JarvisTray:
             menu_items.append(pystray.MenuItem("Reset conversation", self._handle_reset))
         if log_path is not None:
             menu_items.append(pystray.MenuItem("Open log", self._handle_open_log))
+        if autostart_enabled is not None and on_autostart_toggle is not None:
+            # Pystray re-evaluates `checked` each time the menu opens, so the
+            # checkmark stays in sync if the shortcut is added/removed externally.
+            menu_items.append(pystray.MenuItem(
+                "Start with Windows",
+                self._handle_toggle_autostart,
+                checked=lambda item: bool(self._autostart_enabled()),
+            ))
         if menu_items:
             menu_items.append(pystray.Menu.SEPARATOR)
         menu_items.append(pystray.MenuItem("Quit", self._handle_quit))
@@ -99,6 +111,10 @@ class JarvisTray:
     def _handle_show_window(self) -> None:
         if self._on_show_window is not None:
             self._on_show_window()
+
+    def _handle_toggle_autostart(self) -> None:
+        if self._on_autostart_toggle is not None:
+            self._on_autostart_toggle()
 
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():

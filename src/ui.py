@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+from src import autostart
 from src.console import JarvisConsole
 from src.tray import JarvisTray, State
 
@@ -93,9 +94,25 @@ class JarvisUI:
             on_reset=self._handle_reset,
             on_show_window=self.console.show,
             log_path=self._log_path,
+            autostart_enabled=autostart.is_enabled,
+            on_autostart_toggle=self._toggle_autostart,
             shutdown_event=self.shutdown,
         )
         self._tray.run()
+
+    def _toggle_autostart(self) -> None:
+        try:
+            if autostart.is_enabled():
+                autostart.disable()
+                print("[autostart] disabled")
+                self.console.add_system_text("autostart disabled.")
+            else:
+                autostart.enable()
+                print(f"[autostart] enabled ({autostart.shortcut_path()})")
+                self.console.add_system_text("autostart enabled.")
+        except Exception as exc:
+            print(f"[autostart] toggle failed: {exc}")
+            self.console.add_system_text(f"autostart toggle failed: {exc}")
 
     def _handle_quit(self) -> None:
         # Fires on tray's thread when user clicks Quit. Coordinate teardown:

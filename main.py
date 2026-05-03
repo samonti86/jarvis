@@ -48,29 +48,65 @@ MAX_PAIRS = 10            # cap conversation at 10 exchanges (20 messages)
 IDLE_RESET_SEC = 600.0    # 10 min of silence → forget conversation
 
 
-def setup_logging() -> Path | None:
-    """Determine the log path for the tray's 'Open log' menu item.
+class _TeeStream:
+    """Forwards writes to multiple underlying streams. Minimal surface — only
+    the methods print() actually touches. We deliberately don't expose
+    .fileno() because libraries that introspect it might try to dup our fd
+    and bypass the tee."""
 
-    Three modes:
-    - jarvis.pyw launcher: already redirected stdout/stderr at import time and
-      set JARVIS_LOG_PATH. We just return the path.
-    - python main.py (console): no redirect, no logfile, return None.
-    - pythonw main.py (rare; no launcher): redirect now and return path. This
-      is a fallback — jarvis.pyw is the supported pythonw entry point because
-      it can redirect *before* import-time prints fire.
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def setup_logging() -> Path:
+    """Always write to %LOCALAPPDATA%\\Jarvis\\jarvis.log. Behavior by mode:
+
+    - jarvis.pyw launcher: redirected stdout/stderr at import time and set
+      JARVIS_LOG_PATH. We respect that and just return the path.
+    - python main.py (console): tee stdout/stderr to both terminal *and* file.
+      You see live output AND the conversation is persisted.
+    - pythonw main.py (rare; no launcher): no console to tee to, redirect only.
     """
-    env_path = os.environ.get("JARVIS_LOG_PATH")
-    if env_path:
-        return Path(env_path)
-    if sys.stdout is not None and sys.stderr is not None:
-        return None
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "jarvis.log"
-    f = open(log_path, "a", encoding="utf-8", buffering=1)
-    sys.stdout = f
-    sys.stderr = f
-    print(f"\n--- Jarvis started {datetime.now().isoformat(timespec='seconds')} ---")
+
+    env_path = os.environ.get("JARVIS_LOG_PATH")
+    if env_path:
+        # jarvis.pyw already opened the file + replaced stdout/stderr.
+        return Path(env_path)
+
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    log_file.write(f"\n--- Jarvis started {datetime.now().isoformat(timespec='seconds')} ---\n")
+    log_file.flush()
+
+    if sys.stdout is None or sys.stderr is None:
+        # pythonw without the launcher — no console to tee to.
+        sys.stdout = log_file
+        sys.stderr = log_file
+    else:
+        # Console mode — tee both. Live terminal output + persistent file.
+        sys.stdout = _TeeStream(sys.stdout, log_file)
+        sys.stderr = _TeeStream(sys.stderr, log_file)
+
     return log_path
 
 
