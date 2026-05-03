@@ -32,7 +32,7 @@ from src.audio import AudioSession
 from src.config import Config, load
 from src.llm import stream_response
 from src.speech_to_text import transcribe_after_wake
-from src.text_to_speech import speak
+from src.text_to_speech import speak_streaming
 from src.tray import JarvisTray, State
 from src.wake_word import wait_for_wake_word
 
@@ -118,8 +118,13 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
 
             history.append({"role": "user", "content": transcript.text})
 
+            # Tee the LLM stream into both stdout (for visibility) and a buffer
+            # (for assembling the assistant message into history). speak_streaming
+            # consumes the generator; sentences are synthed and played as the LLM
+            # produces them — first word audible without waiting for the full reply.
             response_chunks: list[str] = []
-            try:
+
+            def llm_stream():
                 for chunk in stream_response(
                     api_key=cfg.anthropic_api_key,
                     messages=history,
@@ -127,9 +132,17 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
+                    yield chunk
+
+            try:
+                speak_streaming(
+                    llm_stream(),
+                    language=transcript.language,
+                    on_first_audio=lambda: tray.set_state(State.SPEAKING),
+                )
             except Exception as exc:
-                history.pop()  # roll back so history stays in clean user/assistant pairs
-                print(f"\n[main] LLM failed: {exc}")
+                history.pop()  # keep history alternating user/assistant cleanly
+                print(f"\n[main] LLM/TTS failed: {exc}")
                 continue
             print()
 
@@ -141,9 +154,6 @@ def listen_loop(cfg: Config, tray: JarvisTray, reset_event: threading.Event) -> 
             history.append({"role": "assistant", "content": full_response})
             _trim_history(history)
             last_turn_time = time.time()
-
-            tray.set_state(State.SPEAKING)
-            speak(full_response, language=transcript.language)
             print()
 
 

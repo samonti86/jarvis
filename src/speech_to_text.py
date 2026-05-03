@@ -11,9 +11,12 @@ from faster_whisper import WhisperModel
 from src.audio import AudioSession
 
 # Endpointing thresholds (int16 RMS scale).
-# Hysteresis: SPEECH_RMS > SILENCE_RMS prevents flapping near a single threshold.
+# Hysteresis: SPEECH_RMS must exceed the adaptive silence threshold so the
+# detector doesn't flap. The silence threshold is set per-turn from observed
+# pre-speech ambient — same idea as a noise gate's auto-threshold or AGC.
 SPEECH_RMS = 1000          # RMS above this = user is speaking
-SILENCE_RMS = 700          # RMS below this = silence (raised to clear C920e AGC floor)
+SILENCE_FLOOR = 700        # silence threshold never goes below this (clears C920e AGC floor)
+SILENCE_MARGIN = 1.3       # silence threshold = ambient_max * this
 MAX_PRE_SPEECH_SEC = 5.0   # give up if user never starts speaking
 SILENCE_HANG_SEC = 1.2     # consecutive silence after speech to stop
 MAX_RECORDING_SEC = 15.0   # absolute cap
@@ -42,7 +45,18 @@ def _rms(chunk_i16: np.ndarray) -> float:
 
 
 def _record_until_silence(session: AudioSession) -> np.ndarray:
-    """State-machine VAD: wait for speech start, then stop on sustained silence."""
+    """State-machine VAD: wait for speech start, then stop on sustained silence.
+
+    Silence threshold is computed adaptively from pre-speech ambient noise:
+    track the loudest pre-speech chunk (excluding any chunk loud enough to be
+    speech itself), and on speech-start lock the threshold for this turn at
+    max(SILENCE_FLOOR, ambient_max * SILENCE_MARGIN). Auto-tunes to today's
+    environment — A/C, fan noise, distant TV, mic AGC drift, etc.
+
+    Edge case: if the user starts talking immediately after the wake word with
+    no quiet preamble, ambient_max stays near 0 and we fall back to
+    SILENCE_FLOOR — i.e., the same behavior as the old static threshold.
+    """
     chunks: list[np.ndarray] = []
     chunks_per_sec = session.sample_rate / session.chunk_samples
     max_chunks = int(MAX_RECORDING_SEC * chunks_per_sec)
@@ -51,6 +65,8 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
 
     speaking = False
     silence_chunks = 0
+    pre_speech_max_rms = 0.0
+    adaptive_silence_rms = SILENCE_FLOOR  # gets locked in when speech starts
 
     print("[stt] listening for question...", file=sys.stderr)
     while len(chunks) < max_chunks:
@@ -59,14 +75,26 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
         level = _rms(chunk)
 
         if not speaking:
+            # Only count chunks that aren't speech themselves — otherwise a
+            # zero-pause start ("Hey Jarvis tell me...") contaminates ambient.
+            if level < SPEECH_RMS:
+                pre_speech_max_rms = max(pre_speech_max_rms, level)
             if level >= SPEECH_RMS:
                 speaking = True
-                print(f"[stt] speech started (rms={level:.0f})", file=sys.stderr)
+                adaptive_silence_rms = max(
+                    SILENCE_FLOOR, int(pre_speech_max_rms * SILENCE_MARGIN)
+                )
+                print(
+                    f"[stt] speech started (rms={level:.0f}; "
+                    f"ambient_max={pre_speech_max_rms:.0f}, "
+                    f"silence_threshold={adaptive_silence_rms})",
+                    file=sys.stderr,
+                )
             elif len(chunks) >= max_pre_speech_chunks:
                 print("[stt] no speech detected within window", file=sys.stderr)
                 return np.array([], dtype=np.int16)
         else:
-            if level < SILENCE_RMS:
+            if level < adaptive_silence_rms:
                 silence_chunks += 1
                 if silence_chunks >= silence_hang_chunks:
                     break
@@ -79,8 +107,8 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
         recent_rms = _rms(np.concatenate(chunks[-int(chunks_per_sec):]))
         print(
             f"[stt] hit max duration; recent ambient rms={recent_rms:.0f} "
-            f"(silence threshold={SILENCE_RMS}). "
-            "Raise SILENCE_RMS in src/speech_to_text.py if this happens often.",
+            f"(adaptive silence threshold was {adaptive_silence_rms}). "
+            "Environment got louder mid-question, or user kept talking past 15s cap.",
             file=sys.stderr,
         )
     print(f"[stt] captured {duration:.1f}s of audio", file=sys.stderr)
