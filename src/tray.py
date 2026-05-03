@@ -5,14 +5,20 @@ A daemon animation thread updates icon.icon and icon.title on state changes,
 and pulses brightness while in SPEAKING. State transitions from the listen
 loop arrive via set_state(); we wake the animation thread with an Event so it
 re-renders immediately rather than waiting on its sleep timer.
+
+Menu callbacks (Reset, Open log) run on pystray's own thread. They post
+intent via callbacks the caller wires up — we don't touch listen-loop state
+directly from here.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
 import pystray
@@ -38,19 +44,33 @@ def _make_circle(rgb: tuple[int, int, int], brightness: float = 1.0, size: int =
 class JarvisTray:
     """Tray icon manager. Call set_state() from any thread; run() blocks the caller."""
 
-    def __init__(self, on_quit: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        on_quit: Callable[[], None],
+        on_reset: Callable[[], None] | None = None,
+        log_path: Path | None = None,
+    ) -> None:
         self.shutdown = threading.Event()
         self._state = State.IDLE
         self._state_changed = threading.Event()
         self._on_quit = on_quit
+        self._on_reset = on_reset
+        self._log_path = log_path
+
+        menu_items: list[pystray.MenuItem] = []
+        if on_reset is not None:
+            menu_items.append(pystray.MenuItem("Reset conversation", self._handle_reset))
+        if log_path is not None:
+            menu_items.append(pystray.MenuItem("Open log", self._handle_open_log))
+        if menu_items:
+            menu_items.append(pystray.Menu.SEPARATOR)
+        menu_items.append(pystray.MenuItem("Quit", self._handle_quit))
 
         self.icon = pystray.Icon(
             "jarvis",
             _make_circle(State.IDLE.value),
             "Jarvis (idle)",
-            menu=pystray.Menu(
-                pystray.MenuItem("Quit", self._handle_quit),
-            ),
+            menu=pystray.Menu(*menu_items),
         )
 
     def _handle_quit(self) -> None:
@@ -60,6 +80,14 @@ class JarvisTray:
             self._on_quit()
         finally:
             self.icon.stop()
+
+    def _handle_reset(self) -> None:
+        if self._on_reset is not None:
+            self._on_reset()
+
+    def _handle_open_log(self) -> None:
+        if self._log_path is not None and self._log_path.exists():
+            os.startfile(str(self._log_path))  # type: ignore[attr-defined]
 
     def set_state(self, state: State) -> None:
         self._state = state

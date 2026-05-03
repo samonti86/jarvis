@@ -3,8 +3,11 @@
 Caching note: Sonnet 4.6's minimum cacheable prefix is 2048 tokens. The current
 JARVIS_SYSTEM_PROMPT is well below that, so cache_control is currently a no-op
 (cache_creation/read tokens will be 0). The wiring is correct — caching will
-activate automatically once the system prompt grows past the threshold (e.g.,
-when conversation memory or tool descriptions are added in later milestones).
+activate automatically once the system prompt grows past the threshold.
+
+Multi-turn: caller passes the full history (alternating user/assistant) plus
+the new user message as the last entry. The generator yields text chunks; the
+caller is responsible for appending the assistant response to the history.
 """
 
 from __future__ import annotations
@@ -33,6 +36,11 @@ Language:
 - When replying in Spanish, use the formal usted form, and Mexican conventions (not Castilian).
 - Match the cultural register: dry-witty British butler in English; formal, courteous gentleman in Spanish.
 
+Conversation:
+- You may receive prior turns of the current conversation. Treat them as ongoing context —
+  the user can reference earlier exchanges with pronouns or follow-ups ("and what about Madrid?").
+- Stay consistent with what you said before unless corrected.
+
 Knowledge limits:
 - You do not have live data (current weather, time, news) unless explicitly told.
 - If asked, briefly say you don't have access, and offer the closest thing you can do."""
@@ -40,10 +48,11 @@ Knowledge limits:
 
 def stream_response(
     api_key: str,
-    user_text: str,
+    messages: list[dict],
     model: str = "claude-sonnet-4-6",
 ) -> Iterator[str]:
-    """Stream Claude's response to a transcribed user question. Yields text chunks."""
+    """Stream Claude's response. `messages` must be the full alternating history
+    ending with a user message. Yields text chunks; caller assembles + appends to history."""
     client = anthropic.Anthropic(api_key=api_key)
 
     with client.messages.stream(
@@ -56,7 +65,7 @@ def stream_response(
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        messages=[{"role": "user", "content": user_text}],
+        messages=messages,
     ) as stream:
         for text in stream.text_stream:
             yield text
@@ -65,6 +74,7 @@ def stream_response(
         u = final.usage
         print(
             f"[llm] tokens: input={u.input_tokens} output={u.output_tokens} "
-            f"cache_read={u.cache_read_input_tokens} cache_create={u.cache_creation_input_tokens}",
+            f"cache_read={u.cache_read_input_tokens} cache_create={u.cache_creation_input_tokens} "
+            f"history_msgs={len(messages)}",
             file=sys.stderr,
         )
