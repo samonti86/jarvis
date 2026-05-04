@@ -86,15 +86,19 @@ def setup_logging() -> Path:
       You see live output AND the conversation is persisted.
     - pythonw main.py (rare; no launcher): no console to tee to, redirect only.
     """
+    from src.logfile import rotate_if_needed
+
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "jarvis.log"
 
     env_path = os.environ.get("JARVIS_LOG_PATH")
     if env_path:
-        # jarvis.pyw already opened the file + replaced stdout/stderr.
+        # jarvis.pyw already rotated + opened the file + replaced stdout/stderr.
         return Path(env_path)
 
+    # Rotate BEFORE opening — Windows can't rename a file with an open handle.
+    rotate_if_needed(log_path)
     log_file = open(log_path, "a", encoding="utf-8", buffering=1)
     log_file.write(f"\n--- Jarvis started {datetime.now().isoformat(timespec='seconds')} ---\n")
     log_file.flush()

@@ -48,9 +48,15 @@ def _ensure_correct_interpreter() -> None:
 
 
 def _redirect_to_logfile() -> Path:
+    # Local import: happens after _ensure_correct_interpreter, so we're on
+    # whichever Python can resolve src/. logfile.py is stdlib-only by design,
+    # so this works on either system or venv pythonw.
+    from src.logfile import rotate_if_needed
+
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "jarvis.log"
+    rotate_if_needed(log_path)  # MUST happen before opening — Windows can't rename open files
     f = open(log_path, "a", encoding="utf-8", buffering=1)  # line-buffered
     sys.stdout = f
     sys.stderr = f
