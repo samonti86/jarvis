@@ -1,5 +1,6 @@
 # Core LLM
 anthropic>=0.40.0
+httpx>=0.27           # already pulled by anthropic, but we use it directly in src/sports.py
 
 # Wake-word detection (local, MIT licensed)
 openwakeword>=0.6.0

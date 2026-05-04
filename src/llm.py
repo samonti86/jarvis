@@ -1,9 +1,25 @@
-"""Anthropic SDK client: streaming Claude responses with prompt caching on the system prompt.
+"""Anthropic SDK client: streaming Claude with prompt caching, web_search,
+and client-side tools (get_sports_info as of M13).
+
+Two flavors of tool use coexist here:
+
+  Server-side (web_search): Anthropic runs it. We just declare the tool and
+  the model calls it transparently. The text stream pauses 1-2s, then
+  resumes — text_stream handles this for us. No client involvement.
+
+  Client-side (get_sports_info): the model emits a `tool_use` block, the
+  stream stops with `stop_reason="tool_use"`, and we have to:
+    1. execute the tool locally
+    2. append the assistant turn (full content) + a user turn (tool_result)
+    3. restart the stream so Claude can continue with the data
+  This is the "agentic loop" pattern and is the standard Anthropic SDK shape
+  for any client-side tool. Once we have it, adding more client-side tools
+  (Plex, Home Assistant, etc.) is a one-line dispatch addition.
 
 Caching note: Sonnet 4.6's minimum cacheable prefix is 2048 tokens. The
 JARVIS_SYSTEM_PROMPT alone is well below that, but as recent-conversation
 summaries get injected (M10), the prompt grows toward the threshold and
-caching will start to activate automatically.
+caching activates automatically.
 
 Multi-turn: caller passes the full history (alternating user/assistant) plus
 the new user message as the last entry. The generator yields text chunks; the
@@ -13,14 +29,6 @@ Long-term memory: caller can pass `summaries` (a list of SummaryRecord from
 src.memory). They get formatted with relative timestamps and appended to the
 system prompt under a "Recent conversations" section, giving Jarvis context
 about what was discussed in earlier (now-sealed) sessions.
-
-Web search (M12): Anthropic's server-side web_search tool is enabled. Claude
-decides when to use it (auto tool_choice). During a search the text stream
-pauses for 1-2s, then resumes with the answer — text_stream handles this
-transparently. The server-side sampling loop has a 10-iteration cap; if hit,
-stop_reason is "pause_turn" and we'd need a manual continuation flow. Voice
-queries that exhaust 10 search iterations are extremely unlikely; we detect
-and log this case but don't auto-resume.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ from typing import Iterator
 import anthropic
 
 from src.memory import SummaryRecord, format_summaries_for_prompt
+from src.sports import SPORTS_TOOL, execute_sports_tool
 
 
 JARVIS_SYSTEM_PROMPT = """You are Jarvis, a personal voice assistant in the spirit of Tony Stark's J.A.R.V.I.S.
@@ -63,39 +72,48 @@ Memory of past sessions:
   ("what did we talk about earlier?", "remember that thing about Docker?") — never as
   a source of truth for time-sensitive facts.
 - If a past summary mentions a fact that can change — sports rosters, scores, weather,
-  prices, news, "current" anything — treat it as STALE and use web_search to get the
-  fresh answer. Do NOT parrot the old summary back. The user asking the question again
-  is itself a signal they want a current answer, not a memory recall.
+  prices, news, "current" anything — treat it as STALE and fetch the fresh answer with
+  the appropriate tool. Do NOT parrot the old summary back. The user asking the question
+  again is itself a signal they want a current answer, not a memory recall.
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
 
-Live information (web_search tool):
-- You have a web_search tool. Use it for time-sensitive questions you can't answer
-  reliably from training data: current events, sports scores and rosters, weather,
-  news, market prices, recent releases, "who is the current X", anything that
-  changes over time.
-- ALWAYS prefer web_search over memory or training data for these categories. Even if
-  a similar answer appears in your "Recent conversations" memory or feels familiar
-  from training, search again — the world has likely moved on.
-- Do NOT search for things that don't change: math, geography, definitions,
+Live information (you have two tools — pick the right one):
+1. get_sports_info — for live scores, schedules, and recent results in major leagues
+   (NFL, NBA, MLB, NHL, MLS, EPL, Champions League, NCAA football and basketball, WNBA,
+   UFC, F1, PGA, ATP, WTA). ALWAYS prefer this over web_search for any sports query —
+   it returns structured live data and is far more reliable than scraped web pages.
+2. web_search — for everything else time-sensitive: news, weather, market prices,
+   recent releases, "who is the current X", anything that changes over time.
+
+Tool-use rules:
+- For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
+  training data. Even if a similar answer is in your "Recent conversations" memory or
+  feels familiar from training, fetch again — the world has likely moved on.
+- Do NOT call tools for things that don't change: math, geography, definitions,
   established historical facts, well-known general knowledge. Answer those directly.
-- Don't pre-announce ("Let me check…") — just search when needed and answer.
-- This is voice. After searching, summarize in one or two sentences. Don't read
-  citations, URLs, or source names aloud. If sources disagree, give the most
-  likely answer and note that reports vary.
+- Don't pre-announce ("Let me check…") — just call the tool when needed and answer.
+- After fetching, summarize in one or two sentences for voice. Don't read raw lists,
+  URLs, or citations aloud. For multi-game results, mention the user's team if they
+  named one, or a notable highlight; don't recite every game.
 
 Knowledge limits:
-- For questions outside the scope of web search (your own internal state, future
+- For questions outside the scope of your tools (your own internal state, future
   events, opinions you don't have), say so plainly rather than fabricating."""
 
 
-# Anthropic's server-side web search tool. The "_20260209" version includes
-# dynamic filtering — Claude writes code to filter results before they hit
-# the context window. Supported on Sonnet 4.6, Opus 4.6, Opus 4.7.
+# Anthropic's server-side web search tool. Server-side = Anthropic runs it,
+# we just declare it. The "_20260209" version includes dynamic filtering.
+# Supported on Sonnet 4.6, Opus 4.6, Opus 4.7.
 WEB_SEARCH_TOOL = {
     "type": "web_search_20260209",
     "name": "web_search",
 }
+
+
+# Cap on agentic-loop iterations. In practice voice queries finish in 1-2
+# tool calls; 5 is generous safety. If we ever hit this we log it.
+_MAX_LOOP_ITERATIONS = 5
 
 
 def _format_today() -> str:
@@ -122,54 +140,142 @@ def build_system_prompt(summaries: list[SummaryRecord] | None = None) -> str:
     )
 
 
+def _execute_client_tool(name: str, tool_input: dict) -> str:
+    """Dispatch a client-side tool call. Returns a string for Claude to consume.
+    Errors become readable strings — never raises."""
+    try:
+        if name == "get_sports_info":
+            return execute_sports_tool(tool_input)
+        return f"Unknown tool: {name}"
+    except Exception as exc:
+        # Defensive — execute_sports_tool already swallows its own errors,
+        # but a future tool might not. Don't let a tool exception kill the turn.
+        print(f"[llm] tool '{name}' raised: {exc}", file=sys.stderr)
+        return f"Tool error: {exc}"
+
+
 def stream_response(
     api_key: str,
     messages: list[dict],
     model: str = "claude-sonnet-4-6",
     summaries: list[SummaryRecord] | None = None,
 ) -> Iterator[str]:
-    """Stream Claude's response. `messages` must be the full alternating history
-    ending with a user message. `summaries` (optional) prepends recent-session
-    context. Yields text chunks; caller assembles + appends to history."""
+    """Stream Claude's response, handling client-side tool use transparently.
+
+    Yields text chunks suitable for direct TTS feeding. The caller sees a single
+    continuous stream of text even when one or more tool calls happen in the
+    middle — each tool round-trip is invisible from the caller's perspective.
+
+    `messages` must be the full alternating history ending with a user message.
+    `summaries` (optional) prepends recent-session context to the system prompt.
+    """
     client = anthropic.Anthropic(api_key=api_key)
     system_text = build_system_prompt(summaries)
+    system_param = [
+        {
+            "type": "text",
+            "text": system_text,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    tools = [WEB_SEARCH_TOOL, SPORTS_TOOL]
 
-    with client.messages.stream(
-        model=model,
-        max_tokens=1024,
-        system=[
-            {
-                "type": "text",
-                "text": system_text,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=messages,
-        tools=[WEB_SEARCH_TOOL],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
+    # Mutable working copy — we append assistant + tool_result turns as the
+    # agentic loop runs. The caller's `messages` list is left untouched.
+    working = list(messages)
 
-        final = stream.get_final_message()
+    # Telemetry accumulators across all iterations.
+    web_searched = False
+    sports_called = False
+    paused = False
+    total_input = total_output = total_cache_read = total_cache_create = 0
+    iterations = 0
+
+    while iterations < _MAX_LOOP_ITERATIONS:
+        iterations += 1
+
+        with client.messages.stream(
+            model=model,
+            max_tokens=1024,
+            system=system_param,
+            messages=working,
+            tools=tools,
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+            final = stream.get_final_message()
+
+        # Accumulate token usage. cache_* fields are None on uncached turns.
         u = final.usage
-        # Did Claude actually invoke web_search this turn? (For telemetry.)
-        web_searched = any(
-            getattr(b, "type", None) == "server_tool_use"
-            and getattr(b, "name", None) == "web_search"
-            for b in final.content
-        )
-        # The server tool loop has a 10-iteration cap. If hit, stop_reason is
-        # "pause_turn" and the response is incomplete — we'd need to re-send
-        # to continue. Voice queries that loop 10x are unlikely; just log it
-        # so we notice if it ever happens in real use.
-        paused = final.stop_reason == "pause_turn"
-        extra = " web_search=yes" if web_searched else ""
-        if paused:
-            extra += " PAUSED_TURN(10-iter cap)"
+        total_input += u.input_tokens
+        total_output += u.output_tokens
+        total_cache_read += u.cache_read_input_tokens or 0
+        total_cache_create += u.cache_creation_input_tokens or 0
+
+        # Track server-side tool use (web_search) for telemetry only — the SDK
+        # has already executed it and the text stream above included Claude's
+        # post-search text.
+        for block in final.content:
+            if (
+                getattr(block, "type", None) == "server_tool_use"
+                and getattr(block, "name", None) == "web_search"
+            ):
+                web_searched = True
+
+        # Server-side loop hit its 10-iteration cap. Rare in voice; we log
+        # and bail rather than try to manually resume.
+        if final.stop_reason == "pause_turn":
+            paused = True
+            break
+
+        # Normal end of turn — Claude is done responding.
+        if final.stop_reason != "tool_use":
+            break
+
+        # Client-side tool use. Append the assistant turn (full content,
+        # including any text + tool_use blocks Claude emitted) so the SDK
+        # has the canonical record. Then run each tool and feed results back.
+        working.append({"role": "assistant", "content": final.content})
+
+        tool_results = []
+        for block in final.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            name = block.name
+            if name == "get_sports_info":
+                sports_called = True
+            result_text = _execute_client_tool(name, block.input or {})
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text,
+            })
+
+        working.append({"role": "user", "content": tool_results})
+        # Loop continues — next stream iteration sees the tool result and
+        # produces Claude's final answer (or another tool call).
+    else:
+        # while-else: ran out of iterations without hitting break. Log it so
+        # we notice if it ever happens in real use.
         print(
-            f"[llm] tokens: input={u.input_tokens} output={u.output_tokens} "
-            f"cache_read={u.cache_read_input_tokens} cache_create={u.cache_creation_input_tokens} "
-            f"history_msgs={len(messages)} summaries={len(summaries) if summaries else 0}"
-            f"{extra}",
+            f"[llm] hit MAX_LOOP_ITERATIONS={_MAX_LOOP_ITERATIONS} agentic cap",
             file=sys.stderr,
         )
+
+    extra = ""
+    if web_searched:
+        extra += " web_search=yes"
+    if sports_called:
+        extra += " sports_tool=yes"
+    if paused:
+        extra += " PAUSED_TURN(10-iter cap)"
+    if iterations > 1:
+        extra += f" iters={iterations}"
+
+    print(
+        f"[llm] tokens: input={total_input} output={total_output} "
+        f"cache_read={total_cache_read} cache_create={total_cache_create} "
+        f"history_msgs={len(messages)} summaries={len(summaries) if summaries else 0}"
+        f"{extra}",
+        file=sys.stderr,
+    )
