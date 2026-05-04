@@ -37,6 +37,7 @@ from pathlib import Path
 from src.audio import AudioSession
 from src.config import Config, load
 from src.llm import stream_response
+from src.memory import MemoryStore, SummaryRecord, summarize_session
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak_streaming
 from src.tray import State
@@ -117,100 +118,174 @@ def _trim_history(history: list[dict]) -> None:
         del history[:2]  # drop oldest user + assistant
 
 
+def _seal_session(
+    memory: MemoryStore,
+    history: list[dict],
+    language: str,
+    started_at: str,
+    cfg: Config,
+) -> None:
+    """Best-effort: ask Haiku for a summary of the just-ended conversation
+    and append it to summaries.jsonl. Idempotent — caller clears history
+    after this returns. Never raises; logs and moves on if summarization fails."""
+    if not history:
+        return
+    summary_text = summarize_session(
+        history,
+        language=language,
+        api_key=cfg.anthropic_api_key,
+        model=cfg.summary_model,
+    )
+    if not summary_text:
+        return  # already logged by summarize_session
+    memory.append_summary(SummaryRecord(
+        started_at=started_at,
+        ended_at=datetime.now().isoformat(timespec="seconds"),
+        language=language,
+        summary=summary_text,
+    ))
+    print(f"[memory] sealed session: {summary_text}", file=sys.stderr)
+
+
 def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None:
-    """Daemon worker. Owns conversation history and updates UI state per phase."""
+    """Daemon worker. Owns conversation history, persists turns + seals
+    sessions on every memory boundary (manual reset / idle / app quit)."""
     history: list[dict] = []
     last_turn_time = 0.0
 
-    with AudioSession(sample_rate=cfg.sample_rate) as session:
-        while not ui.shutdown.is_set():
-            ui.set_state(State.IDLE)
-            session.drain()
+    memory = MemoryStore()
+    memory.prune(retain_raw_days=cfg.retain_raw_days)
+    summaries = memory.recent_summaries(cfg.memory_recall_count)
+    print(f"[memory] loaded {len(summaries)} prior session summaries", file=sys.stderr)
 
-            wait_for_wake_word(session, threshold=cfg.wake_word_threshold)
-            if ui.shutdown.is_set():
-                break
+    # Tracks the language and start-time of the *currently active* session
+    # (i.e., the one being built up in `history`). Reset on every seal.
+    session_language = "en"
+    session_started_at = datetime.now().isoformat(timespec="seconds")
 
-            ui.set_state(State.LISTENING)
+    def seal_and_refresh() -> None:
+        """Seal the active session (if any) and reload summaries for the next one."""
+        nonlocal summaries, session_started_at
+        _seal_session(memory, history, session_language, session_started_at, cfg)
+        history.clear()
+        summaries = memory.recent_summaries(cfg.memory_recall_count)
+        session_started_at = datetime.now().isoformat(timespec="seconds")
 
-            try:
-                transcript = transcribe_after_wake(
+    try:
+        with AudioSession(sample_rate=cfg.sample_rate) as session:
+            while not ui.shutdown.is_set():
+                ui.set_state(State.IDLE)
+                session.drain()
+
+                wait_for_wake_word(
                     session,
-                    model_name=cfg.whisper_model,
-                    # Flip state the moment audio capture ends — don't let the
-                    # LISTENING pill linger through Whisper's ~1-2s transcription.
-                    on_speech_ended=lambda: ui.set_state(State.THINKING),
+                    threshold=cfg.wake_word_threshold,
+                    shutdown_event=ui.shutdown,
+                    reset_event=reset_event,
                 )
-            except Exception as exc:
-                print(f"[main] STT failed: {exc}")
-                continue
+                if ui.shutdown.is_set():
+                    break
 
-            if not transcript.text:
-                print("[main] (no speech captured)\n")
-                continue
+                # Reset clicked while we were idle-listening. Seal+clear now,
+                # without forcing the user to ask another question first.
+                if reset_event.is_set():
+                    if history:
+                        print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
+                        ui.add_system_text("conversation reset.")
+                    else:
+                        print("[main] reset clicked, but no active conversation to seal")
+                    seal_and_refresh()
+                    reset_event.clear()
+                    continue  # back to top — listen for next wake
 
-            # Reset checks happen here — late enough to catch a click made any time
-            # during wait_for_wake_word *or* STT, so the click always applies to the
-            # turn the user is asking right now (not the next one).
-            if reset_event.is_set():
-                if history:
-                    msg = f"[main] conversation reset (manual; cleared {len(history)} msgs)"
-                    print(msg)
-                    ui.add_system_text("conversation reset.")
-                history.clear()
-                reset_event.clear()
-            elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
-                msg = f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)"
-                print(msg)
-                ui.add_system_text("conversation reset (idle).")
-                history.clear()
+                ui.set_state(State.LISTENING)
 
-            print(f"\n[user, {transcript.language}] {transcript.text}")
-            print("[jarvis] ", end="", flush=True)
-            ui.add_user_text(transcript.text, transcript.language)
-            # State is already THINKING (set by on_speech_ended callback inside STT).
+                try:
+                    transcript = transcribe_after_wake(
+                        session,
+                        model_name=cfg.whisper_model,
+                        # Flip state the moment audio capture ends — don't let the
+                        # LISTENING pill linger through Whisper's ~1-2s transcription.
+                        on_speech_ended=lambda: ui.set_state(State.THINKING),
+                    )
+                except Exception as exc:
+                    print(f"[main] STT failed: {exc}")
+                    continue
 
-            history.append({"role": "user", "content": transcript.text})
+                if not transcript.text:
+                    print("[main] (no speech captured)\n")
+                    continue
 
-            # Tee the LLM stream into both stdout (for visibility) and a buffer
-            # (for assembling the assistant message into history). speak_streaming
-            # consumes the generator; sentences are synthed and played as the LLM
-            # produces them — first word audible without waiting for the full reply.
-            response_chunks: list[str] = []
+                # Reset checks happen here — late enough to catch a click made any time
+                # during wait_for_wake_word *or* STT, so the click always applies to the
+                # turn the user is asking right now (not the next one).
+                if reset_event.is_set():
+                    if history:
+                        print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
+                        ui.add_system_text("conversation reset.")
+                    seal_and_refresh()
+                    reset_event.clear()
+                elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
+                    print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
+                    ui.add_system_text("conversation reset (idle).")
+                    seal_and_refresh()
 
-            def llm_stream():
-                for chunk in stream_response(
-                    api_key=cfg.anthropic_api_key,
-                    messages=history,
-                    model=cfg.claude_model,
-                ):
-                    response_chunks.append(chunk)
-                    print(chunk, end="", flush=True)
-                    yield chunk
+                # First turn of a (possibly new) session — capture its language.
+                if not history:
+                    session_language = transcript.language or "en"
+                    session_started_at = datetime.now().isoformat(timespec="seconds")
 
-            try:
-                speak_streaming(
-                    llm_stream(),
-                    language=transcript.language,
-                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                )
-            except Exception as exc:
-                history.pop()  # keep history alternating user/assistant cleanly
-                print(f"\n[main] LLM/TTS failed: {exc}")
-                continue
-            print()
+                print(f"\n[user, {transcript.language}] {transcript.text}")
+                print("[jarvis] ", end="", flush=True)
+                ui.add_user_text(transcript.text, transcript.language)
+                # State is already THINKING (set by on_speech_ended callback inside STT).
 
-            full_response = "".join(response_chunks).strip()
-            if not full_response:
-                history.pop()  # nothing came back; drop the orphan user message
-                continue
+                history.append({"role": "user", "content": transcript.text})
 
-            history.append({"role": "assistant", "content": full_response})
-            _trim_history(history)
-            last_turn_time = time.time()
+                response_chunks: list[str] = []
 
-            ui.add_jarvis_text(full_response)
-            print()
+                def llm_stream():
+                    for chunk in stream_response(
+                        api_key=cfg.anthropic_api_key,
+                        messages=history,
+                        model=cfg.claude_model,
+                        summaries=summaries,
+                    ):
+                        response_chunks.append(chunk)
+                        print(chunk, end="", flush=True)
+                        yield chunk
+
+                try:
+                    speak_streaming(
+                        llm_stream(),
+                        language=transcript.language,
+                        on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                    )
+                except Exception as exc:
+                    history.pop()  # keep history alternating user/assistant cleanly
+                    print(f"\n[main] LLM/TTS failed: {exc}")
+                    continue
+                print()
+
+                full_response = "".join(response_chunks).strip()
+                if not full_response:
+                    history.pop()  # nothing came back; drop the orphan user message
+                    continue
+
+                history.append({"role": "assistant", "content": full_response})
+                _trim_history(history)
+                last_turn_time = time.time()
+
+                # Persist the completed exchange to today's transcript file.
+                memory.record_turn(transcript.text, full_response, transcript.language)
+
+                ui.add_jarvis_text(full_response)
+                print()
+    finally:
+        # Quit / shutdown: seal whatever's still in memory so we don't lose it.
+        if history:
+            print("[memory] sealing in-progress session on shutdown...", file=sys.stderr)
+            _seal_session(memory, history, session_language, session_started_at, cfg)
 
 
 def main() -> None:
@@ -239,6 +314,14 @@ def main() -> None:
     worker.start()
 
     ui.run()  # blocks main thread on Tk's mainloop until Quit is clicked
+
+    # Give listen_loop time to see the shutdown event, exit its loop cleanly,
+    # and run its try/finally — which seals the active session to disk. Worst
+    # case: user quit mid-recording and we wait up to ~15s for max-recording
+    # to time out. Most quits happen during IDLE so this returns within ~80ms.
+    worker.join(timeout=20.0)
+    if worker.is_alive():
+        print("[main] listen_loop didn't exit in time — session may not be sealed", file=sys.stderr)
 
 
 if __name__ == "__main__":
