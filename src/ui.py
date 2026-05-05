@@ -74,6 +74,11 @@ class JarvisUI:
     def add_system_text(self, text: str) -> None:
         self.console.add_system_text(text)
 
+    def set_amplitude(self, level: float) -> None:
+        """Thread-safe pass-through to the console's waveform visualizer.
+        Called ~30x/s by speak_streaming during TTS playback."""
+        self.console.set_amplitude(level)
+
     # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------

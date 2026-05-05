@@ -14,8 +14,16 @@ which enqueues the text for the same per-turn pipeline as voice.
 File attachments (M16): a 📎 button next to the entry opens a file picker.
 Selecting a file stages it as a content block (via src.attachments) and shows
 a chip above the entry. Submit sends both the typed text and the staged
-attachment in one user message. Closing the window still hides; control
-(reset, open log, quit) still lives on the tray.
+attachment in one user message.
+
+Audio waveform (M17): 24 vertical bars between the state pill and transcript
+that pulse with the TTS amplitude envelope. set_amplitude(level) is thread-safe
+(called ~30x/s by speak_streaming's envelope ticker). The _wave_tick redraws
+at 30 fps with smoothing + decay so bars settle to a flat resting line when
+audio stops.
+
+Closing the window still hides; control (reset, open log, quit) still lives
+on the tray.
 """
 
 from __future__ import annotations
@@ -106,6 +114,60 @@ class JarvisConsole:
             anchor="w",
         )
         self._state_label.pack(side="left")
+
+        # --- Audio waveform visualizer (M17) ---
+        # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
+        # Pre-cache each bar's x1/x2 so the per-frame redraw only mutates y.
+        # Sizes tuned in M17 review — bars feel substantial without dominating
+        # the window. To resize: bar_width × num_bars + bar_gap × (num_bars-1)
+        # should be ≤ canvas_width with comfortable horizontal padding.
+        self._wave_num_bars = 24
+        self._wave_bar_width = 7
+        self._wave_bar_gap = 5
+        self._wave_min_height = 3
+        self._wave_max_height = 60
+        self._wave_canvas_width = 440
+        self._wave_canvas_height = 72
+
+        self._wave_amplitude = 0.0          # latest reading from set_amplitude
+        self._wave_displayed = [0.0] * self._wave_num_bars  # smoothed per-bar
+
+        # Golden-angle phase distribution gives non-clustering, deterministic,
+        # visually-irregular bar movement — no `random` import needed.
+        golden = math.pi * (3 - math.sqrt(5))
+        self._wave_phases = [
+            (i * golden) % (2 * math.pi) for i in range(self._wave_num_bars)
+        ]
+
+        self._waveform_canvas = tk.Canvas(
+            self.root,
+            width=self._wave_canvas_width,
+            height=self._wave_canvas_height,
+            bg=self.BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._waveform_canvas.pack(pady=(0, 12))
+
+        # Pre-create the bars; each tick mutates only their y coords.
+        self._wave_bars: list[int] = []
+        self._wave_bar_x: list[tuple[int, int]] = []
+        total_w = (
+            self._wave_num_bars * (self._wave_bar_width + self._wave_bar_gap)
+            - self._wave_bar_gap
+        )
+        start_x = (self._wave_canvas_width - total_w) // 2
+        mid_y = self._wave_canvas_height // 2
+        for i in range(self._wave_num_bars):
+            x1 = start_x + i * (self._wave_bar_width + self._wave_bar_gap)
+            x2 = x1 + self._wave_bar_width
+            half = self._wave_min_height / 2
+            bar_id = self._waveform_canvas.create_rectangle(
+                x1, mid_y - half, x2, mid_y + half,
+                fill=self.HEADER_FG, outline="",
+            )
+            self._wave_bars.append(bar_id)
+            self._wave_bar_x.append((x1, x2))
 
         # --- Text input row (packed first with side='bottom' so it sticks to
         # the bottom and the transcript above gets all remaining vertical space) ---
@@ -203,8 +265,11 @@ class JarvisConsole:
         # Window-close = hide (not quit). Quit comes from the tray menu.
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
 
-        # Kick off the animation tick.
+        # Kick off the animation ticks: state pulse (125ms = 8 fps) and the
+        # waveform redraw (33ms = 30 fps). Two independent recursive .after()
+        # chains so each can stop/continue without affecting the other.
         self.root.after(125, self._tick_animation)
+        self.root.after(33, self._wave_tick)
 
     # ------------------------------------------------------------------
     # Public API — all thread-safe (schedule on Tk thread via .after()).
@@ -234,6 +299,16 @@ class JarvisConsole:
         tuples — possibly empty. main.py wires this to a thread-safe queue so
         the callback can return immediately and Tk stays responsive."""
         self._on_text_submit = callback
+
+    def set_amplitude(self, level: float) -> None:
+        """Thread-safe: external setter for current TTS amplitude in [0, 1].
+        Called ~30x/s by speak_streaming's envelope ticker thread. Latest
+        reading replaces the stored value; _wave_tick handles smoothing +
+        decay between updates so bars don't snap."""
+        if self._destroyed:
+            return
+        clamped = max(0.0, min(1.0, float(level)))
+        self.root.after(0, self._set_amplitude_internal, clamped)
 
     def show(self) -> None:
         if not self._destroyed:
@@ -288,6 +363,49 @@ class JarvisConsole:
             self._state_label.configure(text=state.name)
         except tk.TclError:
             pass
+
+    def _set_amplitude_internal(self, level: float) -> None:
+        # Runs on Tk's thread (scheduled via .after). Just store; redraw
+        # happens on the next _wave_tick frame.
+        self._wave_amplitude = level
+
+    def _wave_tick(self) -> None:
+        """30 fps waveform redraw. Decays stored amplitude every frame so bars
+        fall after audio stops; per-bar phase oscillation keeps the visualizer
+        alive even at constant amplitude (mimics a real EQ meter); smoothing
+        prevents single-frame jitter from being visually harsh."""
+        if self._destroyed:
+            return
+
+        # Decay factor 0.85: ~99% gone over 0.3s. Snappy attack-and-release.
+        self._wave_amplitude *= 0.85
+        if self._wave_amplitude < 0.005:
+            self._wave_amplitude = 0.0
+
+        t = time.time()
+        smoothing = 0.4
+        span = self._wave_max_height - self._wave_min_height
+        mid_y = self._wave_canvas_height // 2
+
+        try:
+            for i, bar_id in enumerate(self._wave_bars):
+                # Each bar: amplitude × (0.5 + 0.5 × sin(t·ω + phase)) gives
+                # a [0.5×amp, 1.0×amp] band. Bars are partially correlated
+                # (all driven by amplitude) but phase-offset for visual life.
+                oscillation = math.sin(t * 6 + self._wave_phases[i]) * 0.5 + 0.5
+                target = self._wave_amplitude * (0.5 + 0.5 * oscillation)
+                self._wave_displayed[i] += (target - self._wave_displayed[i]) * smoothing
+
+                height = self._wave_min_height + self._wave_displayed[i] * span
+                half = height / 2
+                x1, x2 = self._wave_bar_x[i]
+                self._waveform_canvas.coords(
+                    bar_id, x1, mid_y - half, x2, mid_y + half
+                )
+        except tk.TclError:
+            return  # canvas destroyed; stop scheduling
+
+        self.root.after(33, self._wave_tick)
 
     def _append_line(self, who: str, text: str, language: str) -> None:
         ts = time.strftime("%H:%M")

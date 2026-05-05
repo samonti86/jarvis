@@ -24,6 +24,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from typing import Callable, Iterable
 
 import edge_tts
@@ -68,6 +69,7 @@ def speak_streaming(
     text_iter: Iterable[str],
     language: str = "en",
     on_first_audio: Callable[[], None] | None = None,
+    on_amplitude: Callable[[float], None] | None = None,
 ) -> None:
     """Tier B: pipelined synth+playback as text chunks arrive from the LLM stream.
 
@@ -79,6 +81,12 @@ def speak_streaming(
 
     `on_first_audio` (optional) fires once, when the first audio sample is
     about to play — caller uses this to flip tray state THINKING → SPEAKING.
+
+    `on_amplitude` (optional) fires ~30 times per second during playback with
+    the current RMS amplitude in [0, 1]. Used by the waveform visualizer.
+    Implementation: we pre-compute an envelope per sentence and walk it on a
+    daemon ticker thread that runs alongside sd.play(). Audio path itself is
+    untouched — the ticker only reads the envelope and emits values.
 
     On any exception in the text producer (e.g., LLM stream raising), this
     function re-raises it after threads drain, so the caller can roll back
@@ -149,13 +157,100 @@ def speak_streaming(
                     on_first_audio()
                 except Exception:
                     pass  # never let a UI callback break playback
+
+        # Optional waveform feed: pre-compute the RMS envelope and walk it on
+        # a ticker thread that runs concurrently with sd.play. They start at
+        # roughly the same instant, so the bars stay in sync with the audio
+        # to within one window (~33ms) — imperceptible.
+        envelope = None
+        ticker_stop = None
+        ticker_thread = None
+        if on_amplitude is not None:
+            envelope = _compute_envelope(samples, sample_rate, window_sec=0.033)
+            if envelope.size > 0:
+                ticker_stop = threading.Event()
+                ticker_thread = threading.Thread(
+                    target=_run_envelope_ticker,
+                    args=(envelope, 0.033, on_amplitude, ticker_stop),
+                    daemon=True,
+                )
+                ticker_thread.start()
+
         sd.play(samples, samplerate=sample_rate, blocking=True)
+
+        # Stop the ticker promptly so it doesn't run past playback end. The
+        # console's own decay logic settles bars back to flat from here.
+        if ticker_stop is not None:
+            ticker_stop.set()
+        if ticker_thread is not None:
+            ticker_thread.join(timeout=0.2)
 
     t_prod.join()
     t_synth.join()
 
     if producer_errors:
         raise producer_errors[0]
+
+
+def _compute_envelope(
+    samples: np.ndarray, sample_rate: int, window_sec: float = 0.033
+) -> np.ndarray:
+    """Pre-compute RMS amplitude per fixed-duration window. Returns float32
+    array of values in [0, 1] (clipped). Mono-mixed if multi-channel.
+
+    Window choice: 33ms = ~30 fps, matches the visualizer's redraw rate.
+    Faster windows look noisier; slower lose attack transients."""
+    if samples.size == 0 or sample_rate <= 0:
+        return np.array([], dtype=np.float32)
+
+    if samples.ndim > 1:
+        mono = samples.mean(axis=1)  # downmix without losing dynamic range much
+    else:
+        mono = samples
+
+    window_size = max(1, int(window_sec * sample_rate))
+    n_windows = len(mono) // window_size
+    if n_windows == 0:
+        return np.array([], dtype=np.float32)
+
+    # Reshape into [n_windows, window_size] and compute RMS per row.
+    truncated = mono[: n_windows * window_size].astype(np.float64)
+    rms = np.sqrt((truncated.reshape(n_windows, window_size) ** 2).mean(axis=1))
+    # 16-bit signed max is 32768. Clip to [0, 1] in case mono mixing pushed
+    # beyond float intermediate range.
+    return np.clip(rms / 32768.0, 0.0, 1.0).astype(np.float32)
+
+
+def _run_envelope_ticker(
+    envelope: np.ndarray,
+    window_sec: float,
+    on_amplitude: Callable[[float], None],
+    stop_event: threading.Event,
+) -> None:
+    """Walk the envelope in real time, calling on_amplitude per window.
+
+    Uses absolute time-since-start so we don't drift on slow callbacks. Stops
+    early if the caller signals via stop_event (i.e., sd.play returned)."""
+    start = time.monotonic()
+    n = len(envelope)
+    last_idx = -1
+    while not stop_event.is_set():
+        elapsed = time.monotonic() - start
+        idx = int(elapsed / window_sec)
+        if idx >= n:
+            return
+        if idx != last_idx:
+            try:
+                on_amplitude(float(envelope[idx]))
+            except Exception:
+                pass  # never let a UI callback kill the ticker
+            last_idx = idx
+        # Sleep until just past the next window boundary, so we sample once
+        # per window without spin-waiting.
+        next_boundary = start + (idx + 1) * window_sec
+        sleep_for = max(0.0, next_boundary - time.monotonic())
+        if stop_event.wait(sleep_for):
+            return
 
 
 def _speak_edge_tts(text: str, voice: str) -> None:

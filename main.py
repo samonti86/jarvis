@@ -272,6 +272,7 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
                     llm_stream(),
                     language=language,
                     on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                    on_amplitude=ui.set_amplitude,
                 )
             except Exception as exc:
                 history.pop()  # keep history alternating user/assistant cleanly
