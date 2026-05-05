@@ -41,6 +41,7 @@ import anthropic
 
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.sports import SPORTS_TOOL, execute_sports_tool
+from src.weather import WEATHER_TOOL, execute_weather_tool
 
 
 JARVIS_SYSTEM_PROMPT = """You are Jarvis, a personal voice assistant in the spirit of Tony Stark's J.A.R.V.I.S.
@@ -78,18 +79,27 @@ Memory of past sessions:
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
 
-Live information (you have two tools — pick the right one):
+Live information (you have four tools — pick the right one):
 1. get_sports_info — for live scores, schedules, and recent results in major leagues
    (NFL, NBA, MLB, NHL, MLS, EPL, Champions League, NCAA football and basketball, WNBA,
    UFC, F1, PGA, ATP, WTA). ALWAYS prefer this over web_search for any sports query —
    it returns structured live data and is far more reliable than scraped web pages.
-2. web_search — for everything else time-sensitive: news, weather, market prices,
-   recent releases, "who is the current X", anything that changes over time.
+2. get_weather — for current weather, today's forecast, or a multi-day forecast for
+   any city worldwide. ALWAYS prefer this over web_search for weather queries.
+3. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
+   the user names a particular site or document ("check ESPN for Giants news", "what
+   does IGN say about Super Mario", "summarize this PDF at <url>"). You may chain
+   web_search → web_fetch when you need to find a URL first, then read it in depth.
+4. web_search — for general info-finding when no specific source is named: news,
+   market prices, recent releases, "who is the current X", anything that changes
+   over time.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
   training data. Even if a similar answer is in your "Recent conversations" memory or
   feels familiar from training, fetch again — the world has likely moved on.
+- When the user names a specific website or asks about a PDF, prefer web_fetch (or
+  web_search → web_fetch if you need to find the right URL on that site first).
 - Do NOT call tools for things that don't change: math, geography, definitions,
   established historical facts, well-known general knowledge. Answer those directly.
 - Don't pre-announce ("Let me check…") — just call the tool when needed and answer.
@@ -108,6 +118,18 @@ Knowledge limits:
 WEB_SEARCH_TOOL = {
     "type": "web_search_20260209",
     "name": "web_search",
+}
+
+
+# Anthropic's server-side web fetch tool. Pulls the full contents of a
+# specific URL (HTML or PDF) and returns the parsed text. The "_20260209"
+# version supports dynamic filtering — Claude writes a small Python snippet
+# that runs server-side over the fetched page, keeping only relevant chunks
+# before they reach our context. Pairs naturally with web_search (search
+# to find a URL → fetch to read it in depth).
+WEB_FETCH_TOOL = {
+    "type": "web_fetch_20260209",
+    "name": "web_fetch",
 }
 
 
@@ -146,6 +168,8 @@ def _execute_client_tool(name: str, tool_input: dict) -> str:
     try:
         if name == "get_sports_info":
             return execute_sports_tool(tool_input)
+        if name == "get_weather":
+            return execute_weather_tool(tool_input)
         return f"Unknown tool: {name}"
     except Exception as exc:
         # Defensive — execute_sports_tool already swallows its own errors,
@@ -178,7 +202,7 @@ def stream_response(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    tools = [WEB_SEARCH_TOOL, SPORTS_TOOL]
+    tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, SPORTS_TOOL, WEATHER_TOOL]
 
     # Mutable working copy — we append assistant + tool_result turns as the
     # agentic loop runs. The caller's `messages` list is left untouched.
@@ -186,7 +210,9 @@ def stream_response(
 
     # Telemetry accumulators across all iterations.
     web_searched = False
+    web_fetched = False
     sports_called = False
+    weather_called = False
     paused = False
     total_input = total_output = total_cache_read = total_cache_create = 0
     iterations = 0
@@ -212,15 +238,17 @@ def stream_response(
         total_cache_read += u.cache_read_input_tokens or 0
         total_cache_create += u.cache_creation_input_tokens or 0
 
-        # Track server-side tool use (web_search) for telemetry only — the SDK
-        # has already executed it and the text stream above included Claude's
-        # post-search text.
+        # Track server-side tool use (web_search, web_fetch) for telemetry
+        # only — the SDK has already executed them and the text stream above
+        # included Claude's post-tool text.
         for block in final.content:
-            if (
-                getattr(block, "type", None) == "server_tool_use"
-                and getattr(block, "name", None) == "web_search"
-            ):
+            if getattr(block, "type", None) != "server_tool_use":
+                continue
+            sname = getattr(block, "name", None)
+            if sname == "web_search":
                 web_searched = True
+            elif sname == "web_fetch":
+                web_fetched = True
 
         # Server-side loop hit its 10-iteration cap. Rare in voice; we log
         # and bail rather than try to manually resume.
@@ -244,6 +272,8 @@ def stream_response(
             name = block.name
             if name == "get_sports_info":
                 sports_called = True
+            elif name == "get_weather":
+                weather_called = True
             result_text = _execute_client_tool(name, block.input or {})
             tool_results.append({
                 "type": "tool_result",
@@ -265,8 +295,12 @@ def stream_response(
     extra = ""
     if web_searched:
         extra += " web_search=yes"
+    if web_fetched:
+        extra += " web_fetch=yes"
     if sports_called:
         extra += " sports_tool=yes"
+    if weather_called:
+        extra += " weather_tool=yes"
     if paused:
         extra += " PAUSED_TURN(10-iter cap)"
     if iterations > 1:
