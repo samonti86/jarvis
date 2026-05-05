@@ -1,18 +1,24 @@
 """Jarvis — top-level entry point.
 
-Threading layout (M8):
+Threading layout:
 - Main thread:    Tk's mainloop (JarvisConsole window). Tk strongly prefers
                   the main thread, so this is its home.
 - Worker thread:  pystray icon loop (started by JarvisUI). Win32 lets pystray
                   run on any thread; we put it here so Tk can have main.
-- Worker thread:  listen_loop (started here in main()). Posts state +
-                  transcript updates to the UI; both UI surfaces are
-                  thread-safe (Tk via .after(), pystray via attribute writes).
+- Worker thread:  listen_loop (voice path). Wakes on "Hey Jarvis", transcribes,
+                  then calls process_question.
+- Worker thread:  text_input_loop (M15). Pops typed messages from a queue and
+                  calls process_question. Both paths share state (history,
+                  memory) and serialize via processing_lock so voice and text
+                  can't overlap.
 
-Conversation memory: listen_loop owns `history` (alternating user/assistant
-messages). Trimmed in pairs to MAX_PAIRS most recent exchanges. Reset paths:
+All UI surfaces (Tk console, pystray) are thread-safe — console via .after(),
+pystray via attribute writes.
+
+Conversation memory: history is alternating user/assistant messages. Trimmed
+in pairs to MAX_PAIRS most recent exchanges. Reset paths:
 (a) tray menu "Reset conversation" — fires reset_event, applied at the next
-    wake-word + STT
+    question (voice or text)
 (b) idle timeout — IDLE_RESET_SEC since last completed turn → forget
 (c) app restart — history is in-process only, never persisted
 
@@ -21,13 +27,14 @@ setup_logging() redirects stdout/stderr to %LOCALAPPDATA%\\Jarvis\\jarvis.log so
 we don't lose debug output. Console mode (python main.py) is unchanged.
 
 Echo handling: while TTS plays, the mic still captures it. session.drain() at
-the top of each iteration discards that buffered echo so the wake-word detector
-starts each turn on fresh, live audio.
+the top of each voice iteration discards that buffered echo so the wake-word
+detector starts each turn on fresh, live audio.
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import time
@@ -153,7 +160,16 @@ def _seal_session(
 
 def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
-    sessions on every memory boundary (manual reset / idle / app quit)."""
+    sessions on every memory boundary (manual reset / idle / app quit).
+
+    Two input paths share state through closures:
+      - voice path: this function's main loop (wake-word → STT → process_question)
+      - text path: text_input_loop spawned below (queue → process_question)
+
+    Both call process_question, which holds processing_lock for the duration of
+    the LLM stream + TTS. That means a typed message that lands while Jarvis is
+    answering a spoken one waits its turn — no overlapping responses.
+    """
     history: list[dict] = []
     last_turn_time = 0.0
 
@@ -167,6 +183,13 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
     session_language = "en"
     session_started_at = datetime.now().isoformat(timespec="seconds")
 
+    # Serializes process_question so voice and text paths never run together.
+    processing_lock = threading.Lock()
+
+    # Text-submission queue. Tk's submit handler puts strings here; the
+    # text_input_loop worker pops them and calls process_question.
+    text_queue: queue.Queue[str] = queue.Queue()
+
     def seal_and_refresh() -> None:
         """Seal the active session (if any) and reload summaries for the next one."""
         nonlocal summaries, session_started_at
@@ -174,6 +197,110 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
         history.clear()
         summaries = memory.recent_summaries(cfg.memory_recall_count)
         session_started_at = datetime.now().isoformat(timespec="seconds")
+
+    def process_question(text: str, language: str) -> None:
+        """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
+
+        Called from both voice path (after STT) and text path (after typed
+        Enter). Caller is responsible for setting THINKING before calling;
+        SPEAKING is set automatically when TTS audio starts.
+        """
+        nonlocal session_language, session_started_at, last_turn_time
+
+        with processing_lock:
+            # Apply any pending reset/idle boundary BEFORE this turn — so the
+            # user's question starts a fresh session rather than tacking onto
+            # a stale one.
+            if reset_event.is_set():
+                if history:
+                    print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
+                    ui.add_system_text("conversation reset.")
+                seal_and_refresh()
+                reset_event.clear()
+            elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
+                print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
+                ui.add_system_text("conversation reset (idle).")
+                seal_and_refresh()
+
+            # First turn of a (possibly new) session — capture its language.
+            if not history:
+                session_language = language or "en"
+                session_started_at = datetime.now().isoformat(timespec="seconds")
+
+            print(f"\n[user, {language}] {text}")
+            print("[jarvis] ", end="", flush=True)
+            ui.add_user_text(text, language)
+
+            history.append({"role": "user", "content": text})
+
+            response_chunks: list[str] = []
+
+            def llm_stream():
+                for chunk in stream_response(
+                    api_key=cfg.anthropic_api_key,
+                    messages=history,
+                    model=cfg.claude_model,
+                    summaries=summaries,
+                ):
+                    response_chunks.append(chunk)
+                    print(chunk, end="", flush=True)
+                    yield chunk
+
+            try:
+                speak_streaming(
+                    llm_stream(),
+                    language=language,
+                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                )
+            except Exception as exc:
+                history.pop()  # keep history alternating user/assistant cleanly
+                print(f"\n[main] LLM/TTS failed: {exc}")
+                return
+            print()
+
+            full_response = "".join(response_chunks).strip()
+            if not full_response:
+                history.pop()  # nothing came back; drop the orphan user message
+                return
+
+            history.append({"role": "assistant", "content": full_response})
+            _trim_history(history)
+            last_turn_time = time.time()
+
+            # Persist the completed exchange to today's transcript file.
+            memory.record_turn(text, full_response, language)
+
+            ui.add_jarvis_text(full_response)
+            print()
+
+    def text_input_loop() -> None:
+        """Consume typed questions from the queue. Short timeout so we notice
+        shutdown promptly without wasting cycles."""
+        while not ui.shutdown.is_set():
+            try:
+                text = text_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if ui.shutdown.is_set():
+                break
+            print(f"[text-input] received: {text}", file=sys.stderr)
+            ui.set_state(State.THINKING)
+            try:
+                # Hardcoded 'en' for now — Claude still replies in the input's
+                # language thanks to the system prompt, but TTS picks the
+                # English voice. Add language detection here if it becomes a
+                # real Spanish-typed-input use case.
+                process_question(text, "en")
+            finally:
+                ui.set_state(State.IDLE)
+
+    # Wire the Tk submit handler. Putting on the queue is non-blocking, so
+    # this returns immediately and Tk's mainloop stays responsive even while
+    # an LLM stream + TTS playback is in progress.
+    ui.set_on_text_submit(text_queue.put)
+
+    text_thread = threading.Thread(target=text_input_loop, daemon=True)
+    text_thread.start()
 
     try:
         with AudioSession(sample_rate=cfg.sample_rate) as session:
@@ -220,71 +347,7 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
                     print("[main] (no speech captured)\n")
                     continue
 
-                # Reset checks happen here — late enough to catch a click made any time
-                # during wait_for_wake_word *or* STT, so the click always applies to the
-                # turn the user is asking right now (not the next one).
-                if reset_event.is_set():
-                    if history:
-                        print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
-                        ui.add_system_text("conversation reset.")
-                    seal_and_refresh()
-                    reset_event.clear()
-                elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
-                    print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
-                    ui.add_system_text("conversation reset (idle).")
-                    seal_and_refresh()
-
-                # First turn of a (possibly new) session — capture its language.
-                if not history:
-                    session_language = transcript.language or "en"
-                    session_started_at = datetime.now().isoformat(timespec="seconds")
-
-                print(f"\n[user, {transcript.language}] {transcript.text}")
-                print("[jarvis] ", end="", flush=True)
-                ui.add_user_text(transcript.text, transcript.language)
-                # State is already THINKING (set by on_speech_ended callback inside STT).
-
-                history.append({"role": "user", "content": transcript.text})
-
-                response_chunks: list[str] = []
-
-                def llm_stream():
-                    for chunk in stream_response(
-                        api_key=cfg.anthropic_api_key,
-                        messages=history,
-                        model=cfg.claude_model,
-                        summaries=summaries,
-                    ):
-                        response_chunks.append(chunk)
-                        print(chunk, end="", flush=True)
-                        yield chunk
-
-                try:
-                    speak_streaming(
-                        llm_stream(),
-                        language=transcript.language,
-                        on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                    )
-                except Exception as exc:
-                    history.pop()  # keep history alternating user/assistant cleanly
-                    print(f"\n[main] LLM/TTS failed: {exc}")
-                    continue
-                print()
-
-                full_response = "".join(response_chunks).strip()
-                if not full_response:
-                    history.pop()  # nothing came back; drop the orphan user message
-                    continue
-
-                history.append({"role": "assistant", "content": full_response})
-                _trim_history(history)
-                last_turn_time = time.time()
-
-                # Persist the completed exchange to today's transcript file.
-                memory.record_turn(transcript.text, full_response, transcript.language)
-
-                ui.add_jarvis_text(full_response)
-                print()
+                process_question(transcript.text, transcript.language)
     finally:
         # Quit / shutdown: seal whatever's still in memory so we don't lose it.
         if history:

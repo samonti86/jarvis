@@ -7,9 +7,10 @@ Threading model:
 - An .after(125, _tick_animation) recursive scheduler drives the SPEAKING-state
   pulse at 8 fps, all on Tk's thread — no separate animation thread needed.
 
-The window is intentionally read-only: there are no buttons. All control (reset,
-open log, quit) lives on the tray icon. Closing the window hides it; quit only
-happens from the tray menu.
+Text input (M15): a CTkEntry at the bottom lets the user type questions instead
+of speaking. Submit fires the on_text_submit callback (registered by main.py)
+which enqueues the text for the same per-turn pipeline as voice. Closing the
+window still hides; control (reset, open log, quit) still lives on the tray.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ class JarvisConsole:
         self._state = State.IDLE
         self._anim_start = time.time()
         self._destroyed = False
+        self._on_text_submit: Callable[[str], None] | None = None
 
         # --- Header ---
         header = ctk.CTkLabel(
@@ -90,6 +92,26 @@ class JarvisConsole:
             anchor="w",
         )
         self._state_label.pack(side="left")
+
+        # --- Text input row (packed first with side='bottom' so it sticks to
+        # the bottom and the transcript above gets all remaining vertical space) ---
+        input_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        input_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 16))
+
+        self._input = ctk.CTkEntry(
+            input_frame,
+            placeholder_text="type to Jarvis…  (Enter to send)",
+            font=("Consolas", 11),
+            fg_color=self.PANEL_BG,
+            text_color=self.USER_FG,
+            border_width=0,
+            corner_radius=6,
+            height=34,
+        )
+        self._input.pack(fill="x", expand=True)
+        # Return submits; bind on the underlying widget so we can return
+        # "break" to suppress Tk's default newline insertion.
+        self._input.bind("<Return>", self._on_return)
 
         # --- Transcript pane ---
         transcript_frame = ctk.CTkFrame(self.root, fg_color=self.PANEL_BG, corner_radius=8)
@@ -144,6 +166,12 @@ class JarvisConsole:
     def add_system_text(self, text: str) -> None:
         if not self._destroyed:
             self.root.after(0, self._append_raw, "system", text + "\n")
+
+    def set_on_text_submit(self, callback: Callable[[str], None]) -> None:
+        """Register the function called when the user submits text. Receives
+        the typed string. main.py wires this to a thread-safe queue so the
+        callback can return immediately and Tk stays responsive."""
+        self._on_text_submit = callback
 
     def show(self) -> None:
         if not self._destroyed:
@@ -231,3 +259,16 @@ class JarvisConsole:
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.attributes("-topmost", False)
+
+    def _on_return(self, event):  # noqa: ARG002 — Tk hands us the event
+        """Enter pressed in the input field. Grab the text, clear the entry,
+        hand off to the registered callback. Returning 'break' tells Tk to
+        suppress the default newline behavior."""
+        text = self._input.get().strip()
+        self._input.delete(0, "end")
+        if text and self._on_text_submit is not None:
+            try:
+                self._on_text_submit(text)
+            except Exception as exc:
+                print(f"[console] text submit callback raised: {exc}")
+        return "break"
