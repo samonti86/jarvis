@@ -46,9 +46,13 @@ class JarvisUI:
         """Wire a reset callback. Called when the tray menu's Reset item fires."""
         self._on_reset = callback
 
-    def set_on_text_submit(self, callback: Callable[[str], None]) -> None:
+    def set_on_text_submit(
+        self, callback: Callable[[str, list[tuple[str, dict]]], None]
+    ) -> None:
         """Wire a text-submit callback. Called when the user types in the
-        console's input field and presses Enter. Pass-through to console."""
+        console's input field and presses Enter. Receives (text, attachments)
+        where attachments is a list of (filename, content_block) tuples
+        (possibly empty). Pass-through to console."""
         self.console.set_on_text_submit(callback)
 
     # ------------------------------------------------------------------

@@ -186,9 +186,10 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
     # Serializes process_question so voice and text paths never run together.
     processing_lock = threading.Lock()
 
-    # Text-submission queue. Tk's submit handler puts strings here; the
-    # text_input_loop worker pops them and calls process_question.
-    text_queue: queue.Queue[str] = queue.Queue()
+    # Text-submission queue. Tk's submit handler puts (text, attachments)
+    # tuples here; the text_input_loop worker pops them and calls
+    # process_question. attachments is list[tuple[str, dict]] (filename + block).
+    text_queue: queue.Queue[tuple[str, list[tuple[str, dict]]]] = queue.Queue()
 
     def seal_and_refresh() -> None:
         """Seal the active session (if any) and reload summaries for the next one."""
@@ -198,12 +199,22 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
         summaries = memory.recent_summaries(cfg.memory_recall_count)
         session_started_at = datetime.now().isoformat(timespec="seconds")
 
-    def process_question(text: str, language: str) -> None:
+    def process_question(
+        text: str,
+        language: str,
+        attachments: list[dict] | None = None,
+    ) -> None:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
-        Called from both voice path (after STT) and text path (after typed
-        Enter). Caller is responsible for setting THINKING before calling;
-        SPEAKING is set automatically when TTS audio starts.
+        Called from both voice path (after STT, no attachments) and text path
+        (after typed Enter, optional attachments). Caller is responsible for
+        setting THINKING before calling; SPEAKING is set automatically when
+        TTS audio starts.
+
+        When attachments is non-empty, the user message becomes a list of
+        content blocks (attachments first, then a text block) instead of a
+        plain string. History keeps that structure verbatim, so multi-turn
+        Q&A about an attached document works naturally until reset/trim.
         """
         nonlocal session_language, session_started_at, last_turn_time
 
@@ -231,7 +242,17 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
             print("[jarvis] ", end="", flush=True)
             ui.add_user_text(text, language)
 
-            history.append({"role": "user", "content": text})
+            # Build user-message content. With attachments: list of blocks
+            # (each attachment first so Claude has the doc/image in context
+            # before the question text). Without: plain string (cheaper).
+            if attachments:
+                content: list[dict] | str = list(attachments)
+                if text:
+                    content.append({"type": "text", "text": text})
+            else:
+                content = text
+
+            history.append({"role": "user", "content": content})
 
             response_chunks: list[str] = []
 
@@ -278,26 +299,34 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
         shutdown promptly without wasting cycles."""
         while not ui.shutdown.is_set():
             try:
-                text = text_queue.get(timeout=0.5)
+                item = text_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             if ui.shutdown.is_set():
                 break
-            print(f"[text-input] received: {text}", file=sys.stderr)
+            text, attachments = item
+            blocks = [block for _, block in attachments] if attachments else []
+            print(
+                f"[text-input] received: {text} (attachments={len(blocks)})",
+                file=sys.stderr,
+            )
             ui.set_state(State.THINKING)
             try:
                 # Hardcoded 'en' for now — Claude still replies in the input's
                 # language thanks to the system prompt, but TTS picks the
                 # English voice. Add language detection here if it becomes a
                 # real Spanish-typed-input use case.
-                process_question(text, "en")
+                process_question(text, "en", attachments=blocks)
             finally:
                 ui.set_state(State.IDLE)
 
     # Wire the Tk submit handler. Putting on the queue is non-blocking, so
     # this returns immediately and Tk's mainloop stays responsive even while
-    # an LLM stream + TTS playback is in progress.
-    ui.set_on_text_submit(text_queue.put)
+    # an LLM stream + TTS playback is in progress. Lambda repackages the
+    # (text, attachments) args into a single queue item.
+    ui.set_on_text_submit(
+        lambda text, attachments: text_queue.put((text, attachments))
+    )
 
     text_thread = threading.Thread(target=text_input_loop, daemon=True)
     text_thread.start()
@@ -385,8 +414,10 @@ def main() -> None:
     # Give listen_loop time to see the shutdown event, exit its loop cleanly,
     # and run its try/finally — which seals the active session to disk. Worst
     # case: user quit mid-recording and we wait up to ~15s for max-recording
-    # to time out. Most quits happen during IDLE so this returns within ~80ms.
-    worker.join(timeout=20.0)
+    # to time out, then a summarize call. M16 hardening: bumped from 20s → 30s
+    # so the summarize round-trip (capped at 8s in memory.py, no SDK retries)
+    # plus any tail TTS playback comfortably fits before we give up.
+    worker.join(timeout=30.0)
     if worker.is_alive():
         print("[main] listen_loop didn't exit in time — session may not be sealed", file=sys.stderr)
 

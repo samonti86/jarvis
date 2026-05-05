@@ -9,8 +9,13 @@ Threading model:
 
 Text input (M15): a CTkEntry at the bottom lets the user type questions instead
 of speaking. Submit fires the on_text_submit callback (registered by main.py)
-which enqueues the text for the same per-turn pipeline as voice. Closing the
-window still hides; control (reset, open log, quit) still lives on the tray.
+which enqueues the text for the same per-turn pipeline as voice.
+
+File attachments (M16): a 📎 button next to the entry opens a file picker.
+Selecting a file stages it as a content block (via src.attachments) and shows
+a chip above the entry. Submit sends both the typed text and the staged
+attachment in one user message. Closing the window still hides; control
+(reset, open log, quit) still lives on the tray.
 """
 
 from __future__ import annotations
@@ -18,10 +23,13 @@ from __future__ import annotations
 import math
 import time
 import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog
 from typing import Callable
 
 import customtkinter as ctk
 
+from src.attachments import load_attachment
 from src.tray import State
 
 
@@ -47,7 +55,13 @@ class JarvisConsole:
         self._state = State.IDLE
         self._anim_start = time.time()
         self._destroyed = False
-        self._on_text_submit: Callable[[str], None] | None = None
+        # Submit callback receives (text, attachments) where attachments is a
+        # list of (filename, content_block) tuples — possibly empty. None means
+        # not wired yet.
+        self._on_text_submit: Callable[[str, list[tuple[str, dict]]], None] | None = None
+        # Currently staged attachment (one at a time for first pass): (filename, content_block).
+        # None when nothing is staged.
+        self._staged: tuple[str, dict] | None = None
 
         # --- Header ---
         header = ctk.CTkLabel(
@@ -98,8 +112,53 @@ class JarvisConsole:
         input_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         input_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 16))
 
+        # Chip frame for staged attachment — created here, but only packed
+        # when a file is staged (pack_forget when not). Sits ABOVE the entry
+        # row inside input_frame.
+        self._chip_frame = ctk.CTkFrame(
+            input_frame, fg_color=self.PANEL_BG, corner_radius=6, height=28
+        )
+        self._chip_label = ctk.CTkLabel(
+            self._chip_frame,
+            text="",
+            font=("Consolas", 10),
+            text_color=self.HEADER_FG,
+            anchor="w",
+        )
+        self._chip_label.pack(side="left", padx=(10, 6), pady=4)
+        self._chip_clear_btn = ctk.CTkButton(
+            self._chip_frame,
+            text="✕",
+            width=24,
+            height=20,
+            font=("Consolas", 11),
+            fg_color="transparent",
+            text_color=self.DIM_FG,
+            hover_color=self.BG,
+            command=self._clear_attachment,
+        )
+        self._chip_clear_btn.pack(side="right", padx=(0, 6), pady=4)
+        # NB: _chip_frame is NOT packed yet — _show_chip / _hide_chip manage that.
+
+        # Entry row holds the 📎 attach button on the left and the entry on the right.
+        self._entry_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        self._entry_row.pack(fill="x")
+
+        self._attach_button = ctk.CTkButton(
+            self._entry_row,
+            text="📎",
+            width=34,
+            height=34,
+            font=("Segoe UI Emoji", 14),
+            fg_color=self.PANEL_BG,
+            text_color=self.HEADER_FG,
+            hover_color=self.BG,
+            command=self._on_attach_clicked,
+        )
+        self._attach_button.pack(side="left", padx=(0, 6))
+
         self._input = ctk.CTkEntry(
-            input_frame,
+            self._entry_row,
             placeholder_text="type to Jarvis…  (Enter to send)",
             font=("Consolas", 11),
             fg_color=self.PANEL_BG,
@@ -108,7 +167,7 @@ class JarvisConsole:
             corner_radius=6,
             height=34,
         )
-        self._input.pack(fill="x", expand=True)
+        self._input.pack(side="left", fill="x", expand=True)
         # Return submits; bind on the underlying widget so we can return
         # "break" to suppress Tk's default newline insertion.
         self._input.bind("<Return>", self._on_return)
@@ -167,10 +226,13 @@ class JarvisConsole:
         if not self._destroyed:
             self.root.after(0, self._append_raw, "system", text + "\n")
 
-    def set_on_text_submit(self, callback: Callable[[str], None]) -> None:
+    def set_on_text_submit(
+        self, callback: Callable[[str, list[tuple[str, dict]]], None]
+    ) -> None:
         """Register the function called when the user submits text. Receives
-        the typed string. main.py wires this to a thread-safe queue so the
-        callback can return immediately and Tk stays responsive."""
+        (text, attachments) where attachments is a list of (filename, content_block)
+        tuples — possibly empty. main.py wires this to a thread-safe queue so
+        the callback can return immediately and Tk stays responsive."""
         self._on_text_submit = callback
 
     def show(self) -> None:
@@ -261,14 +323,80 @@ class JarvisConsole:
         self.root.attributes("-topmost", False)
 
     def _on_return(self, event):  # noqa: ARG002 — Tk hands us the event
-        """Enter pressed in the input field. Grab the text, clear the entry,
-        hand off to the registered callback. Returning 'break' tells Tk to
-        suppress the default newline behavior."""
+        """Enter pressed in the input field. Grab the text + any staged
+        attachment, clear both, hand off to the registered callback.
+
+        If a file is staged, prepend "[📎 filename] " to the typed text so
+        the filename is visible in both the transcript and in the message
+        Claude sees. Empty input with no attachment = no-op.
+
+        Returning 'break' suppresses Tk's default newline-insert behavior.
+        """
         text = self._input.get().strip()
+        staged = self._staged
+
+        if not text and staged is None:
+            return "break"  # nothing to send
+
+        # Clear entry + chip BEFORE firing the callback, so the UI feels
+        # snappy and a slow downstream can't visually "stick" the staged file.
         self._input.delete(0, "end")
-        if text and self._on_text_submit is not None:
+        self._clear_attachment()
+
+        attachments: list[tuple[str, dict]] = []
+        if staged is not None:
+            filename, block = staged
+            attachments.append(staged)
+            text = (f"[📎 {filename}] " + text).rstrip()
+
+        if self._on_text_submit is not None:
             try:
-                self._on_text_submit(text)
+                self._on_text_submit(text, attachments)
             except Exception as exc:
                 print(f"[console] text submit callback raised: {exc}")
         return "break"
+
+    def _on_attach_clicked(self) -> None:
+        """Open the file picker. Tk's askopenfilename blocks the GUI thread
+        until the dialog closes — that's fine because the worker threads
+        (listen_loop, text_input_loop) keep running independently."""
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Attach a file for Jarvis",
+            filetypes=[
+                ("Documents", "*.pdf"),
+                ("Images", "*.png *.jpg *.jpeg *.gif *.webp"),
+                ("Text / code", "*.txt *.md *.csv *.json *.yaml *.yml *.log *.py *.js *.ts *.html *.css"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return  # user cancelled
+        block, error = load_attachment(path)
+        if error is not None or block is None:
+            self.add_system_text(f"attachment: {error or 'unknown error'}")
+            return
+        # Best-effort filename for display + the prefix we inject on submit.
+        filename = Path(path).name
+        self._staged = (filename, block)
+        self._show_chip(filename)
+
+    def _clear_attachment(self) -> None:
+        """Remove the staged attachment + hide the chip. Called after submit
+        OR by the chip's ✕ button."""
+        self._staged = None
+        self._hide_chip()
+
+    def _show_chip(self, filename: str) -> None:
+        """Reveal the chip with the staged filename. Pack BEFORE the entry_row
+        so it appears above. Truncate long filenames so the chip stays compact."""
+        display = filename if len(filename) <= 50 else filename[:47] + "…"
+        self._chip_label.configure(text=f"📄 {display}")
+        # Pack BEFORE the entry row so the chip lands above the input.
+        self._chip_frame.pack(fill="x", pady=(0, 6), before=self._entry_row)
+
+    def _hide_chip(self) -> None:
+        try:
+            self._chip_frame.pack_forget()
+        except tk.TclError:
+            pass

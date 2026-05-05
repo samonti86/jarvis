@@ -201,7 +201,12 @@ def summarize_session(
     )
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        # Fast-fail config (M16 hardening): summarization is best-effort —
+        # we'd rather skip the summary than block app shutdown. max_retries=0
+        # disables the SDK's default retry-with-backoff on 429s (which can
+        # easily exceed our worker.join timeout). timeout=8s caps any single
+        # request so a hanging endpoint doesn't stall quit either.
+        client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=8.0)
         msg = client.messages.create(
             model=model,
             max_tokens=80,  # tight cap discourages multi-paragraph drift
