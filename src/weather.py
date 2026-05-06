@@ -16,6 +16,7 @@ cities, towns, and well-known regions.
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
@@ -72,6 +73,44 @@ WEATHER_TOOL = {
 _GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
+# M19 hardening: Open-Meteo occasionally lags. We use a generous timeout and
+# one retry with brief backoff, but ONLY for transport-level failures
+# (timeouts / connection errors) — never for HTTP 4xx/5xx, which won't get
+# better with a retry and just waste the user's time.
+_HTTP_TIMEOUT_SEC = 10.0
+_RETRY_BACKOFF_SEC = 0.5
+
+
+def _http_get_with_retry(
+    url: str, params: dict[str, Any] | None = None
+) -> httpx.Response | None:
+    """GET with one retry on transport errors. Returns None on final failure
+    or on any non-2xx response. Caller checks for None."""
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            r = httpx.get(url, params=params, timeout=_HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            return r
+        except httpx.HTTPStatusError as exc:
+            # 4xx/5xx — won't fix itself; don't retry.
+            print(f"[weather] HTTP {exc.response.status_code} on {url}", file=sys.stderr)
+            return None
+        except httpx.RequestError as exc:
+            # Timeout, connect error, DNS — worth one retry.
+            last_exc = exc
+            if attempt == 1:
+                print(
+                    f"[weather] {type(exc).__name__} on {url} — retrying in "
+                    f"{_RETRY_BACKOFF_SEC}s",
+                    file=sys.stderr,
+                )
+                time.sleep(_RETRY_BACKOFF_SEC)
+                continue
+            break
+    print(f"[weather] gave up after retry: {last_exc}", file=sys.stderr)
+    return None
+
 
 # WMO weather interpretation codes collapsed to voice-friendly phrases.
 # Full table: https://open-meteo.com/en/docs (search "WMO Weather interpretation").
@@ -122,21 +161,21 @@ def _temp_unit(units: str) -> str:
 def _geocode(location: str) -> tuple[float, float, str] | None:
     """Resolve a place name to (lat, lon, display_name). Returns None on
     miss or any error — caller treats None as 'place not found'."""
+    r = _http_get_with_retry(
+        _GEOCODE_URL,
+        params={
+            "name": location,
+            "count": 1,
+            "language": "en",
+            "format": "json",
+        },
+    )
+    if r is None:
+        return None
     try:
-        r = httpx.get(
-            _GEOCODE_URL,
-            params={
-                "name": location,
-                "count": 1,
-                "language": "en",
-                "format": "json",
-            },
-            timeout=5.0,
-        )
-        r.raise_for_status()
         data = r.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        print(f"[weather] geocode failed ({location}): {exc}", file=sys.stderr)
+    except ValueError as exc:
+        print(f"[weather] geocode JSON parse failed ({location}): {exc}", file=sys.stderr)
         return None
 
     results = data.get("results") or []
@@ -186,12 +225,13 @@ def _fetch_forecast(
         )
         params["forecast_days"] = 1 if mode == "today" else 5
 
+    r = _http_get_with_retry(_FORECAST_URL, params=params)
+    if r is None:
+        return {}
     try:
-        r = httpx.get(_FORECAST_URL, params=params, timeout=5.0)
-        r.raise_for_status()
         return r.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        print(f"[weather] forecast fetch failed: {exc}", file=sys.stderr)
+    except ValueError as exc:
+        print(f"[weather] forecast JSON parse failed: {exc}", file=sys.stderr)
         return {}
 
 

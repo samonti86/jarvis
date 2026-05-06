@@ -122,13 +122,21 @@ WEB_SEARCH_TOOL = {
 
 
 # Anthropic's server-side web fetch tool. Pulls the full contents of a
-# specific URL (HTML or PDF) and returns the parsed text. The "_20260209"
-# version supports dynamic filtering — Claude writes a small Python snippet
-# that runs server-side over the fetched page, keeping only relevant chunks
-# before they reach our context. Pairs naturally with web_search (search
-# to find a URL → fetch to read it in depth).
+# specific URL (HTML or PDF) and returns the parsed text. Pairs naturally
+# with web_search (search to find a URL → fetch to read it in depth).
+#
+# We deliberately use _20250910 (the older version) rather than _20260209.
+# The newer version's "dynamic filtering" feature runs Anthropic's code
+# execution sandbox to filter big pages, which threads a `container_id`
+# through the conversation — and our agentic loop in stream_response() does
+# not track or forward that container_id. Mismatch surfaced in M19 testing
+# as: "container_id is required when there are pending tool uses generated
+# by code execution with tools." For voice queries (typical pages ≤ a few
+# KB), dynamic filtering's token-saving benefit is small; for the rare
+# multi-MB doc, the agentic loop's MAX_LOOP_ITERATIONS still bounds cost.
+# Revisit if we ever add a "summarize this 200-page document" workflow.
 WEB_FETCH_TOOL = {
-    "type": "web_fetch_20260209",
+    "type": "web_fetch_20250910",
     "name": "web_fetch",
 }
 
