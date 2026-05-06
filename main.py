@@ -46,7 +46,7 @@ from src.config import Config, load
 from src.llm import stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.speech_to_text import transcribe_after_wake
-from src.text_to_speech import speak_streaming
+from src.text_to_speech import speak, speak_streaming
 from src.tray import State
 from src.ui import JarvisUI
 from src.wake_word import wait_for_wake_word
@@ -277,6 +277,22 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
             except Exception as exc:
                 history.pop()  # keep history alternating user/assistant cleanly
                 print(f"\n[main] LLM/TTS failed: {exc}")
+                # M20: don't leave the user in silence after a partial reply.
+                # Speak a brief apology in their language via the simpler Tier
+                # A path (no streaming pipeline that could fail again). Wrap
+                # in defensive try/except so the apology itself can't break
+                # the loop. Add to transcript too so the console reflects it.
+                apology = (
+                    "Disculpe, tuve un problema técnico. ¿Podría intentarlo de nuevo?"
+                    if language == "es"
+                    else "Apologies, a technical hiccup. Could you try that again?"
+                )
+                ui.set_state(State.SPEAKING)
+                try:
+                    speak(apology, language=language)
+                except Exception as apology_exc:
+                    print(f"[main] apology TTS also failed: {apology_exc}")
+                ui.add_jarvis_text(apology)
                 return
             print()
 

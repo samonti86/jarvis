@@ -18,6 +18,7 @@ more is a one-line entry — ESPN's path conventions are consistent.
 from __future__ import annotations
 
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -99,6 +100,41 @@ _ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 # Cap output for voice — TTS reading 30 NCAAF Saturday games is unbearable.
 _MAX_GAMES_PER_RESPONSE = 8
 
+# M20: same defensive HTTP policy as src/weather.py. Retry once on transport
+# errors (timeout / DNS / connection drop); never retry on HTTPStatusError
+# (4xx/5xx don't fix themselves).
+_HTTP_TIMEOUT_SEC = 10.0
+_RETRY_BACKOFF_SEC = 0.5
+
+
+def _http_get_with_retry(
+    url: str, params: dict[str, Any] | None = None
+) -> httpx.Response | None:
+    """GET with one retry on transport errors. Returns None on final failure
+    or any non-2xx response. Caller checks for None."""
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            r = httpx.get(url, params=params, timeout=_HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            return r
+        except httpx.HTTPStatusError as exc:
+            print(f"[sports] HTTP {exc.response.status_code} on {url}", file=sys.stderr)
+            return None
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if attempt == 1:
+                print(
+                    f"[sports] {type(exc).__name__} on {url} — retrying in "
+                    f"{_RETRY_BACKOFF_SEC}s",
+                    file=sys.stderr,
+                )
+                time.sleep(_RETRY_BACKOFF_SEC)
+                continue
+            break
+    print(f"[sports] gave up after retry: {last_exc}", file=sys.stderr)
+    return None
+
 
 def _fetch_scoreboard(league_path: str, date_yyyymmdd: str | None) -> dict[str, Any]:
     """One ESPN scoreboard fetch. Always returns a dict — never raises.
@@ -106,13 +142,14 @@ def _fetch_scoreboard(league_path: str, date_yyyymmdd: str | None) -> dict[str, 
     caller treats it as "no games" rather than crashing the turn."""
     url = f"{_ESPN_BASE}/{league_path}/scoreboard"
     params = {"dates": date_yyyymmdd} if date_yyyymmdd else {}
+    r = _http_get_with_retry(url, params=params)
+    if r is None:
+        return {}
     try:
-        r = httpx.get(url, params=params, timeout=5.0)
-        r.raise_for_status()
         return r.json()
-    except (httpx.HTTPError, ValueError) as exc:
+    except ValueError as exc:
         print(
-            f"[sports] ESPN fetch failed ({league_path} {date_yyyymmdd}): {exc}",
+            f"[sports] JSON parse failed ({league_path} {date_yyyymmdd}): {exc}",
             file=sys.stderr,
         )
         return {}
