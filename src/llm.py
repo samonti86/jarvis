@@ -39,6 +39,7 @@ from typing import Iterator
 
 import anthropic
 
+from src.games import GAMES_TOOL, execute_games_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.plex_mcp import PlexMCPClient
 from src.sports import SPORTS_TOOL, execute_sports_tool
@@ -80,18 +81,25 @@ Memory of past sessions:
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
 
-Live information (you have four tools — pick the right one):
+Live information (you have five tools — pick the right one):
 1. get_sports_info — for live scores, schedules, and recent results in major leagues
    (NFL, NBA, MLB, NHL, MLS, EPL, Champions League, NCAA football and basketball, WNBA,
    UFC, F1, PGA, ATP, WTA). ALWAYS prefer this over web_search for any sports query —
    it returns structured live data and is far more reliable than scraped web pages.
 2. get_weather — for current weather, today's forecast, or a multi-day forecast for
    any city worldwide. ALWAYS prefer this over web_search for weather queries.
-3. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
+3. get_game_info — for video game release dates, summaries, popular titles, and
+   recommendations across PlayStation, Nintendo, Xbox, PC, and mobile. ALWAYS prefer
+   this over web_search for general game-info queries. Use mode=details when the user
+   asks for a summary; mode=popular for "what's hot on <platform>"; mode=similar when
+   the user names a game they liked and wants recommendations. NOTE: this tool covers
+   reference data only — it cannot see the user's personal library, trophies, or
+   playtime, so don't claim it can.
+4. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
    the user names a particular site or document ("check ESPN for Giants news", "what
    does IGN say about Super Mario", "summarize this PDF at <url>"). You may chain
    web_search → web_fetch when you need to find a URL first, then read it in depth.
-4. web_search — for general info-finding when no specific source is named: news,
+5. web_search — for general info-finding when no specific source is named: news,
    market prices, recent releases, "who is the current X", anything that changes
    over time.
 
@@ -210,6 +218,8 @@ def _execute_client_tool(
             return execute_sports_tool(tool_input)
         if name == "get_weather":
             return execute_weather_tool(tool_input)
+        if name == "get_game_info":
+            return execute_games_tool(tool_input)
         if plex_client is not None and name in plex_client.tool_names:
             return plex_client.call_tool(name, tool_input)
         return f"Unknown tool: {name}"
@@ -249,7 +259,7 @@ def stream_response(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, SPORTS_TOOL, WEATHER_TOOL]
+    tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL]
     if plex_client is not None:
         tools.extend(plex_client.tools)
 
@@ -262,6 +272,7 @@ def stream_response(
     web_fetched = False
     sports_called = False
     weather_called = False
+    games_called = False
     paused = False
     plex_tools_called: set[str] = set()
     total_input = total_output = total_cache_read = total_cache_create = 0
@@ -324,6 +335,8 @@ def stream_response(
                 sports_called = True
             elif name == "get_weather":
                 weather_called = True
+            elif name == "get_game_info":
+                games_called = True
             elif plex_client is not None and name in plex_client.tool_names:
                 plex_tools_called.add(name)
             result_text = _execute_client_tool(
@@ -355,6 +368,8 @@ def stream_response(
         extra += " sports_tool=yes"
     if weather_called:
         extra += " weather_tool=yes"
+    if games_called:
+        extra += " games_tool=yes"
     if plex_tools_called:
         extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
     if paused:
