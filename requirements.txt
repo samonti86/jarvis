@@ -32,3 +32,10 @@ python-dotenv>=1.0.0
 # SDK's ClientSession. plex-mcp-server pulls in plexapi as its transitive dep.
 mcp>=1.0.0
 plex-mcp-server>=1.1.7
+
+# PC diagnostics + system control (M23) — local Windows telemetry and
+# allowlisted actions. psutil for CPU/RAM/disk/processes/services. pycaw for
+# the Windows Audio Endpoint (system master volume). pywin32 NOT required —
+# we shell out to PowerShell Get-WinEvent for event log queries.
+psutil>=5.9
+pycaw>=20240210

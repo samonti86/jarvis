@@ -41,8 +41,10 @@ import anthropic
 
 from src.games import GAMES_TOOL, execute_games_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
+from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
 from src.plex_mcp import PlexMCPClient
 from src.sports import SPORTS_TOOL, execute_sports_tool
+from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
 from src.weather import WEATHER_TOOL, execute_weather_tool
 
 
@@ -102,6 +104,31 @@ Live information (you have five tools — pick the right one):
 5. web_search — for general info-finding when no specific source is named: news,
    market prices, recent releases, "who is the current X", anything that changes
    over time.
+
+Local PC control (you have two tools — pick the right one):
+6. pc_diagnostics — read-only telemetry on THIS Windows PC: CPU, RAM, disk,
+   processes, services, network, recent System event-log entries. Use for any
+   "how is my PC doing", "what's slowing me down", "any recent errors", "is X
+   service running" question. NEVER modifies state — call freely without
+   confirmation.
+7. system_control — fixed allowlist of safe actions on THIS PC: open_app,
+   lock_workstation, volume_set, volume_mute, volume_unmute, screen_off,
+   kill_process. Each action is individually scoped — there is NO arbitrary-
+   command path.
+
+Local-PC safety rules:
+- For low-impact actions (open_app, lock_workstation, volume_*, screen_off):
+  briefly announce what you're about to do, then call the tool. No need to
+  await confirmation for these.
+- For kill_process: ALWAYS ask the user to confirm in plain language first
+  ("Confirm: terminate chrome.exe?"), wait for an explicit yes, THEN call
+  with confirmed=true. The tool itself enforces this — if you call without
+  confirmed=true it returns a confirmation-required notice rather than
+  killing anything.
+- "Improve performance" / "fix my PC" style requests: start with diagnostics
+  (pc_diagnostics overview/cpu/memory/disk) and report findings. Suggest
+  remediations in plain language but DO NOT apply changes the user didn't
+  explicitly ask for. The user is the decider; you are the analyst.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -220,6 +247,10 @@ def _execute_client_tool(
             return execute_weather_tool(tool_input)
         if name == "get_game_info":
             return execute_games_tool(tool_input)
+        if name == "pc_diagnostics":
+            return execute_pc_diagnostics_tool(tool_input)
+        if name == "system_control":
+            return execute_system_control_tool(tool_input)
         if plex_client is not None and name in plex_client.tool_names:
             return plex_client.call_tool(name, tool_input)
         return f"Unknown tool: {name}"
@@ -259,7 +290,11 @@ def stream_response(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL]
+    tools = [
+        WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
+        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
+        PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
+    ]
     if plex_client is not None:
         tools.extend(plex_client.tools)
 
@@ -273,6 +308,8 @@ def stream_response(
     sports_called = False
     weather_called = False
     games_called = False
+    diagnostics_called = False
+    sysctl_called = False
     paused = False
     plex_tools_called: set[str] = set()
     total_input = total_output = total_cache_read = total_cache_create = 0
@@ -337,6 +374,10 @@ def stream_response(
                 weather_called = True
             elif name == "get_game_info":
                 games_called = True
+            elif name == "pc_diagnostics":
+                diagnostics_called = True
+            elif name == "system_control":
+                sysctl_called = True
             elif plex_client is not None and name in plex_client.tool_names:
                 plex_tools_called.add(name)
             result_text = _execute_client_tool(
@@ -370,6 +411,10 @@ def stream_response(
         extra += " weather_tool=yes"
     if games_called:
         extra += " games_tool=yes"
+    if diagnostics_called:
+        extra += " diagnostics=yes"
+    if sysctl_called:
+        extra += " sysctl=yes"
     if plex_tools_called:
         extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
     if paused:
