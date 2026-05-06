@@ -45,7 +45,10 @@ def _rms(chunk_i16: np.ndarray) -> float:
     return float(np.sqrt(np.mean(chunk_i16.astype(np.float64) ** 2)))
 
 
-def _record_until_silence(session: AudioSession) -> np.ndarray:
+def _record_until_silence(
+    session: AudioSession,
+    on_amplitude: "Callable[[float], None] | None" = None,
+) -> np.ndarray:
     """State-machine VAD: wait for speech start, then stop on sustained silence.
 
     Silence threshold is computed adaptively from pre-speech ambient noise:
@@ -57,6 +60,11 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
     Edge case: if the user starts talking immediately after the wake word with
     no quiet preamble, ambient_max stays near 0 and we fall back to
     SILENCE_FLOOR — i.e., the same behavior as the old static threshold.
+
+    M18: on_amplitude (optional) is called once per chunk with a normalized
+    [0, 1] level — used by the waveform visualizer to react during LISTENING.
+    Mic speech RMS is much smaller than TTS digital-scale audio, so we apply
+    a 2x boost so the bars feel visually balanced with the speaking path.
     """
     chunks: list[np.ndarray] = []
     chunks_per_sec = session.sample_rate / session.chunk_samples
@@ -74,6 +82,15 @@ def _record_until_silence(session: AudioSession) -> np.ndarray:
         chunk = session.read()
         chunks.append(chunk)
         level = _rms(chunk)
+
+        # M18: feed the waveform visualizer. 2x boost lifts conversational
+        # mic levels (~0.05–0.3 of full scale) into the same visual range
+        # as TTS playback (~0.5–0.7). Clip so we never push beyond [0, 1].
+        if on_amplitude is not None:
+            try:
+                on_amplitude(min(1.0, level / 32768.0 * 2.0))
+            except Exception:
+                pass  # never let a UI callback break the recording loop
 
         if not speaking:
             # Only count chunks that aren't speech themselves — otherwise a
@@ -120,6 +137,7 @@ def transcribe_after_wake(
     session: AudioSession,
     model_name: str = "small",
     on_speech_ended: "Callable[[], None] | None" = None,
+    on_amplitude: "Callable[[float], None] | None" = None,
 ) -> Transcript:
     """Record from `session` until silence, then transcribe.
 
@@ -128,9 +146,13 @@ def transcribe_after_wake(
     LISTENING to THINKING right when the user stops talking, instead of
     letting it linger through Whisper's ~1-2s of work. Only fires if real
     speech was captured; not on the no-speech-detected timeout path.
+
+    `on_amplitude` (M18) fires once per audio chunk during recording with the
+    current normalized level in [0, 1]. Used by the waveform visualizer to
+    react in real time while LISTENING.
     """
     model = _get_model(model_name)
-    audio_i16 = _record_until_silence(session)
+    audio_i16 = _record_until_silence(session, on_amplitude=on_amplitude)
 
     if audio_i16.size == 0:
         return Transcript(text="", language="")

@@ -44,7 +44,7 @@ from pathlib import Path
 from src.audio import AudioSession
 from src.config import Config, load
 from src.llm import stream_response
-from src.memory import MemoryStore, SummaryRecord, summarize_session
+from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak_streaming
 from src.tray import State
@@ -368,6 +368,10 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
                         # Flip state the moment audio capture ends — don't let the
                         # LISTENING pill linger through Whisper's ~1-2s transcription.
                         on_speech_ended=lambda: ui.set_state(State.THINKING),
+                        # M18: drive the waveform visualizer with mic amplitude
+                        # while LISTENING. SPEAKING and LISTENING never overlap
+                        # so the same callback safely serves both phases.
+                        on_amplitude=ui.set_amplitude,
                     )
                 except Exception as exc:
                     print(f"[main] STT failed: {exc}")
@@ -404,7 +408,9 @@ def main() -> None:
         reset_event.set()
         print("[tray] reset queued — applies to your next 'Hey Jarvis'")
 
-    ui = JarvisUI(log_path=log_path)
+    # Memory dir = %LOCALAPPDATA%\Jarvis (parent of sessions/ and summaries.jsonl)
+    # — exposed on the tray so the user can browse past transcripts in one click.
+    ui = JarvisUI(log_path=log_path, memory_dir=default_base_dir())
     ui.set_on_reset(_on_reset)
 
     worker = threading.Thread(target=listen_loop, args=(cfg, ui, reset_event), daemon=True)

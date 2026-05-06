@@ -54,6 +54,7 @@ class JarvisTray:
         on_reset: Callable[[], None] | None = None,
         on_show_window: Callable[[], None] | None = None,
         log_path: Path | None = None,
+        memory_dir: Path | None = None,
         autostart_enabled: Callable[[], bool] | None = None,
         on_autostart_toggle: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
@@ -67,6 +68,7 @@ class JarvisTray:
         self._on_reset = on_reset
         self._on_show_window = on_show_window
         self._log_path = log_path
+        self._memory_dir = memory_dir
         self._autostart_enabled = autostart_enabled
         self._on_autostart_toggle = on_autostart_toggle
 
@@ -77,6 +79,8 @@ class JarvisTray:
             menu_items.append(pystray.MenuItem("Reset conversation", self._handle_reset))
         if log_path is not None:
             menu_items.append(pystray.MenuItem("Open log", self._handle_open_log))
+        if memory_dir is not None:
+            menu_items.append(pystray.MenuItem("Open memory folder", self._handle_open_memory))
         if autostart_enabled is not None and on_autostart_toggle is not None:
             # Pystray re-evaluates `checked` each time the menu opens, so the
             # checkmark stays in sync if the shortcut is added/removed externally.
@@ -119,6 +123,12 @@ class JarvisTray:
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():
             os.startfile(str(self._log_path))  # type: ignore[attr-defined]
+
+    def _handle_open_memory(self) -> None:
+        # Opens %LOCALAPPDATA%\Jarvis\ — gets the user one click away from
+        # jarvis.log, summaries.jsonl, and the sessions/ folder all at once.
+        if self._memory_dir is not None and self._memory_dir.exists():
+            os.startfile(str(self._memory_dir))  # type: ignore[attr-defined]
 
     def set_state(self, state: State) -> None:
         self._state = state

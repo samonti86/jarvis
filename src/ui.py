@@ -31,7 +31,11 @@ from src.tray import JarvisTray, State
 
 
 class JarvisUI:
-    def __init__(self, log_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        log_path: Path | None = None,
+        memory_dir: Path | None = None,
+    ) -> None:
         # Console must be constructed on the thread that will run mainloop
         # (Tk requirement). main.py creates JarvisUI on the main thread, so
         # the console is bound to main thread here.
@@ -39,6 +43,7 @@ class JarvisUI:
 
         self.shutdown = threading.Event()
         self._log_path = log_path
+        self._memory_dir = memory_dir
         self._tray: JarvisTray | None = None
         self._on_reset: Callable[[], None] | None = None
 
@@ -108,6 +113,7 @@ class JarvisUI:
             on_reset=self._handle_reset,
             on_show_window=self.console.show,
             log_path=self._log_path,
+            memory_dir=self._memory_dir,
             autostart_enabled=autostart.is_enabled,
             on_autostart_toggle=self._toggle_autostart,
             shutdown_event=self.shutdown,
