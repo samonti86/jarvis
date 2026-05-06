@@ -45,6 +45,7 @@ from src.audio import AudioSession
 from src.config import Config, load
 from src.llm import stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
+from src.plex_mcp import PlexMCPClient
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
 from src.tray import State
@@ -158,7 +159,12 @@ def _seal_session(
     print(f"[memory] sealed session: {summary_text}", file=sys.stderr)
 
 
-def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None:
+def listen_loop(
+    cfg: Config,
+    ui: JarvisUI,
+    reset_event: threading.Event,
+    plex_client: PlexMCPClient | None = None,
+) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
 
@@ -262,6 +268,7 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
                     messages=history,
                     model=cfg.claude_model,
                     summaries=summaries,
+                    plex_client=plex_client,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
@@ -405,6 +412,23 @@ def listen_loop(cfg: Config, ui: JarvisUI, reset_event: threading.Event) -> None
             _seal_session(memory, history, session_language, session_started_at, cfg)
 
 
+def _try_connect_plex(cfg: Config) -> PlexMCPClient | None:
+    """M21: best-effort Plex MCP connection. Per the project contract,
+    Plex is optional — any failure (no creds, server down, MCP server
+    crashes, transitive dep import fail) logs and returns None. The rest
+    of Jarvis runs unaffected."""
+    if not cfg.plex_url or not cfg.plex_token:
+        print("[plex-mcp] PLEX_URL/PLEX_TOKEN unset — Plex tools disabled", file=sys.stderr)
+        return None
+    try:
+        client = PlexMCPClient(cfg.plex_url, cfg.plex_token)
+    except Exception as exc:
+        print(f"[plex-mcp] connect failed ({exc}); continuing without Plex tools", file=sys.stderr)
+        return None
+    print(f"[plex-mcp] connected — {len(client.tools)} tools available", file=sys.stderr)
+    return client
+
+
 def main() -> None:
     log_path = setup_logging()
 
@@ -412,6 +436,11 @@ def main() -> None:
     if not cfg.anthropic_api_key:
         print("ERROR: ANTHROPIC_API_KEY missing. Add it to .env and try again.", file=sys.stderr)
         sys.exit(1)
+
+    # M21: spin up Plex MCP before the UI. Synchronous; takes a few seconds
+    # the first time as plex-mcp-server initializes its plexapi connection.
+    # Failure is non-fatal — we simply run without Plex tools.
+    plex_client = _try_connect_plex(cfg)
 
     print("Jarvis ready. Tray icon active — left-click to show window. Say 'Hey Jarvis' to begin.\n")
 
@@ -429,7 +458,11 @@ def main() -> None:
     ui = JarvisUI(log_path=log_path, memory_dir=default_base_dir())
     ui.set_on_reset(_on_reset)
 
-    worker = threading.Thread(target=listen_loop, args=(cfg, ui, reset_event), daemon=True)
+    worker = threading.Thread(
+        target=listen_loop,
+        args=(cfg, ui, reset_event, plex_client),
+        daemon=True,
+    )
     worker.start()
 
     ui.run()  # blocks main thread on Tk's mainloop until Quit is clicked
@@ -443,6 +476,14 @@ def main() -> None:
     worker.join(timeout=30.0)
     if worker.is_alive():
         print("[main] listen_loop didn't exit in time — session may not be sealed", file=sys.stderr)
+
+    # M21: clean up MCP subprocess. Done after worker.join so any in-flight
+    # tool call inside listen_loop has a chance to complete first.
+    if plex_client is not None:
+        try:
+            plex_client.close()
+        except Exception as exc:
+            print(f"[plex-mcp] close failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

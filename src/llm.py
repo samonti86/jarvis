@@ -40,6 +40,7 @@ from typing import Iterator
 import anthropic
 
 from src.memory import SummaryRecord, format_summaries_for_prompt
+from src.plex_mcp import PlexMCPClient
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.weather import WEATHER_TOOL, execute_weather_tool
 
@@ -112,6 +113,24 @@ Knowledge limits:
   events, opinions you don't have), say so plainly rather than fabricating."""
 
 
+# Appended to the system prompt only when a Plex MCP session is live. Kept
+# separate so we don't promise tools that aren't there when Plex graceful-
+# failed at startup.
+_PLEX_PROMPT_ADDENDUM = """
+
+Media library (Plex):
+- You also have tools (prefixed by their MCP-server names) to query and control
+  the user's personal Plex Media Server. Use them when the user asks about THEIR
+  library, what's currently playing on their TVs/clients, or wants to control
+  playback ("play X on the living room", "what's on my Plex right now?",
+  "show me recently added films").
+- Do NOT use Plex tools for general movie/TV info — for that, web_search /
+  web_fetch are right. Plex tools are scoped to what the user owns.
+- For voice replies, summarize Plex results briefly. Don't read full IDs, file
+  paths, or long lists. If a search returns many matches, name a few and offer
+  to narrow down."""
+
+
 # Anthropic's server-side web search tool. Server-side = Anthropic runs it,
 # we just declare it. The "_20260209" version includes dynamic filtering.
 # Supported on Sonnet 4.6, Opus 4.6, Opus 4.7.
@@ -152,14 +171,23 @@ def _format_today() -> str:
     return now.strftime("%A, %B ") + str(now.day) + now.strftime(", %Y")
 
 
-def build_system_prompt(summaries: list[SummaryRecord] | None = None) -> str:
+def build_system_prompt(
+    summaries: list[SummaryRecord] | None = None,
+    plex_available: bool = False,
+) -> str:
     """Compose the system prompt with the current date and optional memory.
 
     The current date gives Claude a temporal anchor for reasoning about what's
     stale vs. current. We use date precision (not time) so the cache breakpoint
     invalidates at most once per day, not per turn.
+
+    When `plex_available` is True, append a Plex section advertising the
+    media-library tools. We gate this on actual session presence so a
+    graceful-fail startup doesn't leave Claude believing in tools it can't call.
     """
     base = f"{JARVIS_SYSTEM_PROMPT}\n\nToday is {_format_today()}."
+    if plex_available:
+        base += _PLEX_PROMPT_ADDENDUM
     if not summaries:
         return base
     memory_block = format_summaries_for_prompt(summaries)
@@ -170,7 +198,11 @@ def build_system_prompt(summaries: list[SummaryRecord] | None = None) -> str:
     )
 
 
-def _execute_client_tool(name: str, tool_input: dict) -> str:
+def _execute_client_tool(
+    name: str,
+    tool_input: dict,
+    plex_client: PlexMCPClient | None = None,
+) -> str:
     """Dispatch a client-side tool call. Returns a string for Claude to consume.
     Errors become readable strings — never raises."""
     try:
@@ -178,9 +210,11 @@ def _execute_client_tool(name: str, tool_input: dict) -> str:
             return execute_sports_tool(tool_input)
         if name == "get_weather":
             return execute_weather_tool(tool_input)
+        if plex_client is not None and name in plex_client.tool_names:
+            return plex_client.call_tool(name, tool_input)
         return f"Unknown tool: {name}"
     except Exception as exc:
-        # Defensive — execute_sports_tool already swallows its own errors,
+        # Defensive — existing tool executors swallow their own errors,
         # but a future tool might not. Don't let a tool exception kill the turn.
         print(f"[llm] tool '{name}' raised: {exc}", file=sys.stderr)
         return f"Tool error: {exc}"
@@ -191,6 +225,7 @@ def stream_response(
     messages: list[dict],
     model: str = "claude-sonnet-4-6",
     summaries: list[SummaryRecord] | None = None,
+    plex_client: PlexMCPClient | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -200,9 +235,13 @@ def stream_response(
 
     `messages` must be the full alternating history ending with a user message.
     `summaries` (optional) prepends recent-session context to the system prompt.
+    `plex_client` (optional, M21) — if a live Plex MCP session is provided,
+    its tools are surfaced to Claude alongside the built-in tools.
     """
     client = anthropic.Anthropic(api_key=api_key)
-    system_text = build_system_prompt(summaries)
+    system_text = build_system_prompt(
+        summaries, plex_available=plex_client is not None
+    )
     system_param = [
         {
             "type": "text",
@@ -211,6 +250,8 @@ def stream_response(
         }
     ]
     tools = [WEB_SEARCH_TOOL, WEB_FETCH_TOOL, SPORTS_TOOL, WEATHER_TOOL]
+    if plex_client is not None:
+        tools.extend(plex_client.tools)
 
     # Mutable working copy — we append assistant + tool_result turns as the
     # agentic loop runs. The caller's `messages` list is left untouched.
@@ -222,6 +263,7 @@ def stream_response(
     sports_called = False
     weather_called = False
     paused = False
+    plex_tools_called: set[str] = set()
     total_input = total_output = total_cache_read = total_cache_create = 0
     iterations = 0
 
@@ -282,7 +324,11 @@ def stream_response(
                 sports_called = True
             elif name == "get_weather":
                 weather_called = True
-            result_text = _execute_client_tool(name, block.input or {})
+            elif plex_client is not None and name in plex_client.tool_names:
+                plex_tools_called.add(name)
+            result_text = _execute_client_tool(
+                name, block.input or {}, plex_client=plex_client
+            )
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -309,6 +355,8 @@ def stream_response(
         extra += " sports_tool=yes"
     if weather_called:
         extra += " weather_tool=yes"
+    if plex_tools_called:
+        extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
     if paused:
         extra += " PAUSED_TURN(10-iter cap)"
     if iterations > 1:

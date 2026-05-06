@@ -20,6 +20,8 @@ class Config:
     sample_rate: int
     memory_recall_count: int   # how many recent summaries to inject into the system prompt
     retain_raw_days: int       # transcripts older than this are pruned on app start
+    plex_url: str              # M21 — empty if Plex MCP not configured
+    plex_token: str            # M21 — empty if Plex MCP not configured
 
 
 def load() -> Config:
@@ -33,4 +35,6 @@ def load() -> Config:
         sample_rate=16_000,  # required by both openWakeWord and Whisper
         memory_recall_count=int(os.getenv("MEMORY_RECALL_COUNT", "10")),
         retain_raw_days=int(os.getenv("RETAIN_RAW_DAYS", "30")),
+        plex_url=os.getenv("PLEX_URL", "").strip(),
+        plex_token=os.getenv("PLEX_TOKEN", "").strip(),
     )
