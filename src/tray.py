@@ -59,6 +59,8 @@ class JarvisTray:
         on_autostart_toggle: Callable[[], None] | None = None,
         mute_enabled: Callable[[], bool] | None = None,
         on_mute_toggle: Callable[[], None] | None = None,
+        engineer_enabled: Callable[[], bool] | None = None,
+        on_engineer_toggle: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
         # Allow caller to share a shutdown event (UI coordinator) so a single
@@ -75,6 +77,8 @@ class JarvisTray:
         self._on_autostart_toggle = on_autostart_toggle
         self._mute_enabled = mute_enabled
         self._on_mute_toggle = on_mute_toggle
+        self._engineer_enabled = engineer_enabled
+        self._on_engineer_toggle = on_engineer_toggle
 
         menu_items: list[pystray.MenuItem] = []
         if on_show_window is not None:
@@ -94,6 +98,15 @@ class JarvisTray:
                 "Mute (text only)",
                 self._handle_toggle_mute,
                 checked=lambda item: bool(self._mute_enabled()),
+            ))
+        if engineer_enabled is not None and on_engineer_toggle is not None:
+            # Engineer mode: extended thinking + permission for longer,
+            # structured replies (paragraphs, bullets, code blocks). Costs
+            # more tokens; off by default. Independent of mute.
+            menu_items.append(pystray.MenuItem(
+                "Engineer mode",
+                self._handle_toggle_engineer,
+                checked=lambda item: bool(self._engineer_enabled()),
             ))
         if autostart_enabled is not None and on_autostart_toggle is not None:
             # Pystray re-evaluates `checked` each time the menu opens, so the
@@ -137,6 +150,10 @@ class JarvisTray:
     def _handle_toggle_mute(self) -> None:
         if self._on_mute_toggle is not None:
             self._on_mute_toggle()
+
+    def _handle_toggle_engineer(self) -> None:
+        if self._on_engineer_toggle is not None:
+            self._on_engineer_toggle()
 
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():

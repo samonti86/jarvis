@@ -46,6 +46,12 @@ class JarvisUI:
         # the text response into the console. Toggleable from the tray.
         # Always starts cleared (unmuted) — restart is a clean slate.
         self.mute_event = threading.Event()
+        # When set, stream_response runs with extended thinking enabled and
+        # an engineer-mode system prompt addendum (longer structured replies,
+        # technical depth). Independent of mute — voice + engineer is allowed.
+        # Always starts cleared (off) — engineer mode costs more tokens, so
+        # off is the cheap default.
+        self.engineer_event = threading.Event()
         self._log_path = log_path
         self._memory_dir = memory_dir
         self._tray: JarvisTray | None = None
@@ -132,6 +138,32 @@ class JarvisUI:
         self.set_muted(not self.is_muted())
 
     # ------------------------------------------------------------------
+    # Engineer mode toggle. Independent of mute — engineer + voice is a
+    # legitimate combination (dictating a code review or a deep-dive while
+    # away from the screen). When on: longer structured replies + extended
+    # thinking enabled on the API call.
+    # ------------------------------------------------------------------
+
+    def is_engineer_mode(self) -> bool:
+        return self.engineer_event.is_set()
+
+    def set_engineer_mode(self, on: bool) -> None:
+        if on == self.is_engineer_mode():
+            return
+        if on:
+            self.engineer_event.set()
+        else:
+            self.engineer_event.clear()
+        self.console.set_engineer(on)
+        self.console.add_system_text(
+            "engineer mode on — deeper, structured replies + extended thinking."
+            if on else "engineer mode off — back to concise."
+        )
+
+    def _handle_toggle_engineer(self) -> None:
+        self.set_engineer_mode(not self.is_engineer_mode())
+
+    # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------
 
@@ -165,6 +197,8 @@ class JarvisUI:
             on_autostart_toggle=self._toggle_autostart,
             mute_enabled=self.is_muted,
             on_mute_toggle=self._handle_toggle_mute,
+            engineer_enabled=self.is_engineer_mode,
+            on_engineer_toggle=self._handle_toggle_engineer,
             shutdown_event=self.shutdown,
         )
         self._tray.run()

@@ -45,9 +45,52 @@ DEFAULT_VOICE = "en-GB-RyanNeural"
 _SENTENCE_RE = re.compile(r"[.!?](?:\s+|$)|\n+")
 
 
+# --- Markdown stripping (M26 follow-up) ---
+# Engineer-mode responses use **bold**, bullets, and headers — great for
+# reading on screen, terrible for TTS (edge-tts reads the literal asterisks
+# as "asterisk asterisk"). We strip these markers at the audio-path entry
+# point only; the visual transcript still shows the original markdown.
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_BOLD_UND = re.compile(r"__(.+?)__", re.DOTALL)
+# Single-asterisk italic. The (?<!\w) and (?!\w) lookarounds avoid stripping
+# asterisks that are mid-word (rare in English but not impossible in code).
+_MD_ITALIC_AST = re.compile(r"(?<!\w)\*([^*\n]+?)\*(?!\w)")
+_MD_INLINE_CODE = re.compile(r"`([^`\n]+?)`")
+_MD_HEADER = re.compile(r"^\s*#{1,6}\s+", re.MULTILINE)
+_MD_BULLET = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
+
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """Remove formatting markers so TTS doesn't read them aloud as punctuation.
+
+    Order matters: pair-replace first (**bold** → bold), THEN the defensive
+    orphan-asterisk sweep at the end. The orphan sweep handles a real edge
+    case — the sentence-boundary regex can split inside a `**...**` span
+    (because `1. ` looks like end-of-sentence), leaving one `**` in each
+    half. Pair-replace can't fix half-spans; the orphan sweep does.
+
+    Underscores are NOT stripped wholesale — file paths and identifiers use
+    them legitimately ('MAX_TOKENS'). Only paired __bold__ underscores get
+    converted. Same defensive instinct for `#` (we strip ONLY at line start
+    as headers; mid-line `#` could be a hashtag, channel, or issue ref).
+    """
+    text = _MD_BOLD.sub(r"\1", text)
+    text = _MD_BOLD_UND.sub(r"\1", text)
+    text = _MD_ITALIC_AST.sub(r"\1", text)
+    text = _MD_INLINE_CODE.sub(r"\1", text)
+    text = _MD_HEADER.sub("", text)
+    text = _MD_BULLET.sub("", text)
+    # Defensive sweep: orphan asterisks/backticks left after sentence-splits
+    # inside a bold or code span. Voice context very rarely has legitimate
+    # isolated asterisks or backticks.
+    text = re.sub(r"\*+", "", text)
+    text = re.sub(r"`+", "", text)
+    return text
+
+
 def speak(text: str, language: str = "en") -> None:
     """Tier A: synthesize full text in one shot and play. Edge-tts → pyttsx3 fallback."""
-    text = text.strip()
+    text = _strip_markdown_for_tts(text.strip())
     if not text:
         return
 
@@ -99,7 +142,12 @@ def speak_streaming(
     producer_errors: list[BaseException] = []
 
     def text_producer() -> None:
-        """Iterate text chunks, emit complete sentences to sentence_q."""
+        """Iterate text chunks, emit complete sentences to sentence_q.
+        Markdown strip happens per-sentence here so the TTS pipeline never
+        sees raw `**` / `*` / `` ` `` / leading bullets. Sentences with no
+        alphanumeric content (horizontal rules like '---', stray punctuation
+        left after stripping) are dropped — edge-tts rejects them and they
+        carry no audible content anyway."""
         try:
             buffer = ""
             for chunk in text_iter:
@@ -108,12 +156,13 @@ def speak_streaming(
                     m = _SENTENCE_RE.search(buffer)
                     if not m:
                         break
-                    sentence = buffer[: m.end()].strip()
+                    sentence = _strip_markdown_for_tts(buffer[: m.end()].strip())
                     buffer = buffer[m.end():]
-                    if sentence:
+                    if sentence and any(c.isalnum() for c in sentence):
                         sentence_q.put(sentence)
-            if buffer.strip():
-                sentence_q.put(buffer.strip())
+            tail = _strip_markdown_for_tts(buffer.strip())
+            if tail and any(c.isalnum() for c in tail):
+                sentence_q.put(tail)
         except BaseException as exc:
             producer_errors.append(exc)
         finally:

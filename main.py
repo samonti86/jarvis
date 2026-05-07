@@ -264,18 +264,27 @@ def listen_loop(
 
             response_chunks: list[str] = []
 
+            # Snapshot engineer-mode state once per turn — same discipline as
+            # mute. Mid-turn toggle applies to the next turn (changing thinking
+            # budget mid-stream isn't supported).
+            engineer = ui.is_engineer_mode()
+
             def on_telemetry(rec: TelemetryRecord) -> None:
                 """Called by stream_response at the end of each turn. Surfaces
                 the per-turn signal that previously only existed as a stderr
                 log line. Format chosen for SRE skim-readability — verb
                 (which tools), then iteration count if >1, then how long,
-                then how much it cost."""
+                then how much it cost. The 'thinking' marker calls out
+                engineer-mode turns since their token cost is meaningfully
+                higher."""
                 ui.add_session_tokens(rec.total_tokens)
                 bits: list[str] = []
                 if rec.tools_used:
                     bits.append(", ".join(rec.tools_used))
                 if rec.iterations > 1:
                     bits.append(f"{rec.iterations} iters")
+                if rec.thinking_enabled:
+                    bits.append("thinking")
                 bits.append(f"{rec.elapsed_sec:.1f}s")
                 bits.append(f"{rec.total_tokens:,} tok")
                 if rec.paused:
@@ -291,6 +300,7 @@ def listen_loop(
                     plex_client=plex_client,
                     plex_laptop_client=plex_laptop_client,
                     on_complete=on_telemetry,
+                    engineer_mode=engineer,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)

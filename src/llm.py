@@ -177,6 +177,36 @@ Media library (Plex):
   to narrow down."""
 
 
+# Appended only when engineer mode is on. Unlocks structured depth without
+# changing the calm-butler tone — the user is a Technical Support Engineer /
+# SRE and values trade-off analysis over brevity in this mode. Calibration
+# bullet at the end keeps the model from lecturing on simple questions.
+_ENGINEER_PROMPT_ADDENDUM = """
+
+Engineer mode (deeper technical reasoning):
+- This conversation is in engineer mode. The user is a Technical Support Engineer / SRE
+  who values depth, precision, and trade-off analysis over brevity. The calm, dryly-witty
+  tone still holds — engineer mode is depth, not chattiness.
+- You may write longer, structured responses with paragraphs, bullet points, ordered
+  steps, or code blocks where they help comprehension. Visual structure is allowed here
+  even though normal voice mode forbids it.
+- Lead with the answer, then back it up with reasoning. Don't bury the lede.
+- Explain WHY, not just WHAT. When recommending an approach, surface the trade-offs:
+  what alternatives you considered, why this choice over those, what could go wrong.
+- For diagnostic / troubleshooting questions: think like a senior engineer pair-partner.
+  Form a hypothesis, suggest the next diagnostic step, propose multiple approaches with
+  their trade-offs. Don't jump to a single fix when several are viable.
+- Push back if the user is about to do something inefficient or risky — name the better
+  approach. Be direct, not preachy. Match their technical level (assume senior).
+- Connect new concepts to what they already know (Linux, networking, sysadmin,
+  containers, cybersecurity) when it helps the explanation land.
+- Calibrate to context. A quick fix doesn't need a lecture. New territory, non-obvious
+  choices, "why is this happening" questions warrant more depth. When in doubt, lean
+  toward more explanation than less.
+- For genuinely simple questions ("what's 2+2", "what's the weather"), keep it brief
+  even in engineer mode. Depth is a tool, not a default for everything."""
+
+
 # Appended only when a live SSH client to the Plex laptop is available.
 # Same gating discipline as _PLEX_PROMPT_ADDENDUM — never promise tools that
 # aren't actually wired up.
@@ -234,6 +264,13 @@ WEB_FETCH_TOOL = {
 # tool calls; 5 is generous safety. If we ever hit this we log it.
 _MAX_LOOP_ITERATIONS = 5
 
+# Token budgets. Default mode is voice-shaped — short replies, no thinking.
+# Engineer mode unlocks extended thinking + a generous output budget so the
+# model can both reason and write the longer structured answer it produced.
+_DEFAULT_MAX_TOKENS = 1024
+_ENGINEER_THINKING_BUDGET = 5000
+_ENGINEER_MAX_TOKENS = 8192   # must exceed thinking_budget; ~3k left for the actual reply
+
 
 @dataclass
 class TelemetryRecord:
@@ -252,6 +289,7 @@ class TelemetryRecord:
     cache_create_tokens: int
     tools_used: list[str] = field(default_factory=list)
     paused: bool = False
+    thinking_enabled: bool = False  # M26: extended thinking was active for this turn
 
     @property
     def total_tokens(self) -> int:
@@ -270,6 +308,7 @@ def build_system_prompt(
     summaries: list[SummaryRecord] | None = None,
     plex_available: bool = False,
     plex_laptop_available: bool = False,
+    engineer_mode: bool = False,
 ) -> str:
     """Compose the system prompt with the current date and optional memory.
 
@@ -281,12 +320,21 @@ def build_system_prompt(
     startup doesn't leave Claude believing in tools it can't call:
     - `plex_available` (M21): advertise the Plex MCP media tools
     - `plex_laptop_available` (M24): advertise the remote-laptop SSH tools
+    - `engineer_mode` (M26): unlock structured-depth replies and connect to
+      the user's technical expertise. Toggleable per-turn from the tray.
+
+    Note: engineer addendum is placed BEFORE the memory block so it stays in
+    the cacheable prefix. Memory varies per turn; tool addenda + engineer
+    addendum stay stable across turns within a session, which matters for
+    prompt-cache hit rate.
     """
     base = f"{JARVIS_SYSTEM_PROMPT}\n\nToday is {_format_today()}."
     if plex_available:
         base += _PLEX_PROMPT_ADDENDUM
     if plex_laptop_available:
         base += _PLEX_LAPTOP_PROMPT_ADDENDUM
+    if engineer_mode:
+        base += _ENGINEER_PROMPT_ADDENDUM
     if not summaries:
         return base
     memory_block = format_summaries_for_prompt(summaries)
@@ -346,6 +394,7 @@ def stream_response(
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
     on_complete: Callable[[TelemetryRecord], None] | None = None,
+    engineer_mode: bool = False,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -362,6 +411,10 @@ def stream_response(
     `on_complete` (optional) — called once at the end with a TelemetryRecord
     for UI consumption. The same data is also stderr-logged in the existing
     one-line format. Wrapped in try/except so a UI bug can't poison the turn.
+    `engineer_mode` (optional, M26) — when True, append the engineer-mode
+    addendum to the system prompt and enable Anthropic's extended thinking
+    feature with a 5k-token reasoning budget. Captured per-turn from
+    `ui.is_engineer_mode()`; mid-turn toggles apply to the next turn.
     """
     started_at = time.monotonic()
     client = anthropic.Anthropic(api_key=api_key)
@@ -369,6 +422,7 @@ def stream_response(
         summaries,
         plex_available=plex_client is not None,
         plex_laptop_available=plex_laptop_client is not None,
+        engineer_mode=engineer_mode,
     )
     system_param = [
         {
@@ -409,16 +463,32 @@ def stream_response(
     total_input = total_output = total_cache_read = total_cache_create = 0
     iterations = 0
 
+    # Build per-turn stream kwargs once; reuse across agentic-loop iterations.
+    # max_tokens MUST exceed thinking budget when thinking is on; 8192 leaves
+    # room for both the reasoning + a generous structured reply. Anthropic
+    # also requires temperature=1 with extended thinking (we don't set it,
+    # so default of 1 holds). Thinking blocks are preserved in the assistant
+    # turn we append below — required when thinking + tool_use are combined.
+    stream_kwargs: dict = {
+        "model": model,
+        "max_tokens": _ENGINEER_MAX_TOKENS if engineer_mode else _DEFAULT_MAX_TOKENS,
+        "system": system_param,
+        "messages": working,
+        "tools": tools,
+    }
+    if engineer_mode:
+        stream_kwargs["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": _ENGINEER_THINKING_BUDGET,
+        }
+
     while iterations < _MAX_LOOP_ITERATIONS:
         iterations += 1
 
-        with client.messages.stream(
-            model=model,
-            max_tokens=1024,
-            system=system_param,
-            messages=working,
-            tools=tools,
-        ) as stream:
+        # Refresh messages each iteration since the agentic loop appends to
+        # `working`. Other kwargs are stable across iterations.
+        stream_kwargs["messages"] = working
+        with client.messages.stream(**stream_kwargs) as stream:
             for text in stream.text_stream:
                 yield text
             final = stream.get_final_message()
@@ -522,6 +592,8 @@ def stream_response(
         extra += " PAUSED_TURN(10-iter cap)"
     if iterations > 1:
         extra += f" iters={iterations}"
+    if engineer_mode:
+        extra += " thinking=on"
 
     elapsed = time.monotonic() - started_at
     print(
@@ -564,6 +636,7 @@ def stream_response(
             cache_create_tokens=total_cache_create,
             tools_used=tools_used,
             paused=paused,
+            thinking_enabled=engineer_mode,
         )
         try:
             on_complete(record)

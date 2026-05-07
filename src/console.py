@@ -126,6 +126,16 @@ class JarvisConsole:
         )
         # NB: not packed initially — _apply_muted handles pack/forget.
 
+        # Read-only engineer-mode indicator, same shape as the mute label.
+        # Sits to the right of the mute label when both are active.
+        self._engineer_label = ctk.CTkLabel(
+            state_frame,
+            text="🛠 engineer",
+            font=("Segoe UI Emoji", 11),
+            text_color=self.HEADER_FG,
+        )
+        # NB: not packed initially — _apply_engineer handles pack/forget.
+
         # --- Audio waveform visualizer (M17) ---
         # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
         # Pre-cache each bar's x1/x2 so the per-frame redraw only mutates y.
@@ -354,6 +364,12 @@ class JarvisConsole:
         if not self._destroyed:
             self.root.after(0, self._apply_muted, bool(muted))
 
+    def set_engineer(self, on: bool) -> None:
+        """Thread-safe: show/hide the '🛠 engineer' indicator. Called from
+        the UI coordinator when the tray's Engineer mode checkbox is toggled."""
+        if not self._destroyed:
+            self.root.after(0, self._apply_engineer, bool(on))
+
     # ------------------------------------------------------------------
     # SRE status bar API — all thread-safe via .after().
     # ------------------------------------------------------------------
@@ -451,6 +467,15 @@ class JarvisConsole:
                 self._mute_label.pack(side="left", padx=(8, 0))
             else:
                 self._mute_label.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _apply_engineer(self, on: bool) -> None:
+        try:
+            if on:
+                self._engineer_label.pack(side="left", padx=(8, 0))
+            else:
+                self._engineer_label.pack_forget()
         except tk.TclError:
             pass
 
