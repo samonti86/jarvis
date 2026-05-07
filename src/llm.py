@@ -44,6 +44,7 @@ import anthropic
 from src.games import GAMES_TOOL, execute_games_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
+from src.plex_actions import PLEX_ACTION_TOOL, execute_plex_action
 from src.plex_laptop import (
     PLEX_LAPTOP_HEALTH_TOOL,
     PLEX_LOGS_SEARCH_TOOL,
@@ -212,7 +213,9 @@ Engineer mode (deeper technical reasoning):
 # aren't actually wired up.
 _PLEX_LAPTOP_PROMPT_ADDENDUM = """
 
-Remote Plex laptop (read-only diagnostics over SSH):
+Remote Plex laptop (over SSH):
+
+Diagnostics (read-only):
 - plex_logs_tail — last N lines of Plex Media Server.log on the Plex laptop.
   Use for "what's Plex up to right now?", "is Plex okay?".
 - plex_logs_search — regex search of the same log. Use for "any transcoder
@@ -221,14 +224,27 @@ Remote Plex laptop (read-only diagnostics over SSH):
 - plex_laptop_health — CPU/RAM/disk/network on the Plex laptop. Use for
   "how is the Plex box doing?", "is the Plex laptop drowning?", "what's the
   disk space on Plex?".
-- These are READ-ONLY. None of them restart Plex, rotate logs, or change
-  laptop state. If the user asks for remediation ("restart Plex", "clear
-  the cache"), say plainly that you can diagnose but not act on the laptop yet.
 - For "is THIS PC vs the Plex laptop", remember pc_diagnostics is for THIS
   PC and plex_laptop_health is for the remote one.
 - Voice summaries: when reading log lines aloud, paraphrase the gist
   ("a couple of transcoder warnings around 8 PM, otherwise clean") rather
-  than reading raw timestamps and stack traces."""
+  than reading raw timestamps and stack traces.
+
+Actions (destructive, all confirmation-gated):
+- plex_action — restart Plex Media Server, refresh a library, or empty
+  Plex's trash for a library. ALL THREE require explicit user confirmation.
+- For ANY plex_action call: ask the user to confirm in plain language
+  first ("Confirm: restart Plex on the laptop?" / "Confirm: refresh the
+  Movies library?"), wait for an explicit yes, THEN call plex_action with
+  confirmed=true. The tool itself enforces this — if you call without
+  confirmed=true it returns a confirmation-required notice rather than
+  firing. Same pattern as kill_process on the local PC.
+- For refresh_library and empty_trash you need a library_id. If you don't
+  know it, call library_list (Plex MCP) first to enumerate sections.
+- If the user asks for an action we don't support yet (rotate logs,
+  restart the laptop itself, clear OS-level caches), say so plainly —
+  diagnose first, propose remediations in words, but don't pretend to
+  have a tool you don't."""
 
 
 # Anthropic's server-side web search tool. Server-side = Anthropic runs it,
@@ -376,12 +392,14 @@ def _execute_client_tool(
         return f"Tool error: {exc}"
 
 
-# Static dispatch table for the M24 SSH tools — keeps _execute_client_tool's
-# main body unchanged in shape with the existing one-liner-per-tool pattern.
+# Static dispatch table for the SSH-backed tools (M24 read-only + M27
+# actions) — keeps _execute_client_tool's main body unchanged in shape
+# with the existing one-liner-per-tool pattern.
 _PLEX_LAPTOP_DISPATCH = {
     "plex_logs_tail": execute_plex_logs_tail,
     "plex_logs_search": execute_plex_logs_search,
     "plex_laptop_health": execute_plex_laptop_health,
+    "plex_action": execute_plex_action,
 }
 _PLEX_LAPTOP_TOOL_NAMES = frozenset(_PLEX_LAPTOP_DISPATCH.keys())
 
@@ -441,6 +459,7 @@ def stream_response(
             PLEX_LOGS_TAIL_TOOL,
             PLEX_LOGS_SEARCH_TOOL,
             PLEX_LAPTOP_HEALTH_TOOL,
+            PLEX_ACTION_TOOL,
         ])
     if plex_client is not None:
         tools.extend(plex_client.tools)
