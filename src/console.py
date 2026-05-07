@@ -115,6 +115,17 @@ class JarvisConsole:
         )
         self._state_label.pack(side="left")
 
+        # Read-only mute indicator. Packed only while muted (controlled by
+        # set_muted). Toggle itself lives on the tray menu — keeping the
+        # console as a passive surface here so we don't duplicate state.
+        self._mute_label = ctk.CTkLabel(
+            state_frame,
+            text="🔇 muted",
+            font=("Segoe UI Emoji", 11),
+            text_color=self.DIM_FG,
+        )
+        # NB: not packed initially — _apply_muted handles pack/forget.
+
         # --- Audio waveform visualizer (M17) ---
         # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
         # Pre-cache each bar's x1/x2 so the per-frame redraw only mutates y.
@@ -169,10 +180,34 @@ class JarvisConsole:
             self._wave_bars.append(bar_id)
             self._wave_bar_x.append((x1, x2))
 
-        # --- Text input row (packed first with side='bottom' so it sticks to
-        # the bottom and the transcript above gets all remaining vertical space) ---
+        # --- Status bar (SRE-grade footer) ---
+        # Packed FIRST with side="bottom" so it sits at the absolute bottom;
+        # input_frame's subsequent side="bottom" pack lands directly above it.
+        # Single-line, dim, monospace — non-intrusive but always-visible.
+        # Format rebuilt by _update_status_text() whenever any status field
+        # changes. Uptime ticks every 60s via a recursive .after().
+        self._status_started_at = time.time()
+        self._status_model = "(model unset)"
+        self._status_tokens = 0
+        # Map of integration name → enabled bool. Order preserved so dots
+        # render in a stable left-to-right sequence regardless of when each
+        # integration registers itself.
+        self._status_integrations: dict[str, bool] = {}
+
+        self._status_label = ctk.CTkLabel(
+            self.root,
+            text="",
+            font=("Consolas", 9),
+            text_color=self.DIM_FG,
+            anchor="w",
+        )
+        self._status_label.pack(side="bottom", fill="x", padx=22, pady=(0, 6))
+        self._update_status_text()
+
+        # --- Text input row (packed second with side='bottom' so it sits
+        # directly above the status bar; transcript above gets remaining vertical space) ---
         input_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        input_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 16))
+        input_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 8))
 
         # Chip frame for staged attachment — created here, but only packed
         # when a file is staged (pack_forget when not). Sits ABOVE the entry
@@ -268,8 +303,11 @@ class JarvisConsole:
         # Kick off the animation ticks: state pulse (125ms = 8 fps) and the
         # waveform redraw (33ms = 30 fps). Two independent recursive .after()
         # chains so each can stop/continue without affecting the other.
+        # Uptime tick is much slower (60s) — the only field that changes
+        # autonomously.
         self.root.after(125, self._tick_animation)
         self.root.after(33, self._wave_tick)
+        self.root.after(60_000, self._tick_uptime)
 
     # ------------------------------------------------------------------
     # Public API — all thread-safe (schedule on Tk thread via .after()).
@@ -309,6 +347,47 @@ class JarvisConsole:
             return
         clamped = max(0.0, min(1.0, float(level)))
         self.root.after(0, self._set_amplitude_internal, clamped)
+
+    def set_muted(self, muted: bool) -> None:
+        """Thread-safe: show/hide the '🔇 muted' indicator. Called from the
+        UI coordinator when the tray's Mute checkbox is toggled."""
+        if not self._destroyed:
+            self.root.after(0, self._apply_muted, bool(muted))
+
+    # ------------------------------------------------------------------
+    # SRE status bar API — all thread-safe via .after().
+    # ------------------------------------------------------------------
+
+    def set_model_name(self, model: str) -> None:
+        """Display name for the model in the status bar. Strips the 'claude-'
+        prefix for readability — 'sonnet-4-6' beats 'claude-sonnet-4-6'."""
+        if self._destroyed:
+            return
+        clean = model.removeprefix("claude-") if model else "?"
+        self.root.after(0, self._set_status_field, "_status_model", clean)
+
+    def set_integration(self, name: str, enabled: bool) -> None:
+        """Register an integration's status (e.g. 'plex', 'laptop'). The dot
+        next to the name is filled when enabled, hollow when not. Multiple
+        calls update in place — call once at startup, again later if the
+        connection drops/recovers."""
+        if self._destroyed:
+            return
+        self.root.after(0, self._set_integration_internal, name, bool(enabled))
+
+    def add_session_tokens(self, n: int) -> None:
+        """Increment the running session-total token counter. Called from the
+        on_complete telemetry callback after each turn. Non-negative."""
+        if self._destroyed or n <= 0:
+            return
+        self.root.after(0, self._add_session_tokens_internal, int(n))
+
+    def add_telemetry_chip(self, text: str) -> None:
+        """Append a small dim metadata line under the most recent transcript
+        entry — typically right after a Jarvis response. Format is the
+        caller's choice; we just render in dim style."""
+        if not self._destroyed and text:
+            self.root.after(0, self._append_telemetry_chip, text)
 
     def show(self) -> None:
         if not self._destroyed:
@@ -361,6 +440,81 @@ class JarvisConsole:
         self._state = state
         try:
             self._state_label.configure(text=state.name)
+        except tk.TclError:
+            pass
+
+    def _apply_muted(self, muted: bool) -> None:
+        try:
+            if muted:
+                # padx pushes the indicator a bit off the state label so they
+                # read as related-but-distinct.
+                self._mute_label.pack(side="left", padx=(8, 0))
+            else:
+                self._mute_label.pack_forget()
+        except tk.TclError:
+            pass
+
+    # ----- Status bar internals (Tk-thread only) -----
+
+    def _set_status_field(self, attr: str, value) -> None:
+        setattr(self, attr, value)
+        self._update_status_text()
+
+    def _set_integration_internal(self, name: str, enabled: bool) -> None:
+        self._status_integrations[name] = enabled
+        self._update_status_text()
+
+    def _add_session_tokens_internal(self, n: int) -> None:
+        self._status_tokens += n
+        self._update_status_text()
+
+    def _format_uptime(self) -> str:
+        secs = int(time.time() - self._status_started_at)
+        h, rem = divmod(secs, 3600)
+        m, _ = divmod(rem, 60)
+        if h > 0:
+            return f"{h}h {m}m"
+        return f"{m}m"
+
+    def _update_status_text(self) -> None:
+        """Recompose the footer text from current state. Filled circle (●)
+        for enabled integrations, hollow (○) for not. Single dim line, no
+        wrapping — fits within a 520px window comfortably."""
+        parts = [
+            self._status_model,
+            f"up {self._format_uptime()}",
+            f"{self._status_tokens:,} tok",
+        ]
+        # Integrations get a fixed left-to-right ordering by registration time.
+        for name, enabled in self._status_integrations.items():
+            dot = "●" if enabled else "○"
+            parts.append(f"{name} {dot}")
+        try:
+            self._status_label.configure(text="  ·  ".join(parts))
+        except tk.TclError:
+            pass
+
+    def _tick_uptime(self) -> None:
+        """Refresh the uptime field every 60s. Cheap; just rebuilds the
+        label text. Stops itself if the window is destroyed."""
+        if self._destroyed:
+            return
+        self._update_status_text()
+        self.root.after(60_000, self._tick_uptime)
+
+    def _append_telemetry_chip(self, text: str) -> None:
+        """Add a small dim metadata line to the transcript, indented to align
+        with the response text above it. Sits inline with the conversation
+        rather than as a popover — keeps the SRE signal close to the answer
+        it describes."""
+        try:
+            self._transcript.configure(state="normal")
+            tb = self._transcript._textbox
+            # Indent matches the timestamp prefix width so the chip lines up
+            # under "you:" / "jarvis:" labels visually.
+            tb.insert("end", "\n        " + text, "dim")
+            tb.see("end")
+            self._transcript.configure(state="disabled")
         except tk.TclError:
             pass
 

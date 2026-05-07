@@ -57,6 +57,8 @@ class JarvisTray:
         memory_dir: Path | None = None,
         autostart_enabled: Callable[[], bool] | None = None,
         on_autostart_toggle: Callable[[], None] | None = None,
+        mute_enabled: Callable[[], bool] | None = None,
+        on_mute_toggle: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
         # Allow caller to share a shutdown event (UI coordinator) so a single
@@ -71,6 +73,8 @@ class JarvisTray:
         self._memory_dir = memory_dir
         self._autostart_enabled = autostart_enabled
         self._on_autostart_toggle = on_autostart_toggle
+        self._mute_enabled = mute_enabled
+        self._on_mute_toggle = on_mute_toggle
 
         menu_items: list[pystray.MenuItem] = []
         if on_show_window is not None:
@@ -81,6 +85,16 @@ class JarvisTray:
             menu_items.append(pystray.MenuItem("Open log", self._handle_open_log))
         if memory_dir is not None:
             menu_items.append(pystray.MenuItem("Open memory folder", self._handle_open_memory))
+        if mute_enabled is not None and on_mute_toggle is not None:
+            # Voice-output mute. Toggle bypasses TTS while leaving voice input
+            # + console transcript fully working — useful when someone's
+            # sleeping nearby. State lives on JarvisUI's mute_event; the
+            # `checked` lambda re-evaluates each menu open.
+            menu_items.append(pystray.MenuItem(
+                "Mute (text only)",
+                self._handle_toggle_mute,
+                checked=lambda item: bool(self._mute_enabled()),
+            ))
         if autostart_enabled is not None and on_autostart_toggle is not None:
             # Pystray re-evaluates `checked` each time the menu opens, so the
             # checkmark stays in sync if the shortcut is added/removed externally.
@@ -119,6 +133,10 @@ class JarvisTray:
     def _handle_toggle_autostart(self) -> None:
         if self._on_autostart_toggle is not None:
             self._on_autostart_toggle()
+
+    def _handle_toggle_mute(self) -> None:
+        if self._on_mute_toggle is not None:
+            self._on_mute_toggle()
 
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():

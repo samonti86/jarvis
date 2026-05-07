@@ -43,7 +43,7 @@ from pathlib import Path
 
 from src.audio import AudioSession
 from src.config import Config, load
-from src.llm import stream_response
+from src.llm import TelemetryRecord, stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.plex_laptop import DEFAULT_LOG_PATH as DEFAULT_PLEX_LAPTOP_LOG, PlexLaptopClient
 from src.plex_mcp import PlexMCPClient
@@ -264,6 +264,24 @@ def listen_loop(
 
             response_chunks: list[str] = []
 
+            def on_telemetry(rec: TelemetryRecord) -> None:
+                """Called by stream_response at the end of each turn. Surfaces
+                the per-turn signal that previously only existed as a stderr
+                log line. Format chosen for SRE skim-readability — verb
+                (which tools), then iteration count if >1, then how long,
+                then how much it cost."""
+                ui.add_session_tokens(rec.total_tokens)
+                bits: list[str] = []
+                if rec.tools_used:
+                    bits.append(", ".join(rec.tools_used))
+                if rec.iterations > 1:
+                    bits.append(f"{rec.iterations} iters")
+                bits.append(f"{rec.elapsed_sec:.1f}s")
+                bits.append(f"{rec.total_tokens:,} tok")
+                if rec.paused:
+                    bits.append("PAUSED(10-iter cap)")
+                ui.add_telemetry_chip(" · ".join(bits))
+
             def llm_stream():
                 for chunk in stream_response(
                     api_key=cfg.anthropic_api_key,
@@ -272,18 +290,35 @@ def listen_loop(
                     summaries=summaries,
                     plex_client=plex_client,
                     plex_laptop_client=plex_laptop_client,
+                    on_complete=on_telemetry,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
                     yield chunk
 
+            # Capture mute state at the start of the turn. If the user
+            # toggles mid-response, the change applies to the NEXT turn —
+            # mid-stream stop would be jarring and the streamed text is
+            # already visible in the console regardless.
+            muted = ui.is_muted()
+
             try:
-                speak_streaming(
-                    llm_stream(),
-                    language=language,
-                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                    on_amplitude=ui.set_amplitude,
-                )
+                if muted:
+                    # Drain the LLM stream silently. response_chunks gets
+                    # populated inside llm_stream via the print + append, so
+                    # the rest of the function (full_response assembly,
+                    # history append, persist) works unchanged. State stays
+                    # THINKING throughout — caller flips to IDLE after we
+                    # return.
+                    for _ in llm_stream():
+                        pass
+                else:
+                    speak_streaming(
+                        llm_stream(),
+                        language=language,
+                        on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                        on_amplitude=ui.set_amplitude,
+                    )
             except Exception as exc:
                 history.pop()  # keep history alternating user/assistant cleanly
                 print(f"\n[main] LLM/TTS failed: {exc}")
@@ -292,16 +327,19 @@ def listen_loop(
                 # A path (no streaming pipeline that could fail again). Wrap
                 # in defensive try/except so the apology itself can't break
                 # the loop. Add to transcript too so the console reflects it.
+                # When muted, skip TTS but still surface the apology text in
+                # the console — visual feedback that something went wrong.
                 apology = (
                     "Disculpe, tuve un problema técnico. ¿Podría intentarlo de nuevo?"
                     if language == "es"
                     else "Apologies, a technical hiccup. Could you try that again?"
                 )
-                ui.set_state(State.SPEAKING)
-                try:
-                    speak(apology, language=language)
-                except Exception as apology_exc:
-                    print(f"[main] apology TTS also failed: {apology_exc}")
+                if not muted:
+                    ui.set_state(State.SPEAKING)
+                    try:
+                        speak(apology, language=language)
+                    except Exception as apology_exc:
+                        print(f"[main] apology TTS also failed: {apology_exc}")
                 ui.add_jarvis_text(apology)
                 return
             print()
@@ -506,6 +544,15 @@ def main() -> None:
     # — exposed on the tray so the user can browse past transcripts in one click.
     ui = JarvisUI(log_path=log_path, memory_dir=default_base_dir())
     ui.set_on_reset(_on_reset)
+
+    # Status bar bootstrap. Model + integration dots are set once at startup;
+    # token counter accumulates as turns happen. Plex/laptop status reflects
+    # whether the optional integrations were configured + connected — not
+    # whether the underlying network is currently reachable (lazy connect on
+    # the laptop side means we don't probe until first use).
+    ui.set_model_name(cfg.claude_model)
+    ui.set_integration("plex", plex_client is not None)
+    ui.set_integration("laptop", plex_laptop_client is not None)
 
     worker = threading.Thread(
         target=listen_loop,

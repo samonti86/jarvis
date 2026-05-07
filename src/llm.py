@@ -34,8 +34,10 @@ about what was discussed in earlier (now-sealed) sessions.
 from __future__ import annotations
 
 import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Iterator
+from typing import Callable, Iterator
 
 import anthropic
 
@@ -233,6 +235,31 @@ WEB_FETCH_TOOL = {
 _MAX_LOOP_ITERATIONS = 5
 
 
+@dataclass
+class TelemetryRecord:
+    """Per-turn structured telemetry. Same data the existing stderr log line
+    carries, exposed as a callable contract so the UI can surface it.
+
+    Latency is wall-clock LLM-and-tools time only — TTS playback is excluded.
+    For an SRE skimming the console, "how long did Jarvis spend thinking" is
+    the more useful number than "how long did the whole turn take".
+    """
+    elapsed_sec: float
+    iterations: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_create_tokens: int
+    tools_used: list[str] = field(default_factory=list)
+    paused: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        # cache_read_tokens are billed at a discount but still count as
+        # "input" semantically; include for the SRE-grade total.
+        return self.input_tokens + self.output_tokens + self.cache_read_tokens
+
+
 def _format_today() -> str:
     """Cross-platform 'Sunday, May 4, 2026' (no leading zero on day)."""
     now = datetime.now()
@@ -318,6 +345,7 @@ def stream_response(
     summaries: list[SummaryRecord] | None = None,
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
+    on_complete: Callable[[TelemetryRecord], None] | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -331,7 +359,11 @@ def stream_response(
     its tools are surfaced to Claude alongside the built-in tools.
     `plex_laptop_client` (optional, M24) — if SSH-reachable, the three remote
     diagnostic tools (logs_tail, logs_search, laptop_health) get registered.
+    `on_complete` (optional) — called once at the end with a TelemetryRecord
+    for UI consumption. The same data is also stderr-logged in the existing
+    one-line format. Wrapped in try/except so a UI bug can't poison the turn.
     """
+    started_at = time.monotonic()
     client = anthropic.Anthropic(api_key=api_key)
     system_text = build_system_prompt(
         summaries,
@@ -491,10 +523,50 @@ def stream_response(
     if iterations > 1:
         extra += f" iters={iterations}"
 
+    elapsed = time.monotonic() - started_at
     print(
         f"[llm] tokens: input={total_input} output={total_output} "
         f"cache_read={total_cache_read} cache_create={total_cache_create} "
-        f"history_msgs={len(messages)} summaries={len(summaries) if summaries else 0}"
+        f"history_msgs={len(messages)} summaries={len(summaries) if summaries else 0} "
+        f"elapsed={elapsed:.1f}s"
         f"{extra}",
         file=sys.stderr,
     )
+
+    if on_complete is not None:
+        # Build the structured record. Order matches "what an SRE wants to see
+        # first": which tools fired (the verb), then how many turns of the
+        # agentic loop, then time, then cost.
+        tools_used: list[str] = []
+        if web_searched:
+            tools_used.append("web_search")
+        if web_fetched:
+            tools_used.append("web_fetch")
+        if sports_called:
+            tools_used.append("get_sports_info")
+        if weather_called:
+            tools_used.append("get_weather")
+        if games_called:
+            tools_used.append("get_game_info")
+        if diagnostics_called:
+            tools_used.append("pc_diagnostics")
+        if sysctl_called:
+            tools_used.append("system_control")
+        tools_used.extend(sorted(plex_laptop_tools_called))
+        tools_used.extend(sorted(plex_tools_called))
+
+        record = TelemetryRecord(
+            elapsed_sec=elapsed,
+            iterations=iterations,
+            input_tokens=total_input,
+            output_tokens=total_output,
+            cache_read_tokens=total_cache_read,
+            cache_create_tokens=total_cache_create,
+            tools_used=tools_used,
+            paused=paused,
+        )
+        try:
+            on_complete(record)
+        except Exception as exc:
+            # A UI bug must never break the listen loop.
+            print(f"[llm] on_complete callback raised: {exc}", file=sys.stderr)

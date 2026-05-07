@@ -42,6 +42,10 @@ class JarvisUI:
         self.console = JarvisConsole()
 
         self.shutdown = threading.Event()
+        # When set, main.py's process_question bypasses TTS and just streams
+        # the text response into the console. Toggleable from the tray.
+        # Always starts cleared (unmuted) — restart is a clean slate.
+        self.mute_event = threading.Event()
         self._log_path = log_path
         self._memory_dir = memory_dir
         self._tray: JarvisTray | None = None
@@ -85,6 +89,49 @@ class JarvisUI:
         self.console.set_amplitude(level)
 
     # ------------------------------------------------------------------
+    # SRE status / telemetry — pass-throughs to the console's status bar.
+    # ------------------------------------------------------------------
+
+    def set_model_name(self, model: str) -> None:
+        self.console.set_model_name(model)
+
+    def set_integration(self, name: str, enabled: bool) -> None:
+        self.console.set_integration(name, enabled)
+
+    def add_session_tokens(self, n: int) -> None:
+        self.console.add_session_tokens(n)
+
+    def add_telemetry_chip(self, text: str) -> None:
+        self.console.add_telemetry_chip(text)
+
+    # ------------------------------------------------------------------
+    # Mute toggle. Voice INPUT and console text both keep working when
+    # muted; only TTS playback is suppressed. Toggle lives on the tray
+    # menu; the console shows a passive read-only indicator.
+    # ------------------------------------------------------------------
+
+    def is_muted(self) -> bool:
+        return self.mute_event.is_set()
+
+    def set_muted(self, muted: bool) -> None:
+        """Apply the mute state and propagate to the console indicator.
+        Idempotent — calling with the current value is a no-op."""
+        if muted == self.is_muted():
+            return
+        if muted:
+            self.mute_event.set()
+        else:
+            self.mute_event.clear()
+        self.console.set_muted(muted)
+        self.console.add_system_text("muted — Jarvis will respond in text only." if muted
+                                     else "unmuted — Jarvis will speak again.")
+
+    def _handle_toggle_mute(self) -> None:
+        """Tray menu callback. Runs on pystray's thread; UI updates inside
+        set_muted are themselves thread-safe."""
+        self.set_muted(not self.is_muted())
+
+    # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------
 
@@ -116,6 +163,8 @@ class JarvisUI:
             memory_dir=self._memory_dir,
             autostart_enabled=autostart.is_enabled,
             on_autostart_toggle=self._toggle_autostart,
+            mute_enabled=self.is_muted,
+            on_mute_toggle=self._handle_toggle_mute,
             shutdown_event=self.shutdown,
         )
         self._tray.run()
