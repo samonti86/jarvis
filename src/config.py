@@ -22,6 +22,10 @@ class Config:
     retain_raw_days: int       # transcripts older than this are pruned on app start
     plex_url: str              # M21 — empty if Plex MCP not configured
     plex_token: str            # M21 — empty if Plex MCP not configured
+    plex_laptop_host: str      # M24 — IP/hostname of the Plex laptop (empty disables tools)
+    plex_laptop_user: str      # M24 — SSH username on the Plex laptop
+    plex_laptop_key_path: str  # M24 — path to private key (~ expanded); blank → default ed25519
+    plex_laptop_log_path: str  # M24 — Plex Media Server.log path on the laptop; blank → default
 
 
 def load() -> Config:
@@ -37,4 +41,8 @@ def load() -> Config:
         retain_raw_days=int(os.getenv("RETAIN_RAW_DAYS", "30")),
         plex_url=os.getenv("PLEX_URL", "").strip(),
         plex_token=os.getenv("PLEX_TOKEN", "").strip(),
+        plex_laptop_host=os.getenv("PLEX_LAPTOP_HOST", "").strip(),
+        plex_laptop_user=os.getenv("PLEX_LAPTOP_USER", "").strip(),
+        plex_laptop_key_path=os.getenv("PLEX_LAPTOP_KEY_PATH", "").strip(),
+        plex_laptop_log_path=os.getenv("PLEX_LAPTOP_LOG_PATH", "").strip(),
     )

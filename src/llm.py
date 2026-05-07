@@ -42,6 +42,15 @@ import anthropic
 from src.games import GAMES_TOOL, execute_games_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
+from src.plex_laptop import (
+    PLEX_LAPTOP_HEALTH_TOOL,
+    PLEX_LOGS_SEARCH_TOOL,
+    PLEX_LOGS_TAIL_TOOL,
+    PlexLaptopClient,
+    execute_plex_laptop_health,
+    execute_plex_logs_search,
+    execute_plex_logs_tail,
+)
 from src.plex_mcp import PlexMCPClient
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
@@ -166,6 +175,30 @@ Media library (Plex):
   to narrow down."""
 
 
+# Appended only when a live SSH client to the Plex laptop is available.
+# Same gating discipline as _PLEX_PROMPT_ADDENDUM — never promise tools that
+# aren't actually wired up.
+_PLEX_LAPTOP_PROMPT_ADDENDUM = """
+
+Remote Plex laptop (read-only diagnostics over SSH):
+- plex_logs_tail — last N lines of Plex Media Server.log on the Plex laptop.
+  Use for "what's Plex up to right now?", "is Plex okay?".
+- plex_logs_search — regex search of the same log. Use for "any transcoder
+  errors today?", "any 401s?", "any streaming failures recently?". The
+  pattern is a .NET regex — alternation works ('error|fail|warning').
+- plex_laptop_health — CPU/RAM/disk/network on the Plex laptop. Use for
+  "how is the Plex box doing?", "is the Plex laptop drowning?", "what's the
+  disk space on Plex?".
+- These are READ-ONLY. None of them restart Plex, rotate logs, or change
+  laptop state. If the user asks for remediation ("restart Plex", "clear
+  the cache"), say plainly that you can diagnose but not act on the laptop yet.
+- For "is THIS PC vs the Plex laptop", remember pc_diagnostics is for THIS
+  PC and plex_laptop_health is for the remote one.
+- Voice summaries: when reading log lines aloud, paraphrase the gist
+  ("a couple of transcoder warnings around 8 PM, otherwise clean") rather
+  than reading raw timestamps and stack traces."""
+
+
 # Anthropic's server-side web search tool. Server-side = Anthropic runs it,
 # we just declare it. The "_20260209" version includes dynamic filtering.
 # Supported on Sonnet 4.6, Opus 4.6, Opus 4.7.
@@ -209,6 +242,7 @@ def _format_today() -> str:
 def build_system_prompt(
     summaries: list[SummaryRecord] | None = None,
     plex_available: bool = False,
+    plex_laptop_available: bool = False,
 ) -> str:
     """Compose the system prompt with the current date and optional memory.
 
@@ -216,13 +250,16 @@ def build_system_prompt(
     stale vs. current. We use date precision (not time) so the cache breakpoint
     invalidates at most once per day, not per turn.
 
-    When `plex_available` is True, append a Plex section advertising the
-    media-library tools. We gate this on actual session presence so a
-    graceful-fail startup doesn't leave Claude believing in tools it can't call.
+    Optional addenda are gated on actual tool availability so a graceful-fail
+    startup doesn't leave Claude believing in tools it can't call:
+    - `plex_available` (M21): advertise the Plex MCP media tools
+    - `plex_laptop_available` (M24): advertise the remote-laptop SSH tools
     """
     base = f"{JARVIS_SYSTEM_PROMPT}\n\nToday is {_format_today()}."
     if plex_available:
         base += _PLEX_PROMPT_ADDENDUM
+    if plex_laptop_available:
+        base += _PLEX_LAPTOP_PROMPT_ADDENDUM
     if not summaries:
         return base
     memory_block = format_summaries_for_prompt(summaries)
@@ -237,6 +274,7 @@ def _execute_client_tool(
     name: str,
     tool_input: dict,
     plex_client: PlexMCPClient | None = None,
+    plex_laptop_client: PlexLaptopClient | None = None,
 ) -> str:
     """Dispatch a client-side tool call. Returns a string for Claude to consume.
     Errors become readable strings — never raises."""
@@ -251,6 +289,8 @@ def _execute_client_tool(
             return execute_pc_diagnostics_tool(tool_input)
         if name == "system_control":
             return execute_system_control_tool(tool_input)
+        if plex_laptop_client is not None and name in _PLEX_LAPTOP_TOOL_NAMES:
+            return _PLEX_LAPTOP_DISPATCH[name](plex_laptop_client, tool_input)
         if plex_client is not None and name in plex_client.tool_names:
             return plex_client.call_tool(name, tool_input)
         return f"Unknown tool: {name}"
@@ -261,12 +301,23 @@ def _execute_client_tool(
         return f"Tool error: {exc}"
 
 
+# Static dispatch table for the M24 SSH tools — keeps _execute_client_tool's
+# main body unchanged in shape with the existing one-liner-per-tool pattern.
+_PLEX_LAPTOP_DISPATCH = {
+    "plex_logs_tail": execute_plex_logs_tail,
+    "plex_logs_search": execute_plex_logs_search,
+    "plex_laptop_health": execute_plex_laptop_health,
+}
+_PLEX_LAPTOP_TOOL_NAMES = frozenset(_PLEX_LAPTOP_DISPATCH.keys())
+
+
 def stream_response(
     api_key: str,
     messages: list[dict],
     model: str = "claude-sonnet-4-6",
     summaries: list[SummaryRecord] | None = None,
     plex_client: PlexMCPClient | None = None,
+    plex_laptop_client: PlexLaptopClient | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -278,10 +329,14 @@ def stream_response(
     `summaries` (optional) prepends recent-session context to the system prompt.
     `plex_client` (optional, M21) — if a live Plex MCP session is provided,
     its tools are surfaced to Claude alongside the built-in tools.
+    `plex_laptop_client` (optional, M24) — if SSH-reachable, the three remote
+    diagnostic tools (logs_tail, logs_search, laptop_health) get registered.
     """
     client = anthropic.Anthropic(api_key=api_key)
     system_text = build_system_prompt(
-        summaries, plex_available=plex_client is not None
+        summaries,
+        plex_available=plex_client is not None,
+        plex_laptop_available=plex_laptop_client is not None,
     )
     system_param = [
         {
@@ -295,6 +350,12 @@ def stream_response(
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
         PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
     ]
+    if plex_laptop_client is not None:
+        tools.extend([
+            PLEX_LOGS_TAIL_TOOL,
+            PLEX_LOGS_SEARCH_TOOL,
+            PLEX_LAPTOP_HEALTH_TOOL,
+        ])
     if plex_client is not None:
         tools.extend(plex_client.tools)
 
@@ -312,6 +373,7 @@ def stream_response(
     sysctl_called = False
     paused = False
     plex_tools_called: set[str] = set()
+    plex_laptop_tools_called: set[str] = set()
     total_input = total_output = total_cache_read = total_cache_create = 0
     iterations = 0
 
@@ -378,10 +440,15 @@ def stream_response(
                 diagnostics_called = True
             elif name == "system_control":
                 sysctl_called = True
+            elif name in _PLEX_LAPTOP_TOOL_NAMES:
+                plex_laptop_tools_called.add(name)
             elif plex_client is not None and name in plex_client.tool_names:
                 plex_tools_called.add(name)
             result_text = _execute_client_tool(
-                name, block.input or {}, plex_client=plex_client
+                name,
+                block.input or {},
+                plex_client=plex_client,
+                plex_laptop_client=plex_laptop_client,
             )
             tool_results.append({
                 "type": "tool_result",
@@ -417,6 +484,8 @@ def stream_response(
         extra += " sysctl=yes"
     if plex_tools_called:
         extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
+    if plex_laptop_tools_called:
+        extra += f" plex_laptop_tools={','.join(sorted(plex_laptop_tools_called))}"
     if paused:
         extra += " PAUSED_TURN(10-iter cap)"
     if iterations > 1:

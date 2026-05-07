@@ -45,6 +45,7 @@ from src.audio import AudioSession
 from src.config import Config, load
 from src.llm import stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
+from src.plex_laptop import DEFAULT_LOG_PATH as DEFAULT_PLEX_LAPTOP_LOG, PlexLaptopClient
 from src.plex_mcp import PlexMCPClient
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
@@ -164,6 +165,7 @@ def listen_loop(
     ui: JarvisUI,
     reset_event: threading.Event,
     plex_client: PlexMCPClient | None = None,
+    plex_laptop_client: PlexLaptopClient | None = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -269,6 +271,7 @@ def listen_loop(
                     model=cfg.claude_model,
                     summaries=summaries,
                     plex_client=plex_client,
+                    plex_laptop_client=plex_laptop_client,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
@@ -429,6 +432,47 @@ def _try_connect_plex(cfg: Config) -> PlexMCPClient | None:
     return client
 
 
+def _try_connect_plex_laptop(cfg: Config) -> PlexLaptopClient | None:
+    """M24: best-effort SSH client for the Plex laptop diagnostic tools.
+
+    Lazy connect — we don't actually open the TCP+SSH handshake here, just
+    construct the client (which validates params). The first tool call opens
+    the connection. That keeps Jarvis startup fast even when the laptop is
+    asleep or off-network; voice queries to other tools work normally, and
+    only an actual plex_logs_* / plex_laptop_health call would hit the
+    "Plex laptop unreachable" string.
+
+    Any failure (missing host/user, bad key path, paramiko import problem)
+    logs and returns None. The rest of Jarvis runs unaffected.
+    """
+    if not cfg.plex_laptop_host or not cfg.plex_laptop_user:
+        print(
+            "[plex-laptop] PLEX_LAPTOP_HOST/USER unset — remote tools disabled",
+            file=sys.stderr,
+        )
+        return None
+    key_path = cfg.plex_laptop_key_path or os.path.expanduser("~/.ssh/id_ed25519")
+    log_path = cfg.plex_laptop_log_path or DEFAULT_PLEX_LAPTOP_LOG
+    try:
+        client = PlexLaptopClient(
+            host=cfg.plex_laptop_host,
+            user=cfg.plex_laptop_user,
+            key_path=key_path,
+            log_path=log_path,
+        )
+    except Exception as exc:
+        print(
+            f"[plex-laptop] init failed ({exc}); continuing without remote tools",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"[plex-laptop] ready — will connect to {cfg.plex_laptop_user}@{cfg.plex_laptop_host} on first tool call",
+        file=sys.stderr,
+    )
+    return client
+
+
 def main() -> None:
     log_path = setup_logging()
 
@@ -441,6 +485,11 @@ def main() -> None:
     # the first time as plex-mcp-server initializes its plexapi connection.
     # Failure is non-fatal — we simply run without Plex tools.
     plex_client = _try_connect_plex(cfg)
+
+    # M24: prepare the SSH client to the Plex laptop. This is lazy — no
+    # network until the first tool call — so it adds zero startup latency
+    # even when the laptop is off.
+    plex_laptop_client = _try_connect_plex_laptop(cfg)
 
     print("Jarvis ready. Tray icon active — left-click to show window. Say 'Hey Jarvis' to begin.\n")
 
@@ -460,7 +509,7 @@ def main() -> None:
 
     worker = threading.Thread(
         target=listen_loop,
-        args=(cfg, ui, reset_event, plex_client),
+        args=(cfg, ui, reset_event, plex_client, plex_laptop_client),
         daemon=True,
     )
     worker.start()
@@ -484,6 +533,14 @@ def main() -> None:
             plex_client.close()
         except Exception as exc:
             print(f"[plex-mcp] close failed: {exc}", file=sys.stderr)
+
+    # M24: tear down the persistent SSH connection. Idempotent + non-blocking;
+    # paramiko handles the channel cleanup internally.
+    if plex_laptop_client is not None:
+        try:
+            plex_laptop_client.close()
+        except Exception as exc:
+            print(f"[plex-laptop] close failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

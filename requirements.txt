@@ -39,3 +39,8 @@ plex-mcp-server>=1.1.7
 # we shell out to PowerShell Get-WinEvent for event log queries.
 psutil>=5.9
 pycaw>=20240210
+
+# Remote Plex laptop diagnostics over SSH (M24). paramiko is pure-Python
+# (depends on cryptography for asymmetric crypto). Used for log triage and
+# remote system-health queries against the Plex laptop using ed25519 key auth.
+paramiko>=3.4
