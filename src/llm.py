@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Iterator
+from typing import Callable, Iterator, NamedTuple
 
 import anthropic
 
@@ -383,6 +383,48 @@ def build_system_prompt(
     )
 
 
+class _ClientTool(NamedTuple):
+    """A built-in client-side tool Jarvis runs locally (vs. the server-side
+    web_search / web_fetch that Anthropic executes)."""
+    execute: Callable[[dict], str]   # runs the tool; returns Claude-readable text, never raises
+    log_label: str                   # short marker for the stderr telemetry line ("sysctl", "diag_collector", ...)
+
+
+# Single source of truth for the built-in client-side tools: API name →
+# (executor, telemetry label). Drives _execute_client_tool's dispatch AND the
+# per-turn telemetry — the set of fired names plus this map produce both the
+# stderr log markers and the console chip. Adding a tool means: import its
+# executor + schema, add one entry here, and add the schema to the `tools`
+# list in stream_response. Insertion order is preserved and defines telemetry
+# order, so keep it sensible (the order the SRE wants to read it in).
+_CLIENT_TOOLS: dict[str, _ClientTool] = {
+    "get_sports_info":              _ClientTool(execute_sports_tool, "sports_tool"),
+    "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
+    "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
+    "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
+    "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
+    "read_local_file":              _ClientTool(execute_read_local_file, "read_file"),
+    "run_pc_diagnostics_collector": _ClientTool(execute_run_pc_diagnostics_collector, "diag_collector"),
+}
+
+# Server-side tools — Anthropic runs these; we only declare them (in
+# stream_response's `tools` list) and record that they fired. Ordered:
+# defines telemetry order. Each name doubles as its own stderr label.
+_SERVER_TOOLS: tuple[str, ...] = ("web_search", "web_fetch")
+
+# SSH-backed tools (M24 read-only + M27 actions). Their executors take the
+# PlexLaptopClient as a first arg, so they're dispatched separately from
+# _CLIENT_TOOLS; telemetry groups them under one `plex_laptop_tools=` marker
+# since they're a family. (Plex MCP tools, M21, are dynamic — names come from
+# the server at runtime — so they're only known via plex_client.tool_names.)
+_PLEX_LAPTOP_DISPATCH = {
+    "plex_logs_tail": execute_plex_logs_tail,
+    "plex_logs_search": execute_plex_logs_search,
+    "plex_laptop_health": execute_plex_laptop_health,
+    "plex_action": execute_plex_action,
+}
+
+
 def _execute_client_tool(
     name: str,
     tool_input: dict,
@@ -392,21 +434,10 @@ def _execute_client_tool(
     """Dispatch a client-side tool call. Returns a string for Claude to consume.
     Errors become readable strings — never raises."""
     try:
-        if name == "get_sports_info":
-            return execute_sports_tool(tool_input)
-        if name == "get_weather":
-            return execute_weather_tool(tool_input)
-        if name == "get_game_info":
-            return execute_games_tool(tool_input)
-        if name == "pc_diagnostics":
-            return execute_pc_diagnostics_tool(tool_input)
-        if name == "system_control":
-            return execute_system_control_tool(tool_input)
-        if name == "read_local_file":
-            return execute_read_local_file(tool_input)
-        if name == "run_pc_diagnostics_collector":
-            return execute_run_pc_diagnostics_collector(tool_input)
-        if plex_laptop_client is not None and name in _PLEX_LAPTOP_TOOL_NAMES:
+        client_tool = _CLIENT_TOOLS.get(name)
+        if client_tool is not None:
+            return client_tool.execute(tool_input)
+        if plex_laptop_client is not None and name in _PLEX_LAPTOP_DISPATCH:
             return _PLEX_LAPTOP_DISPATCH[name](plex_laptop_client, tool_input)
         if plex_client is not None and name in plex_client.tool_names:
             return plex_client.call_tool(name, tool_input)
@@ -416,18 +447,6 @@ def _execute_client_tool(
         # but a future tool might not. Don't let a tool exception kill the turn.
         print(f"[llm] tool '{name}' raised: {exc}", file=sys.stderr)
         return f"Tool error: {exc}"
-
-
-# Static dispatch table for the SSH-backed tools (M24 read-only + M27
-# actions) — keeps _execute_client_tool's main body unchanged in shape
-# with the existing one-liner-per-tool pattern.
-_PLEX_LAPTOP_DISPATCH = {
-    "plex_logs_tail": execute_plex_logs_tail,
-    "plex_logs_search": execute_plex_logs_search,
-    "plex_laptop_health": execute_plex_laptop_health,
-    "plex_action": execute_plex_action,
-}
-_PLEX_LAPTOP_TOOL_NAMES = frozenset(_PLEX_LAPTOP_DISPATCH.keys())
 
 
 def stream_response(
@@ -495,19 +514,16 @@ def stream_response(
     # agentic loop runs. The caller's `messages` list is left untouched.
     working = list(messages)
 
-    # Telemetry accumulators across all iterations.
-    web_searched = False
-    web_fetched = False
-    sports_called = False
-    weather_called = False
-    games_called = False
-    diagnostics_called = False
-    sysctl_called = False
-    read_file_called = False
-    collector_called = False
+    # Telemetry accumulators across all agentic-loop iterations. We track the
+    # set of fired tool names per category; _CLIENT_TOOLS / _SERVER_TOOLS map
+    # those to stderr labels + the console chip below. (The categories are
+    # real — server-side and SSH-backed/MCP tools are formatted differently
+    # in the log: individual `x=yes` markers vs. one grouped `x_tools=a,b`.)
+    fired_server: set[str] = set()        # subset of _SERVER_TOOLS
+    fired_client: set[str] = set()        # subset of _CLIENT_TOOLS keys
+    fired_plex_laptop: set[str] = set()   # subset of _PLEX_LAPTOP_DISPATCH keys
+    fired_plex_mcp: set[str] = set()      # dynamic names from the Plex MCP server
     paused = False
-    plex_tools_called: set[str] = set()
-    plex_laptop_tools_called: set[str] = set()
     total_input = total_output = total_cache_read = total_cache_create = 0
     iterations = 0
 
@@ -552,13 +568,10 @@ def stream_response(
         # only — the SDK has already executed them and the text stream above
         # included Claude's post-tool text.
         for block in final.content:
-            if getattr(block, "type", None) != "server_tool_use":
-                continue
-            sname = getattr(block, "name", None)
-            if sname == "web_search":
-                web_searched = True
-            elif sname == "web_fetch":
-                web_fetched = True
+            if getattr(block, "type", None) == "server_tool_use":
+                sname = getattr(block, "name", None)
+                if sname in _SERVER_TOOLS:
+                    fired_server.add(sname)
 
         # Server-side loop hit its 10-iteration cap. Rare in voice; we log
         # and bail rather than try to manually resume.
@@ -580,24 +593,12 @@ def stream_response(
             if getattr(block, "type", None) != "tool_use":
                 continue
             name = block.name
-            if name == "get_sports_info":
-                sports_called = True
-            elif name == "get_weather":
-                weather_called = True
-            elif name == "get_game_info":
-                games_called = True
-            elif name == "pc_diagnostics":
-                diagnostics_called = True
-            elif name == "system_control":
-                sysctl_called = True
-            elif name == "read_local_file":
-                read_file_called = True
-            elif name == "run_pc_diagnostics_collector":
-                collector_called = True
-            elif name in _PLEX_LAPTOP_TOOL_NAMES:
-                plex_laptop_tools_called.add(name)
+            if name in _CLIENT_TOOLS:
+                fired_client.add(name)
+            elif name in _PLEX_LAPTOP_DISPATCH:
+                fired_plex_laptop.add(name)
             elif plex_client is not None and name in plex_client.tool_names:
-                plex_tools_called.add(name)
+                fired_plex_mcp.add(name)
             result_text = _execute_client_tool(
                 name,
                 block.input or {},
@@ -621,35 +622,22 @@ def stream_response(
             file=sys.stderr,
         )
 
-    extra = ""
-    if web_searched:
-        extra += " web_search=yes"
-    if web_fetched:
-        extra += " web_fetch=yes"
-    if sports_called:
-        extra += " sports_tool=yes"
-    if weather_called:
-        extra += " weather_tool=yes"
-    if games_called:
-        extra += " games_tool=yes"
-    if diagnostics_called:
-        extra += " diagnostics=yes"
-    if sysctl_called:
-        extra += " sysctl=yes"
-    if read_file_called:
-        extra += " read_file=yes"
-    if collector_called:
-        extra += " diag_collector=yes"
-    if plex_tools_called:
-        extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
-    if plex_laptop_tools_called:
-        extra += f" plex_laptop_tools={','.join(sorted(plex_laptop_tools_called))}"
+    # Compact tool/run markers for the stderr line. Order: server tools, then
+    # built-in client tools (in _CLIENT_TOOLS order), then the grouped MCP /
+    # SSH families, then run-shape markers.
+    markers: list[str] = [f"{n}=yes" for n in _SERVER_TOOLS if n in fired_server]
+    markers += [f"{ct.log_label}=yes" for n, ct in _CLIENT_TOOLS.items() if n in fired_client]
+    if fired_plex_mcp:
+        markers.append(f"mcp_tools={','.join(sorted(fired_plex_mcp))}")
+    if fired_plex_laptop:
+        markers.append(f"plex_laptop_tools={','.join(sorted(fired_plex_laptop))}")
     if paused:
-        extra += " PAUSED_TURN(10-iter cap)"
+        markers.append("PAUSED_TURN(10-iter cap)")
     if iterations > 1:
-        extra += f" iters={iterations}"
+        markers.append(f"iters={iterations}")
     if engineer_mode:
-        extra += " thinking=on"
+        markers.append("thinking=on")
+    extra = (" " + " ".join(markers)) if markers else ""
 
     elapsed = time.monotonic() - started_at
     print(
@@ -662,30 +650,15 @@ def stream_response(
     )
 
     if on_complete is not None:
-        # Build the structured record. Order matches "what an SRE wants to see
-        # first": which tools fired (the verb), then how many turns of the
-        # agentic loop, then time, then cost.
-        tools_used: list[str] = []
-        if web_searched:
-            tools_used.append("web_search")
-        if web_fetched:
-            tools_used.append("web_fetch")
-        if sports_called:
-            tools_used.append("get_sports_info")
-        if weather_called:
-            tools_used.append("get_weather")
-        if games_called:
-            tools_used.append("get_game_info")
-        if diagnostics_called:
-            tools_used.append("pc_diagnostics")
-        if sysctl_called:
-            tools_used.append("system_control")
-        if read_file_called:
-            tools_used.append("read_local_file")
-        if collector_called:
-            tools_used.append("run_pc_diagnostics_collector")
-        tools_used.extend(sorted(plex_laptop_tools_called))
-        tools_used.extend(sorted(plex_tools_called))
+        # Flat ordered list of API tool names that fired this turn (the "verb"
+        # the console chip leads with). Order: server tools, built-in client
+        # tools (in _CLIENT_TOOLS order), then the SSH and MCP families.
+        tools_used = (
+            [n for n in _SERVER_TOOLS if n in fired_server]
+            + [n for n in _CLIENT_TOOLS if n in fired_client]
+            + sorted(fired_plex_laptop)
+            + sorted(fired_plex_mcp)
+        )
 
         record = TelemetryRecord(
             elapsed_sec=elapsed,
