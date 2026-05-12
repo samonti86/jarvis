@@ -86,14 +86,7 @@ def load_attachment(path: str) -> tuple[dict | None, str | None]:
         b64, err = _read_b64(p)
         if err is not None:
             return None, err
-        return {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime,
-                "data": b64,
-            },
-        }, None
+        return image_block_from_b64(b64, mime), None
 
     # Text / code files — decode and embed with a filename header so Claude
     # has context about what it's reading.
@@ -116,3 +109,17 @@ def _read_b64(p: Path) -> tuple[str, str | None]:
         return base64.b64encode(p.read_bytes()).decode("ascii"), None
     except OSError as exc:
         return "", f"failed to read {p.name}: {exc}"
+
+
+def image_block(data: bytes, media_type: str = "image/jpeg") -> dict:
+    """Build a Messages-API `image` content block from raw image bytes.
+    Used by load_attachment (file → block) and src/cameras.py (webcam frame
+    → block)."""
+    return image_block_from_b64(base64.b64encode(data).decode("ascii"), media_type)
+
+
+def image_block_from_b64(b64: str, media_type: str) -> dict:
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": b64},
+    }

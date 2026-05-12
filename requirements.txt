@@ -44,3 +44,9 @@ pycaw>=20240210
 # (depends on cryptography for asymmetric crypto). Used for log triage and
 # remote system-health queries against the Plex laptop using ed25519 key auth.
 paramiko>=3.4
+
+# Camera vision (M29) — grab a still frame from the USB webcam for the
+# camera_snapshot tool, which hands the image to Claude (multimodal) to
+# describe. headless = no GUI/Qt bits we don't need. cv2.VideoCapture also
+# does RTSP, so this is forward-compatible if IP cameras get added later.
+opencv-python-headless>=4.8

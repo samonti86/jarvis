@@ -41,6 +41,7 @@ from typing import Callable, Iterator, NamedTuple
 
 import anthropic
 
+from src.cameras import CAMERA_SNAPSHOT_TOOL, execute_camera_snapshot
 from src.diagnostics_collector import (
     RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
     execute_run_pc_diagnostics_collector,
@@ -163,6 +164,18 @@ Local-PC safety rules:
   snapshot for follow-up". For a quick "any errors lately?" the live tool is
   enough — don't kick off a minute-long collection unless the user wants the
   depth or a ticket bundle.
+
+Vision (you can see — one tool):
+10. camera_snapshot — capture a still photo from the webcam and look at it:
+    your eyes on the physical world. Use it whenever the user asks what you
+    see, what's in the room, whether something is there or in a certain state
+    ("is the package on the porch?", "did the pet get on the couch?", "is the
+    kitchen light on?", "how do I look?"), or to read or identify something
+    they hold up. Capture takes a few seconds; each call grabs a fresh frame.
+    Describe what you see briefly and conversationally — like glancing over
+    and remarking on it, not narrating a photo. Don't say "let me take a
+    picture" — just look and report. If it comes back as an error string
+    (camera in use, shutter closed), relay that plainly.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -386,8 +399,10 @@ def build_system_prompt(
 class _ClientTool(NamedTuple):
     """A built-in client-side tool Jarvis runs locally (vs. the server-side
     web_search / web_fetch that Anthropic executes)."""
-    execute: Callable[[dict], str]   # runs the tool; returns Claude-readable text, never raises
-    log_label: str                   # short marker for the stderr telemetry line ("sysctl", "diag_collector", ...)
+    # Runs the tool. Returns text for Claude, OR a list of content blocks
+    # (e.g. camera_snapshot returns an image block + caption). Never raises.
+    execute: Callable[[dict], "str | list[dict]"]
+    log_label: str                   # short marker for the stderr telemetry line ("sysctl", "camera", ...)
 
 
 # Single source of truth for the built-in client-side tools: API name →
@@ -405,6 +420,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
     "read_local_file":              _ClientTool(execute_read_local_file, "read_file"),
     "run_pc_diagnostics_collector": _ClientTool(execute_run_pc_diagnostics_collector, "diag_collector"),
+    "camera_snapshot":              _ClientTool(execute_camera_snapshot, "camera"),
 }
 
 # Server-side tools — Anthropic runs these; we only declare them (in
@@ -430,9 +446,10 @@ def _execute_client_tool(
     tool_input: dict,
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
-) -> str:
-    """Dispatch a client-side tool call. Returns a string for Claude to consume.
-    Errors become readable strings — never raises."""
+) -> str | list[dict]:
+    """Dispatch a client-side tool call. Returns text (or, for camera_snapshot,
+    a list of content blocks) for Claude to consume. Errors become readable
+    strings — never raises."""
     try:
         client_tool = _CLIENT_TOOLS.get(name)
         if client_tool is not None:
@@ -499,6 +516,7 @@ def stream_response(
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
         PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
+        CAMERA_SNAPSHOT_TOOL,
     ]
     if plex_laptop_client is not None:
         tools.extend([
