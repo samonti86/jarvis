@@ -6,6 +6,12 @@ Use cases:
   - reading individual files out of a diagnostics bundle after
     run_pc_diagnostics_collector has produced one (M28's other half)
 
+Sibling, deliberately not shared: src/attachments.py's load_attachment turns
+a file into a Messages-API *content block* (handles PDF/image base64 too) for
+the 📎 upload flow. This module returns *plain text for a tool result* with a
+different size budget and a binary-sniff + credential denylist instead of an
+extension allowlist. Different jobs — merging them would help neither.
+
 Design / safety posture (the M23 philosophy applied to reads):
   - No confirmation gate. The user named the file; reading is low-impact.
     Confirmation is reserved for destructive / expensive operations
@@ -95,15 +101,13 @@ _DENIED_SUFFIXES = {
 
 
 def _is_denied(p: Path) -> bool:
-    name = p.name.lower()
-    if name in _DENIED_EXACT_NAMES:
+    if p.name.lower() in _DENIED_EXACT_NAMES:
         return True
+    suffix = p.suffix.lower()
     # `.pub` overrides a denied stem: id_ed25519.pub is a PUBLIC key.
-    if p.suffix.lower() == ".pub":
+    if suffix == ".pub":
         return False
-    if p.suffix.lower() in _DENIED_SUFFIXES:
-        return True
-    return False
+    return suffix in _DENIED_SUFFIXES
 
 
 def _looks_binary(raw: bytes) -> bool:
