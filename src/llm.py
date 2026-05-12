@@ -41,6 +41,11 @@ from typing import Callable, Iterator
 
 import anthropic
 
+from src.diagnostics_collector import (
+    RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
+    execute_run_pc_diagnostics_collector,
+)
+from src.file_reader import READ_LOCAL_FILE_TOOL, execute_read_local_file
 from src.games import GAMES_TOOL, execute_games_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
@@ -117,8 +122,8 @@ Live information (you have five tools — pick the right one):
    market prices, recent releases, "who is the current X", anything that changes
    over time.
 
-Local PC control (you have two tools — pick the right one):
-6. pc_diagnostics — read-only telemetry on THIS Windows PC: CPU, RAM, disk,
+Local PC control (you have four tools — pick the right one):
+6. pc_diagnostics — read-only LIVE telemetry on THIS Windows PC: CPU, RAM, disk,
    processes, services, network, recent System event-log entries. Use for any
    "how is my PC doing", "what's slowing me down", "any recent errors", "is X
    service running" question. NEVER modifies state — call freely without
@@ -127,20 +132,37 @@ Local PC control (you have two tools — pick the right one):
    lock_workstation, volume_set, volume_mute, volume_unmute, screen_off,
    kill_process. Each action is individually scoped — there is NO arbitrary-
    command path.
+8. read_local_file — read a text file on THIS PC that the user points you at:
+   a config file, a log, a Dockerfile, ~/.ssh/config, an error log. Read-only.
+   Whatever you read joins the conversation, so only read what the user asked
+   about. Refuses binary files and private-key material.
+9. run_pc_diagnostics_collector — a DEEP snapshot: collects host / security /
+   package / event-log data into a bundle of text files and returns their
+   paths. Use for "run a full diagnostic", "deep system check", "collect
+   everything for a support ticket", or follow-up troubleshooting that needs
+   more than the live pc_diagnostics snapshot. After it runs, use
+   read_local_file on the specific bundle files relevant to the question.
+   Slow (60-90s) and writes to disk — confirmation-gated.
 
 Local-PC safety rules:
-- For low-impact actions (open_app, lock_workstation, volume_*, screen_off):
-  briefly announce what you're about to do, then call the tool. No need to
-  await confirmation for these.
-- For kill_process: ALWAYS ask the user to confirm in plain language first
-  ("Confirm: terminate chrome.exe?"), wait for an explicit yes, THEN call
-  with confirmed=true. The tool itself enforces this — if you call without
-  confirmed=true it returns a confirmation-required notice rather than
-  killing anything.
+- For low-impact actions (open_app, lock_workstation, volume_*, screen_off)
+  and any read_local_file call: briefly announce what you're about to do (or
+  just do it), then call the tool. No confirmation needed for these.
+- For kill_process AND run_pc_diagnostics_collector: ALWAYS ask the user to
+  confirm in plain language first ("Confirm: terminate chrome.exe?" /
+  "Confirm: run a full diagnostics collection? It takes about a minute."),
+  wait for an explicit yes, THEN call with confirmed=true. The tools enforce
+  this server-side — calling without confirmed=true returns a confirmation-
+  required notice rather than acting.
 - "Improve performance" / "fix my PC" style requests: start with diagnostics
-  (pc_diagnostics overview/cpu/memory/disk) and report findings. Suggest
-  remediations in plain language but DO NOT apply changes the user didn't
-  explicitly ask for. The user is the decider; you are the analyst.
+  (pc_diagnostics for a live look, or run_pc_diagnostics_collector for a deep
+  one) and report findings. Suggest remediations in plain language but DO NOT
+  apply changes the user didn't explicitly ask for. You are the analyst; the
+  user is the decider.
+- pc_diagnostics is "right now"; run_pc_diagnostics_collector is "deep
+  snapshot for follow-up". For a quick "any errors lately?" the live tool is
+  enough — don't kick off a minute-long collection unless the user wants the
+  depth or a ticket bundle.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -380,6 +402,10 @@ def _execute_client_tool(
             return execute_pc_diagnostics_tool(tool_input)
         if name == "system_control":
             return execute_system_control_tool(tool_input)
+        if name == "read_local_file":
+            return execute_read_local_file(tool_input)
+        if name == "run_pc_diagnostics_collector":
+            return execute_run_pc_diagnostics_collector(tool_input)
         if plex_laptop_client is not None and name in _PLEX_LAPTOP_TOOL_NAMES:
             return _PLEX_LAPTOP_DISPATCH[name](plex_laptop_client, tool_input)
         if plex_client is not None and name in plex_client.tool_names:
@@ -453,6 +479,7 @@ def stream_response(
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
         PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
+        READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
     ]
     if plex_laptop_client is not None:
         tools.extend([
@@ -476,6 +503,8 @@ def stream_response(
     games_called = False
     diagnostics_called = False
     sysctl_called = False
+    read_file_called = False
+    collector_called = False
     paused = False
     plex_tools_called: set[str] = set()
     plex_laptop_tools_called: set[str] = set()
@@ -561,6 +590,10 @@ def stream_response(
                 diagnostics_called = True
             elif name == "system_control":
                 sysctl_called = True
+            elif name == "read_local_file":
+                read_file_called = True
+            elif name == "run_pc_diagnostics_collector":
+                collector_called = True
             elif name in _PLEX_LAPTOP_TOOL_NAMES:
                 plex_laptop_tools_called.add(name)
             elif plex_client is not None and name in plex_client.tool_names:
@@ -603,6 +636,10 @@ def stream_response(
         extra += " diagnostics=yes"
     if sysctl_called:
         extra += " sysctl=yes"
+    if read_file_called:
+        extra += " read_file=yes"
+    if collector_called:
+        extra += " diag_collector=yes"
     if plex_tools_called:
         extra += f" mcp_tools={','.join(sorted(plex_tools_called))}"
     if plex_laptop_tools_called:
@@ -643,6 +680,10 @@ def stream_response(
             tools_used.append("pc_diagnostics")
         if sysctl_called:
             tools_used.append("system_control")
+        if read_file_called:
+            tools_used.append("read_local_file")
+        if collector_called:
+            tools_used.append("run_pc_diagnostics_collector")
         tools_used.extend(sorted(plex_laptop_tools_called))
         tools_used.extend(sorted(plex_tools_called))
 
