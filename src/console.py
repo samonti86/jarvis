@@ -72,13 +72,20 @@ class JarvisConsole:
         # Currently staged attachment (one at a time for first pass): (filename, content_block).
         # None when nothing is staged.
         self._staged: tuple[str, dict] | None = None
-        # Thumbnails embedded in the transcript via image_create — Tk weakly
-        # references images, so without a strong ref here they'd GC and the
-        # transcript would show empty placeholders. Grows unbounded across the
-        # session, but each entry is ~240x135 RGB (~100 KB live) so even a
-        # very chatty session is bounded in memory. Cleared on shutdown
-        # implicitly via window destruction.
-        self._thumbnail_refs: list[ImageTk.PhotoImage] = []
+        # Thumbnails embedded in the transcript. Each entry holds:
+        #   (thumb_photo, full_bytes, label)
+        # - thumb_photo: PhotoImage rendered inline; we hold a strong ref
+        #   because Tk only weak-references images and would silently GC them
+        #   otherwise (transcript would show empty placeholders).
+        # - full_bytes: original image bytes from the vision tool, kept so
+        #   click-to-enlarge can re-decode at full resolution without going
+        #   back to disk.
+        # - label: friendly source name (e.g. "🖥 screen snapshot") — also
+        #   used as the popup window title.
+        # Grows unbounded across the session: each entry is ~100 KB live
+        # thumb + ~200-500 KB raw bytes; a 50-turn vision-heavy session is
+        # bounded at a few MB. Cleared implicitly when the window destroys.
+        self._thumbnail_refs: list[tuple[ImageTk.PhotoImage, bytes, str]] = []
 
         # --- Header ---
         header = ctk.CTkLabel(
@@ -565,12 +572,20 @@ class JarvisConsole:
     # capture, narrow enough to leave the transcript readable around it.
     # Height auto-derived from source aspect ratio.
     _THUMBNAIL_WIDTH = 240
+    # Cap on the click-to-enlarge popup. Slightly under a 1080p display so
+    # the window fits with its OS chrome on most monitors. Aspect preserved.
+    _ENLARGE_MAX_W = 1400
+    _ENLARGE_MAX_H = 900
 
     def _append_image_thumbnail(self, image_bytes: bytes, label: str) -> None:
         """Decode bytes → PIL Image → resize → PhotoImage → insert into the
         transcript via tk.Text.image_create. Runs on Tk's thread (scheduled
         via .after by add_image_thumbnail). Defensive — a bad image must
-        never break the transcript pane."""
+        never break the transcript pane.
+
+        Also wires per-thumbnail click + hover bindings: clicking the image
+        opens a full-resolution popup; hovering changes the cursor to a hand
+        so the affordance is discoverable."""
         try:
             pil = Image.open(io.BytesIO(image_bytes))
             w, h = pil.size
@@ -584,10 +599,15 @@ class JarvisConsole:
             # type. CTkImage is for CTk widgets (CTkButton, CTkLabel) and
             # doesn't accept tk.Text.image_create cleanly — different path.
             photo = ImageTk.PhotoImage(pil)
-            self._thumbnail_refs.append(photo)  # strong ref so Tk doesn't GC
         except Exception as exc:
             print(f"[console] thumbnail decode failed: {exc}")
             return
+
+        # Index assigned BEFORE appending — used as the closure-captured key
+        # so the click handler knows which thumbnail it owns even after
+        # later thumbnails are added.
+        idx = len(self._thumbnail_refs)
+        self._thumbnail_refs.append((photo, image_bytes, label))
 
         try:
             self._transcript.configure(state="normal")
@@ -595,12 +615,67 @@ class JarvisConsole:
             # Match the 8-space indent of telemetry chips so labels align
             # visually under "you:" / "jarvis:" rows above.
             tb.insert("end", f"\n        {label}\n        ", "dim")
+
+            # Capture the insertion point before image_create — we need it
+            # to apply a per-thumbnail tag (one image == one character in
+            # the text widget, so the tag covers exactly the image position).
+            img_pos = tb.index("end-1c")  # one char before trailing implicit newline
             tb.image_create("end", image=photo)
-            tb.insert("end", "\n", "dim")
+            tag = f"thumb_{idx}"
+            tb.tag_add(tag, img_pos, f"{img_pos}+1c")
+            # Bindings via lambda default-arg capture so each thumbnail's
+            # handler closes over its OWN idx (not the last value of the
+            # loop variable).
+            tb.tag_bind(tag, "<Button-1>", lambda _e, i=idx: self._open_thumbnail_popup(i))
+            tb.tag_bind(tag, "<Enter>", lambda _e: tb.config(cursor="hand2"))
+            tb.tag_bind(tag, "<Leave>", lambda _e: tb.config(cursor=""))
+
+            tb.insert("end", "\n        (click to enlarge)\n", "dim")
             tb.see("end")
             self._transcript.configure(state="disabled")
         except tk.TclError:
             pass
+
+    def _open_thumbnail_popup(self, idx: int) -> None:
+        """Open a CTkToplevel showing the full-resolution captured image.
+        Same dark theme as the main window. Esc / window-X closes. Multiple
+        popups can coexist — useful if the user wants to compare a screen
+        snapshot to a previous one. Defensive — re-decode failure logs +
+        skips silently rather than crashing the UI."""
+        if idx < 0 or idx >= len(self._thumbnail_refs):
+            return
+        _photo, image_bytes, label = self._thumbnail_refs[idx]
+
+        try:
+            pil = Image.open(io.BytesIO(image_bytes))
+        except Exception as exc:
+            print(f"[console] enlarge decode failed: {exc}")
+            return
+
+        w, h = pil.size
+        if w > self._ENLARGE_MAX_W or h > self._ENLARGE_MAX_H:
+            ratio = min(self._ENLARGE_MAX_W / w, self._ENLARGE_MAX_H / h)
+            pil = pil.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        full_photo = ImageTk.PhotoImage(pil)
+
+        try:
+            win = ctk.CTkToplevel(self.root)
+            win.title(label)
+            win.configure(fg_color=self.BG)
+            # transient ties the popup to the main window so it follows
+            # min/restore and stays on top of the main window without
+            # being a global always-on-top window.
+            win.transient(self.root)
+
+            lbl = tk.Label(win, image=full_photo, bg=self.BG, borderwidth=0)
+            # Strong ref on the Label keeps the PhotoImage alive for the
+            # popup's lifetime; closing the window GCs both together.
+            lbl.image = full_photo  # type: ignore[attr-defined]
+            lbl.pack(padx=10, pady=10)
+
+            win.bind("<Escape>", lambda _e: win.destroy())
+        except tk.TclError as exc:
+            print(f"[console] popup open failed: {exc}")
 
     def _set_amplitude_internal(self, level: float) -> None:
         # Runs on Tk's thread (scheduled via .after). Just store; redraw
