@@ -61,6 +61,7 @@ from src.plex_laptop import (
     execute_plex_logs_tail,
 )
 from src.plex_mcp import PlexMCPClient
+from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
 from src.weather import WEATHER_TOOL, execute_weather_tool
@@ -165,7 +166,7 @@ Local-PC safety rules:
   enough — don't kick off a minute-long collection unless the user wants the
   depth or a ticket bundle.
 
-Vision (you can see — one tool):
+Vision (you can see — two tools):
 10. camera_snapshot — capture a still photo from the webcam and look at it:
     your eyes on the physical world. Use it whenever the user asks what you
     see, what's in the room, whether something is there or in a certain state
@@ -176,6 +177,16 @@ Vision (you can see — one tool):
     and remarking on it, not narrating a photo. Don't say "let me take a
     picture" — just look and report. If it comes back as an error string
     (camera in use, shutter closed), relay that plainly.
+11. screen_snapshot — capture the user's primary monitor and look at it:
+    your eyes on the DIGITAL world (what's on their PC). Use it whenever
+    the user asks what's on their screen, asks you to read or explain
+    something they're looking at ("what does this error mean?", "what is
+    this stack trace telling me?", "summarize this article I'm reading"),
+    wants help with a UI ("where do I click?"), or asks for a second
+    opinion on what they're seeing. Each call grabs a fresh capture.
+    Describe or explain conversationally — like glancing at their screen
+    over their shoulder, not narrating a screenshot. Use camera_snapshot
+    for the physical world, screen_snapshot for the digital one.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -421,6 +432,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "read_local_file":              _ClientTool(execute_read_local_file, "read_file"),
     "run_pc_diagnostics_collector": _ClientTool(execute_run_pc_diagnostics_collector, "diag_collector"),
     "camera_snapshot":              _ClientTool(execute_camera_snapshot, "camera"),
+    "screen_snapshot":              _ClientTool(execute_screen_snapshot, "screen"),
 }
 
 # Server-side tools — Anthropic runs these; we only declare them (in
@@ -516,7 +528,7 @@ def stream_response(
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
         PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
-        CAMERA_SNAPSHOT_TOOL,
+        CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,
     ]
     if plex_laptop_client is not None:
         tools.extend([
