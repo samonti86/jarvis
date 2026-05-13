@@ -291,6 +291,18 @@ def listen_loop(
                     bits.append("PAUSED(10-iter cap)")
                 ui.add_telemetry_chip(" · ".join(bits))
 
+            def on_image_captured(image_bytes: bytes, media_type: str, tool_name: str) -> None:  # noqa: ARG001 — media_type unused for now
+                """Called by stream_response when a vision tool returns an
+                image. Renders the bytes as an inline thumbnail in the
+                console transcript so the user sees *what Jarvis saw*, not
+                just the text description. Label maps tool name → emoji +
+                source for at-a-glance recognition."""
+                label = {
+                    "camera_snapshot": "📷 webcam snapshot",
+                    "screen_snapshot": "🖥 screen snapshot",
+                }.get(tool_name, f"🖼 {tool_name}")
+                ui.add_image_thumbnail(image_bytes, label)
+
             def llm_stream():
                 for chunk in stream_response(
                     api_key=cfg.anthropic_api_key,
@@ -300,6 +312,7 @@ def listen_loop(
                     plex_client=plex_client,
                     plex_laptop_client=plex_laptop_client,
                     on_complete=on_telemetry,
+                    on_image_captured=on_image_captured,
                     engineer_mode=engineer,
                 ):
                     response_chunks.append(chunk)

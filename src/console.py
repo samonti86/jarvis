@@ -28,6 +28,7 @@ on the tray.
 
 from __future__ import annotations
 
+import io
 import math
 import time
 import tkinter as tk
@@ -36,6 +37,7 @@ from tkinter import filedialog
 from typing import Callable
 
 import customtkinter as ctk
+from PIL import Image, ImageTk
 
 from src.attachments import load_attachment
 from src.tray import State
@@ -70,6 +72,13 @@ class JarvisConsole:
         # Currently staged attachment (one at a time for first pass): (filename, content_block).
         # None when nothing is staged.
         self._staged: tuple[str, dict] | None = None
+        # Thumbnails embedded in the transcript via image_create — Tk weakly
+        # references images, so without a strong ref here they'd GC and the
+        # transcript would show empty placeholders. Grows unbounded across the
+        # session, but each entry is ~240x135 RGB (~100 KB live) so even a
+        # very chatty session is bounded in memory. Cleared on shutdown
+        # implicitly via window destruction.
+        self._thumbnail_refs: list[ImageTk.PhotoImage] = []
 
         # --- Header ---
         header = ctk.CTkLabel(
@@ -405,6 +414,15 @@ class JarvisConsole:
         if not self._destroyed and text:
             self.root.after(0, self._append_telemetry_chip, text)
 
+    def add_image_thumbnail(self, image_bytes: bytes, label: str) -> None:
+        """Thread-safe: embed a small thumbnail of an image into the transcript,
+        with a dim label above it. Called when a vision tool (camera_snapshot,
+        screen_snapshot) successfully captures — the user sees *what Jarvis saw*
+        inline with the conversation, not just the text description. Decoding
+        and resizing happen on Tk's thread (cheap for ≤1568px source)."""
+        if not self._destroyed and image_bytes:
+            self.root.after(0, self._append_image_thumbnail, image_bytes, label)
+
     def show(self) -> None:
         if not self._destroyed:
             self.root.after(0, self._do_show)
@@ -538,6 +556,47 @@ class JarvisConsole:
             # Indent matches the timestamp prefix width so the chip lines up
             # under "you:" / "jarvis:" labels visually.
             tb.insert("end", "\n        " + text, "dim")
+            tb.see("end")
+            self._transcript.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    # Thumbnail target width — wide enough to read UI elements in a screen
+    # capture, narrow enough to leave the transcript readable around it.
+    # Height auto-derived from source aspect ratio.
+    _THUMBNAIL_WIDTH = 240
+
+    def _append_image_thumbnail(self, image_bytes: bytes, label: str) -> None:
+        """Decode bytes → PIL Image → resize → PhotoImage → insert into the
+        transcript via tk.Text.image_create. Runs on Tk's thread (scheduled
+        via .after by add_image_thumbnail). Defensive — a bad image must
+        never break the transcript pane."""
+        try:
+            pil = Image.open(io.BytesIO(image_bytes))
+            w, h = pil.size
+            if w > self._THUMBNAIL_WIDTH:
+                ratio = self._THUMBNAIL_WIDTH / w
+                pil = pil.resize(
+                    (self._THUMBNAIL_WIDTH, int(h * ratio)),
+                    Image.LANCZOS,
+                )
+            # ImageTk.PhotoImage is the standard tk.Text-embeddable image
+            # type. CTkImage is for CTk widgets (CTkButton, CTkLabel) and
+            # doesn't accept tk.Text.image_create cleanly — different path.
+            photo = ImageTk.PhotoImage(pil)
+            self._thumbnail_refs.append(photo)  # strong ref so Tk doesn't GC
+        except Exception as exc:
+            print(f"[console] thumbnail decode failed: {exc}")
+            return
+
+        try:
+            self._transcript.configure(state="normal")
+            tb = self._transcript._textbox
+            # Match the 8-space indent of telemetry chips so labels align
+            # visually under "you:" / "jarvis:" rows above.
+            tb.insert("end", f"\n        {label}\n        ", "dim")
+            tb.image_create("end", image=photo)
+            tb.insert("end", "\n", "dim")
             tb.see("end")
             self._transcript.configure(state="disabled")
         except tk.TclError:

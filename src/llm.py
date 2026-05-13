@@ -33,6 +33,7 @@ about what was discussed in earlier (now-sealed) sessions.
 
 from __future__ import annotations
 
+import base64
 import sys
 import time
 from dataclasses import dataclass, field
@@ -486,6 +487,7 @@ def stream_response(
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
     on_complete: Callable[[TelemetryRecord], None] | None = None,
+    on_image_captured: Callable[[bytes, str, str], None] | None = None,
     engineer_mode: bool = False,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
@@ -503,6 +505,11 @@ def stream_response(
     `on_complete` (optional) — called once at the end with a TelemetryRecord
     for UI consumption. The same data is also stderr-logged in the existing
     one-line format. Wrapped in try/except so a UI bug can't poison the turn.
+    `on_image_captured` (optional) — fired whenever a client-side tool returns
+    a tool_result containing an image content block (currently camera_snapshot
+    + screen_snapshot). Receives (image_bytes, media_type, tool_name) so the
+    UI can render an inline thumbnail of what Jarvis just "saw". Wrapped in
+    try/except — a UI bug must not break the agentic loop mid-turn.
     `engineer_mode` (optional, M26) — when True, append the engineer-mode
     addendum to the system prompt and enable Anthropic's extended thinking
     feature with a 5k-token reasoning budget. Captured per-turn from
@@ -635,6 +642,31 @@ def stream_response(
                 plex_client=plex_client,
                 plex_laptop_client=plex_laptop_client,
             )
+            # Vision tools (camera_snapshot, screen_snapshot) return a list
+            # containing an image block + a caption text block. If a UI hook
+            # is registered, surface the raw bytes so the console can render
+            # an inline thumbnail of what Jarvis just saw. Detecting on the
+            # generic shape (list with an image block) keeps this hook
+            # tool-agnostic — any future tool that returns an image gets
+            # thumbnailed for free.
+            if on_image_captured is not None and isinstance(result_text, list):
+                for sub in result_text:
+                    if isinstance(sub, dict) and sub.get("type") == "image":
+                        src = sub.get("source", {})
+                        if src.get("type") == "base64" and src.get("data"):
+                            try:
+                                img_bytes = base64.b64decode(src["data"])
+                                on_image_captured(
+                                    img_bytes,
+                                    src.get("media_type", "image/png"),
+                                    name,
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"[llm] on_image_captured failed for {name}: {exc}",
+                                    file=sys.stderr,
+                                )
+                        break
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,

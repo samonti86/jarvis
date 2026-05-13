@@ -110,6 +110,11 @@ class JarvisUI:
     def add_telemetry_chip(self, text: str) -> None:
         self.console.add_telemetry_chip(text)
 
+    def add_image_thumbnail(self, image_bytes: bytes, label: str) -> None:
+        """Embed a thumbnail of an image into the transcript. Called when a
+        vision tool (camera_snapshot, screen_snapshot) successfully captures."""
+        self.console.add_image_thumbnail(image_bytes, label)
+
     # ------------------------------------------------------------------
     # Mute toggle. Voice INPUT and console text both keep working when
     # muted; only TTS playback is suppressed. Toggle lives on the tray
