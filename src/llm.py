@@ -64,6 +64,7 @@ from src.plex_laptop import (
 from src.plex_mcp import PlexMCPClient
 from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
 from src.sports import SPORTS_TOOL, execute_sports_tool
+from src.pc_shell import PC_SHELL_TOOL, execute_pc_shell
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
 from src.weather import WEATHER_TOOL, execute_weather_tool
 
@@ -125,21 +126,30 @@ Live information (you have five tools — pick the right one):
    market prices, recent releases, "who is the current X", anything that changes
    over time.
 
-Local PC control (you have four tools — pick the right one):
+Local PC control (you have five tools — pick the right one):
 6. pc_diagnostics — read-only LIVE telemetry on THIS Windows PC: CPU, RAM, disk,
    processes, services, network, recent System event-log entries. Use for any
    "how is my PC doing", "what's slowing me down", "any recent errors", "is X
-   service running" question. NEVER modifies state — call freely without
-   confirmation.
-7. system_control — fixed allowlist of safe actions on THIS PC: open_app,
+   service running" question. One-shot static snapshot. NEVER modifies state.
+7. pc_shell — investigate dynamically with ONE read-only Windows command from
+   a fixed allowlist (ipconfig, Get-NetAdapter, Get-NetRoute, Get-NetTCPConnection,
+   netstat, arp, ping, tracert, Test-NetConnection, Resolve-DnsName, nslookup,
+   Get-Process, Get-Service, Get-WinEvent, Get-CimInstance, systeminfo,
+   Get-ChildItem, Get-HotFix). Use when pc_diagnostics' static snapshot isn't
+   enough — to ping a host, look up DNS, list a service by name, search a
+   specific event log, see what's listening on a port, etc. Chain calls
+   freely: ping → tracert → Resolve-DnsName is the classic network-debug
+   sequence. Output is truncated; re-call with narrower filters if needed.
+   NEVER modifies state — no confirmation needed.
+8. system_control — fixed allowlist of safe actions on THIS PC: open_app,
    lock_workstation, volume_set, volume_mute, volume_unmute, screen_off,
    kill_process. Each action is individually scoped — there is NO arbitrary-
    command path.
-8. read_local_file — read a text file on THIS PC that the user points you at:
+9. read_local_file — read a text file on THIS PC that the user points you at:
    a config file, a log, a Dockerfile, ~/.ssh/config, an error log. Read-only.
    Whatever you read joins the conversation, so only read what the user asked
    about. Refuses binary files and private-key material.
-9. run_pc_diagnostics_collector — a DEEP snapshot: collects host / security /
+10. run_pc_diagnostics_collector — a DEEP snapshot: collects host / security /
    package / event-log data into a bundle of text files and returns their
    paths. Use for "run a full diagnostic", "deep system check", "collect
    everything for a support ticket", or follow-up troubleshooting that needs
@@ -148,9 +158,10 @@ Local PC control (you have four tools — pick the right one):
    Slow (60-90s) and writes to disk — confirmation-gated.
 
 Local-PC safety rules:
-- For low-impact actions (open_app, lock_workstation, volume_*, screen_off)
-  and any read_local_file call: briefly announce what you're about to do (or
-  just do it), then call the tool. No confirmation needed for these.
+- For low-impact actions (open_app, lock_workstation, volume_*, screen_off),
+  any read_local_file call, and any pc_shell call: briefly announce what
+  you're about to do (or just do it), then call the tool. No confirmation
+  needed — these are read-only or low-impact.
 - For kill_process AND run_pc_diagnostics_collector: ALWAYS ask the user to
   confirm in plain language first ("Confirm: terminate chrome.exe?" /
   "Confirm: run a full diagnostics collection? It takes about a minute."),
@@ -168,7 +179,7 @@ Local-PC safety rules:
   depth or a ticket bundle.
 
 Vision (you can see — two tools):
-10. camera_snapshot — capture a still photo from the webcam and look at it:
+11. camera_snapshot — capture a still photo from the webcam and look at it:
     your eyes on the physical world. Use it whenever the user asks what you
     see, what's in the room, whether something is there or in a certain state
     ("is the package on the porch?", "did the pet get on the couch?", "is the
@@ -178,7 +189,7 @@ Vision (you can see — two tools):
     and remarking on it, not narrating a photo. Don't say "let me take a
     picture" — just look and report. If it comes back as an error string
     (camera in use, shutter closed), relay that plainly.
-11. screen_snapshot — capture the user's primary monitor and look at it:
+12. screen_snapshot — capture the user's primary monitor and look at it:
     your eyes on the DIGITAL world (what's on their PC). Use it whenever
     the user asks what's on their screen, asks you to read or explain
     something they're looking at ("what does this error mean?", "what is
@@ -429,6 +440,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
+    "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
     "read_local_file":              _ClientTool(execute_read_local_file, "read_file"),
     "run_pc_diagnostics_collector": _ClientTool(execute_run_pc_diagnostics_collector, "diag_collector"),
@@ -533,7 +545,7 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
-        PC_DIAGNOSTICS_TOOL, SYSTEM_CONTROL_TOOL,
+        PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,
     ]
