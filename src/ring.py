@@ -255,18 +255,28 @@ class RingWatcher:
     async def _fire_alert(self, cam, event: dict) -> None:
         """Fetch snapshot for an event and call into SecurityWatcher.
         Snapshot is best-effort — empty bytes is acceptable, the
-        deterrent path still fires with no image attached."""
+        deterrent path still fires (and sends Discord text-only) with
+        no image attached."""
         print(f"[ring] motion event id={event['id']} at {event.get('created_at')}",
               file=sys.stderr)
-        snap_bytes = b""
+        snap_bytes: bytes = b""
         try:
-            snap_bytes = await cam.async_get_snapshot()
+            result = await cam.async_get_snapshot()
+            # async_get_snapshot can return None (Ring API doesn't always
+            # have a fresh snapshot ready, especially on back-to-back
+            # events). Treat the same as empty bytes — deterrent + Discord
+            # still fire, just without an attached image.
+            if result:
+                snap_bytes = result
+                print(f"[ring] snapshot fetched: {len(snap_bytes)} bytes",
+                      file=sys.stderr)
+            else:
+                print("[ring] snapshot returned empty (Ring API had no "
+                      "fresh frame) — proceeding without image",
+                      file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             print(f"[ring] snapshot fetch failed: {exc} — proceeding without",
                   file=sys.stderr)
-        # Hop back to sync land for the SecurityWatcher call. trigger_external_motion
-        # is fully sync and thread-safe — it just enters the challenge state and
-        # returns immediately, doesn't block on TTS or disk I/O.
         try:
             self._security.trigger_external_motion(
                 source="ring", jpeg_bytes=snap_bytes or None,

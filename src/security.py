@@ -653,11 +653,22 @@ class SecurityWatcher:
         saved_path = self._save_evidence_bytes(jpeg_bytes)
         if saved_path is not None:
             print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
+        elif jpeg_bytes:
+            print("[security] evidence save returned None despite non-empty "
+                  "JPEG bytes — check evidence_dir permissions", file=sys.stderr)
+        else:
+            print("[security] no JPEG bytes to save (snapshot was empty)",
+                  file=sys.stderr)
 
         # Discord notification on a daemon thread so a slow POST doesn't delay
-        # the spoken deterrent or the LOCKED transition. Pass the in-memory
-        # JPEG bytes directly rather than re-reading from disk.
-        if self._discord_webhook_url and jpeg_bytes:
+        # the spoken deterrent or the LOCKED transition. ALWAYS fire if the
+        # webhook is configured — send_discord_alert handles empty image_bytes
+        # gracefully (sends text-only). Skipping Discord because Ring's
+        # snapshot fetch returned empty bytes (which happens occasionally on
+        # back-to-back motion events) means the user loses the most valuable
+        # part of the security system: the phone push. Better to ship the
+        # alert without an image than to skip it.
+        if self._discord_webhook_url:
             self._send_discord_alert_async(jpeg_bytes, saved_path)
 
         # Flip the LOCKED indicator BEFORE the announce so the UI updates
