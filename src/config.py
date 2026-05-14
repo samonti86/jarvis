@@ -26,6 +26,7 @@ class Config:
     plex_laptop_user: str      # M24 — SSH username on the Plex laptop
     plex_laptop_key_path: str  # M24 — path to private key (~ expanded); blank → default ed25519
     plex_laptop_log_path: str  # M24 — Plex Media Server.log path on the laptop; blank → default
+    security_passphrase: str   # M35 — voice passphrase to clear a security-mode challenge; blank disables challenge step
 
 
 def load() -> Config:
@@ -45,4 +46,5 @@ def load() -> Config:
         plex_laptop_user=os.getenv("PLEX_LAPTOP_USER", "").strip(),
         plex_laptop_key_path=os.getenv("PLEX_LAPTOP_KEY_PATH", "").strip(),
         plex_laptop_log_path=os.getenv("PLEX_LAPTOP_LOG_PATH", "").strip(),
+        security_passphrase=os.getenv("JARVIS_SECURITY_PASSPHRASE", "").strip(),
     )

@@ -1,22 +1,35 @@
-"""Security mode — proactive vision watcher (M34 foundation).
+"""Security mode — proactive vision watcher (M34 foundation + M35 challenge).
 
 The "armed mode" half of the proactive-vision design. While armed, a
 background thread polls the Logi webcam at ~0.5 Hz, runs YOLOv8n person
 detection on each frame, and fires a proactive announcement when a person
-enters the scene. M34 is announce-only; M35 layers the challenge-response
-protocol (passphrase / face match / 15s timer / deterrent) on top of this
-same detection backbone.
+enters the scene. M35 layers the challenge-response protocol on top:
+detection enters CHALLENGE state with a 15s passphrase timer, voice
+authentication clears it, timeout fires the deterrent + saves evidence.
 
-State machine (M34):
+State machine (M35):
 
     DISARMED ──"activate security"──→ ARMED
        ▲                                 │
-       │                                 │ (person detected → announce)
-       │                                 │ (presence-window timer suppresses
-       │                                 │  repeat alerts while same person
-       │                                 │  stays in frame)
+       │                                 │ (person detected, not in cooldown)
        │                                 ▼
-       └────"stand down"─────────────── ARMED
+       │                              CHALLENGE (15s passphrase window open)
+       │                                 │
+       │                          ┌──────┴──────┐
+       │                          │             │
+       │              passphrase match     15s timeout
+       │              + cooldown 60s      ↓
+       │                          │   DETERRENT_FIRED
+       │                          │   (announce + save evidence)
+       │                          │   + cooldown 60s
+       │                          │             │
+       │                          └──────┬──────┘
+       │                                 ▼
+       └────"stand down"──────────── ARMED (cooldown blocks re-fire)
+
+If `security_passphrase` is empty (env var unset), the CHALLENGE step is
+skipped — detection just announces movement (M34 announce-only behavior).
+Graceful fallback so the system works without auth configured.
 
 Design choices:
 
@@ -62,9 +75,13 @@ Threading:
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Callable
 
 
@@ -125,6 +142,45 @@ _CAPTURE_HEIGHT = 480
 # perfect-expose each frame. YOLO is robust to slightly underexposed input.
 _WARMUP_FRAMES = 2
 
+# M35 — challenge-response timing.
+# 15s is enough to: hear the prompt (~2s) + say "Hey Jarvis" + passphrase
+# (~3s) + STT process (~1-2s) = ~7s typical, ~10s worst case. 15s leaves
+# margin for someone moving toward a mic or hesitating. Shorter (10s)
+# feels tight; longer (20s) gives an intruder more time to either run or
+# disable the system.
+_CHALLENGE_TIMEOUT_SECONDS = 15.0
+
+# Per-word fuzzy-match threshold. Word-level comparison (instead of full-
+# string SequenceMatcher) avoids two real failure modes found in smoke
+# testing:
+#   1. "open sesame please" vs "open sesame" scores ~0.80 at the
+#      character level (the "strongest " prefix dominates) — a synonym
+#      attack false-positive. Word-level checking requires "defender" to
+#      fuzzy-match "avenger" alone (ratio 0.53), correctly rejecting it.
+#   2. "stronger ranger" with a permissive 0.75 word threshold also passes
+#      ("ranger" vs "avenger" = 0.77) — a rhyme attack. Bumping to 0.80
+#      drops it while still admitting realistic Whisper wobble.
+#
+# 0.80 is the empirical sweet spot from the matcher tests:
+#   "strong" → "strongest"  = 0.80  ✓ accepted (legit Whisper short-form)
+#   "stronges" → "strongest" = 0.94 ✓ accepted (legit Whisper typo)
+#   "avengers" → "avenger"  = 0.93  ✓ accepted (legit Whisper plural)
+#   "ranger" → "avenger"    = 0.77  ✗ rejected (rhyme attack)
+#   "defender" → "avenger"  = 0.53  ✗ rejected (synonym attack)
+#   "stranger" → "strongest" = 0.59 ✗ rejected (rhyme attack)
+_PASSPHRASE_WORD_MATCH_THRESHOLD = 0.80
+
+# After a CHALLENGE resolves (authenticated OR deterrent), suppress new
+# challenges for this many seconds. Prevents the case where the legit
+# user authenticates, walks past the camera again 5 seconds later, and
+# gets re-challenged — which would be infuriating. 60s is comfortable.
+_CHALLENGE_COOLDOWN_SECONDS = 60.0
+
+# Evidence snapshots from triggered challenges land here. Created lazily on
+# first save. Lives under %LOCALAPPDATA% so it follows the existing memory
+# directory convention (jarvis.log, sessions/, summaries.jsonl).
+_EVIDENCE_SUBDIR = "security/events"
+
 
 # --- Public API ------------------------------------------------------------
 # AnnounceFn signature: (text) → None. Caller-supplied; main.py wraps
@@ -151,10 +207,20 @@ class SecurityWatcher:
         announce: AnnounceFn,
         on_armed_changed: Callable[[bool], None] | None = None,
         camera_index: int = 0,
+        passphrase: str = "",
+        evidence_dir: Path | None = None,
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
         self._camera_index = camera_index
+        # M35: empty passphrase = skip CHALLENGE state entirely. Detection
+        # just announces movement (M34 behavior). Lets the user opt out of
+        # the challenge step without removing security mode entirely.
+        self._passphrase = passphrase.strip()
+        # %LOCALAPPDATA%/Jarvis/security/events/ — created lazily on first
+        # deterrent fire. Caller (main.py) computes the absolute path; we
+        # just store it and stat/mkdir as needed.
+        self._evidence_dir = evidence_dir
 
         # Coordination primitives. _armed is the public state; _stop fires
         # when we need the watcher thread to wind down (overlaps with
@@ -172,6 +238,22 @@ class SecurityWatcher:
         self._person_present = False
         self._person_last_seen = 0.0
 
+        # M35: challenge-response state. Touched from BOTH the watcher
+        # thread (timeout check, entering challenge) AND the listen_loop
+        # thread (try_authenticate after STT). All mutations guarded by
+        # _challenge_lock. Reads of the bool are fine without the lock
+        # (single-word load is atomic on CPython), so is_in_challenge()
+        # doesn't grab it.
+        self._challenge_lock = threading.Lock()
+        self._challenge_active = False
+        self._challenge_started_at = 0.0
+        self._cooldown_until = 0.0
+        # Most recent triggering frame, held in memory between detection
+        # and challenge resolution so the deterrent path can save it as
+        # evidence without re-grabbing (re-grab would capture the moment
+        # AFTER the 15s timeout, missing the actual triggering view).
+        self._challenge_evidence_frame = None
+
         # Lazy-loaded YOLO. Held across activate/deactivate cycles so the
         # second arm is instant (no model reload). Becomes a sentinel
         # "failed to load" value if init blew up — see _ensure_model.
@@ -184,6 +266,86 @@ class SecurityWatcher:
 
     def is_armed(self) -> bool:
         return self._armed.is_set()
+
+    # M35: public API for listen_loop's challenge-transcript diversion.
+    # is_in_challenge() is a hot read on every transcript, so it skips the
+    # lock (single-word atomic load on CPython). try_authenticate() takes
+    # the lock because it mutates challenge state.
+
+    def is_in_challenge(self) -> bool:
+        """True if a passphrase challenge is currently open. listen_loop
+        checks this AFTER STT but BEFORE the intent parser / process_question
+        — when True, the transcript routes to try_authenticate() and Claude
+        isn't called for this turn."""
+        return self._challenge_active
+
+    def try_authenticate(self, transcript: str) -> bool:
+        """Check a transcript against the configured passphrase. Returns
+        True if it matches (challenge resolved as authenticated), False
+        otherwise (challenge stays open until timeout).
+
+        Word-level fuzzy match: every word in the passphrase must have a
+        fuzzy match (SequenceMatcher ratio ≥ 0.75) somewhere in the
+        transcript's words. Tolerates Whisper transcription wobble
+        ("strong" → "strongest") while rejecting synonym attacks
+        ("defender" → "avenger" scores 0.53, below threshold)."""
+        if not self._passphrase:
+            # No passphrase configured — challenge step skipped entirely
+            # (M34 announce-only behavior). Defensive: if try_authenticate
+            # is called anyway, do nothing.
+            return False
+
+        if not transcript or not transcript.strip():
+            return False
+
+        # Normalize both sides: lowercase, strip terminal punctuation, split
+        # into words. Whisper sometimes appends a trailing period; we don't
+        # want it to leak into the last word's similarity.
+        clean_transcript = transcript.strip().lower().rstrip(".!?,")
+        transcript_words = clean_transcript.split()
+        passphrase_words = self._passphrase.lower().split()
+
+        if not transcript_words or not passphrase_words:
+            return False
+
+        # Each passphrase word needs SOME word in the transcript that
+        # fuzzy-matches at the per-word threshold. Short-circuit on first
+        # word that has no match.
+        def _has_fuzzy_match(target: str, candidates: list[str]) -> bool:
+            return any(
+                SequenceMatcher(None, target, c).ratio() >= _PASSPHRASE_WORD_MATCH_THRESHOLD
+                for c in candidates
+            )
+
+        all_matched = all(_has_fuzzy_match(w, transcript_words) for w in passphrase_words)
+
+        print(
+            f"[security] challenge transcript={transcript!r} "
+            f"words={transcript_words} all_passphrase_words_matched={all_matched}",
+            file=sys.stderr,
+        )
+
+        if not all_matched:
+            # At least one passphrase word missing. Challenge stays open
+            # until the timer expires. Don't announce the failure — that
+            # gives an intruder feedback to brute-force. Silent rejection.
+            return False
+
+        # Match — resolve challenge as authenticated.
+        with self._challenge_lock:
+            if not self._challenge_active:
+                # Already resolved (timer fired between transcript end and
+                # our taking the lock). Idempotent; don't announce twice.
+                return True
+            self._challenge_active = False
+            self._cooldown_until = time.monotonic() + _CHALLENGE_COOLDOWN_SECONDS
+            self._challenge_evidence_frame = None  # don't need it anymore
+
+        try:
+            self._announce("Welcome back, sir.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] welcome-back announce raised: {exc}", file=sys.stderr)
+        return True
 
     def activate(self) -> None:
         """Idempotent: arming an already-armed system is a no-op (no second
@@ -221,6 +383,13 @@ class SecurityWatcher:
             return
         self._armed.clear()
         self._stop.set()
+        # M35: clear any pending challenge so disarming mid-challenge
+        # doesn't leave stale state for the next arm. No deterrent fires
+        # on this path — the user explicitly disarmed, so the trigger is
+        # resolved by user authority.
+        with self._challenge_lock:
+            self._challenge_active = False
+            self._challenge_evidence_frame = None
         if self._on_armed_changed is not None:
             try:
                 self._on_armed_changed(False)
@@ -244,7 +413,8 @@ class SecurityWatcher:
     # ---------------------------------------------------------------------
 
     def _watch_loop(self) -> None:
-        """Daemon: poll camera, detect, announce. Exits when _stop fires."""
+        """Daemon: poll camera, detect, enter challenge on person, fire
+        deterrent on timeout. Exits when _stop fires."""
         # First iteration: lazy-load the model. Failure auto-disarms with
         # an announcement so the user isn't left thinking they're protected.
         if not self._ensure_model():
@@ -254,12 +424,18 @@ class SecurityWatcher:
 
         try:
             while not self._stop.is_set() and self._armed.is_set():
-                # Grace period: don't fire detections in the first 5s after
-                # arming so the user has time to walk away from the camera.
+                # Grace period: don't fire detections in the first N seconds
+                # after arming so the user has time to walk away from the
+                # camera. _ARM_GRACE_SECONDS is the tunable.
                 if time.monotonic() - self._armed_at < _ARM_GRACE_SECONDS:
                     if self._stop.wait(0.5):
                         return
                     continue
+
+                # M35: check the 15s challenge timeout BEFORE the next frame
+                # grab, so a deterrent fires promptly even if the camera is
+                # briefly busy. Holds the lock briefly to read state.
+                self._check_challenge_timeout()
 
                 frame = self._grab_frame()
                 if frame is None:
@@ -275,21 +451,9 @@ class SecurityWatcher:
 
                 if person_detected:
                     if not self._person_present:
-                        # Transition empty → person: fire the announcement.
-                        print(
-                            f"[security] person detected — firing announcement",
-                            file=sys.stderr,
-                        )
+                        # Transition empty → person.
                         self._person_present = True
-                        try:
-                            self._announce(
-                                "Sir — I'm detecting movement in the monitored space."
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            print(
-                                f"[security] announce raised: {exc}",
-                                file=sys.stderr,
-                            )
+                        self._handle_person_first_seen(frame, now)
                     self._person_last_seen = now
                 else:
                     # No person this cycle. If we were tracking a presence
@@ -311,6 +475,123 @@ class SecurityWatcher:
                     return
         finally:
             print("[security] watcher loop exited", file=sys.stderr)
+
+    def _handle_person_first_seen(self, frame, now: float) -> None:
+        """Called once per EMPTY→PERSON transition. Decides between three
+        outcomes:
+
+        1. **Cooldown active** — silently skip. Recently-resolved challenge
+           is still suppressing alerts. Logged so audit data shows the
+           cooldown is doing its job.
+        2. **No passphrase configured (M34 mode)** — announce movement and
+           we're done. Graceful fallback.
+        3. **Passphrase configured (M35 mode)** — enter CHALLENGE state,
+           cache the triggering frame as evidence, start the 15s timer."""
+        if now < self._cooldown_until:
+            remaining = self._cooldown_until - now
+            print(
+                f"[security] person detected but in cooldown "
+                f"({remaining:.1f}s left) — skipping alert",
+                file=sys.stderr,
+            )
+            return
+
+        if not self._passphrase:
+            # M34 fallback: no challenge configured, just announce.
+            print("[security] person detected — firing announcement (M34 mode)",
+                  file=sys.stderr)
+            try:
+                self._announce("Sir — I'm detecting movement in the monitored space.")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[security] announce raised: {exc}", file=sys.stderr)
+            return
+
+        # M35: enter CHALLENGE state.
+        with self._challenge_lock:
+            if self._challenge_active:
+                # Already in a challenge from a previous transition (the
+                # presence window must have flickered). Don't restart timer
+                # or re-prompt — let the existing challenge run its course.
+                return
+            self._challenge_active = True
+            self._challenge_started_at = now
+            # Cache the triggering frame for evidence-on-timeout. Copy via
+            # OpenCV's .copy() if available, otherwise the raw reference
+            # (frame is freshly grabbed and not modified after this point).
+            try:
+                self._challenge_evidence_frame = frame.copy()
+            except AttributeError:
+                self._challenge_evidence_frame = frame
+
+        print("[security] person detected — entering CHALLENGE state (15s)",
+              file=sys.stderr)
+        try:
+            self._announce(
+                "Please identify yourself within the next 15 seconds, sir."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] challenge announce raised: {exc}", file=sys.stderr)
+
+    def _check_challenge_timeout(self) -> None:
+        """Called once per watcher poll. If the 15s window has elapsed,
+        fire the deterrent path: save the evidence snapshot, speak the
+        bluff, enter cooldown. Idempotent — if no challenge is active or
+        the timer hasn't expired, no-op."""
+        with self._challenge_lock:
+            if not self._challenge_active:
+                return
+            elapsed = time.monotonic() - self._challenge_started_at
+            if elapsed < _CHALLENGE_TIMEOUT_SECONDS:
+                return
+            # Timer expired. Flip state under the lock first to avoid a
+            # race with try_authenticate (which might be running on the
+            # listen_loop thread RIGHT NOW). Then release the lock before
+            # the slow operations (file write + TTS).
+            self._challenge_active = False
+            self._cooldown_until = time.monotonic() + _CHALLENGE_COOLDOWN_SECONDS
+            evidence_frame = self._challenge_evidence_frame
+            self._challenge_evidence_frame = None
+
+        print(
+            f"[security] CHALLENGE timeout ({_CHALLENGE_TIMEOUT_SECONDS:.0f}s) — "
+            f"firing deterrent + saving evidence",
+            file=sys.stderr,
+        )
+        saved_path = self._save_evidence(evidence_frame)
+        if saved_path is not None:
+            print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
+
+        try:
+            self._announce(
+                "Identity not confirmed. Authorities have been notified. "
+                "Images of the intruder have been transmitted to law enforcement."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] deterrent announce raised: {exc}", file=sys.stderr)
+
+    def _save_evidence(self, frame) -> Path | None:
+        """Write the triggering frame to disk as a JPEG. Returns the path
+        on success, None on any failure. Defensive — never raises into
+        the watcher loop, since "we couldn't save evidence" must not
+        block the deterrent message."""
+        if frame is None or self._evidence_dir is None:
+            return None
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            return None
+        try:
+            self._evidence_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = self._evidence_dir / f"{timestamp}.jpg"
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                return None
+            path.write_bytes(bytes(buf))
+            return path
+        except Exception as exc:  # noqa: BLE001 — defensive
+            print(f"[security] evidence save failed: {exc}", file=sys.stderr)
+            return None
 
     def _ensure_model(self) -> bool:
         """Load YOLO once; cache across arm/disarm cycles. Returns True on

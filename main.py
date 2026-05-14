@@ -469,6 +469,24 @@ def listen_loop(
                     print("[main] (no speech captured)\n")
                     continue
 
+                # M35: challenge-response diversion. If security mode is
+                # currently in a CHALLENGE state (passphrase window open),
+                # the transcript routes to the watcher's authenticator
+                # instead of Claude — regardless of what was said. Either
+                # the passphrase matches and the challenge clears, or it
+                # doesn't and the user can keep trying within the 15s
+                # window (or the watcher times out and fires the deterrent).
+                # Voice activation/deactivation commands are still routed
+                # below since this check sits BEFORE the intent parser.
+                if security_watcher is not None and security_watcher.is_in_challenge():
+                    ui.add_user_text(transcript.text, transcript.language)
+                    try:
+                        security_watcher.try_authenticate(transcript.text)
+                    except Exception as exc:
+                        print(f"[main] try_authenticate raised: {exc}", file=sys.stderr)
+                    ui.set_state(State.IDLE)
+                    continue
+
                 # Pre-LLM intent parser (M34). "Activate security" / "stand
                 # down" route to SecurityWatcher locally — they don't burn a
                 # Claude turn and don't get logged to the conversation
@@ -656,9 +674,14 @@ def main() -> None:
         if text:
             announce_queue.put(text)
 
+    # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
+    # M34 announce-only behavior) and the evidence directory (where
+    # deterrent-fired triggering frames get saved as JPEGs).
     security_watcher = SecurityWatcher(
         announce=_announce,
         on_armed_changed=ui.set_armed_indicator,
+        passphrase=cfg.security_passphrase,
+        evidence_dir=default_base_dir() / "security" / "events",
     )
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`
