@@ -703,12 +703,14 @@ def main() -> None:
     # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
     # M34 announce-only behavior) and the evidence directory (where
     # deterrent-fired triggering frames get saved as JPEGs).
+    # M38: Discord webhook URL (empty → no notification, M35 bluff only).
     security_watcher = SecurityWatcher(
         announce=_announce,
         on_armed_changed=ui.set_armed_indicator,
         on_locked_changed=ui.set_locked_indicator,
         passphrase=cfg.security_passphrase,
         evidence_dir=default_base_dir() / "security" / "events",
+        discord_webhook_url=cfg.discord_webhook_url,
     )
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`

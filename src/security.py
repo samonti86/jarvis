@@ -212,6 +212,7 @@ class SecurityWatcher:
         camera_index: int = 0,
         passphrase: str = "",
         evidence_dir: Path | None = None,
+        discord_webhook_url: str = "",
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
@@ -229,6 +230,9 @@ class SecurityWatcher:
         # deterrent fire. Caller (main.py) computes the absolute path; we
         # just store it and stat/mkdir as needed.
         self._evidence_dir = evidence_dir
+        # M38: Discord webhook URL for deterrent-time push notifications.
+        # Empty string = no notification path active (M35 bluff only).
+        self._discord_webhook_url = discord_webhook_url
 
         # Coordination primitives. _armed is the public state; _stop fires
         # when we need the watcher thread to wind down (overlaps with
@@ -674,6 +678,14 @@ class SecurityWatcher:
         if saved_path is not None:
             print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
 
+        # M38: Discord webhook notification. Fired on a daemon thread so a
+        # slow Discord POST (~500ms typical, but could spike) doesn't delay
+        # the spoken deterrent or the LOCKED state transition. Send the
+        # SAME evidence frame (from before, in memory) rather than re-reading
+        # from disk — saves a stat + read.
+        if self._discord_webhook_url and saved_path is not None:
+            self._send_discord_alert_async(saved_path)
+
         # Flip the LOCKED indicator BEFORE the announce so the UI updates
         # immediately, not after the ~5s deterrent playback finishes.
         if self._on_locked_changed is not None:
@@ -690,6 +702,31 @@ class SecurityWatcher:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[security] deterrent announce raised: {exc}", file=sys.stderr)
+
+    def _send_discord_alert_async(self, evidence_path: Path) -> None:
+        """Fire-and-forget Discord notification on a daemon thread.
+
+        Done off the watcher's main loop because a Discord POST is up to
+        ~500ms typical / ~10s worst case (if Discord is slow or we get
+        rate-limited). The watcher should keep ticking — the spoken
+        deterrent has already played, the user has already authenticated
+        their phone, this is just the push. Errors all swallowed inside
+        send_discord_alert_for_path; nothing this method does can crash
+        the watcher.
+        """
+        # Local import: keep notifications.py off the import chain for
+        # users who never configure a webhook URL (same lazy-import
+        # pattern as ultralytics in _ensure_model).
+        from src.notifications import send_discord_alert_for_path
+
+        def _worker():
+            send_discord_alert_for_path(
+                self._discord_webhook_url, evidence_path, when=datetime.now()
+            )
+
+        threading.Thread(
+            target=_worker, name="DiscordNotify", daemon=True
+        ).start()
 
     def _save_evidence(self, frame) -> Path | None:
         """Write the triggering frame to disk as a JPEG. Returns the path
