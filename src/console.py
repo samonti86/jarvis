@@ -152,6 +152,17 @@ class JarvisConsole:
         )
         # NB: not packed initially — _apply_engineer handles pack/forget.
 
+        # Security-armed indicator (M34). Red because it's a "loud" state —
+        # Jarvis will speak unprompted while armed. Packed only when armed;
+        # toggle lives on the tray and on the voice intent parser.
+        self._armed_label = ctk.CTkLabel(
+            state_frame,
+            text="🛡 ARMED",
+            font=("Segoe UI Emoji", 11, "bold"),
+            text_color="#ef4444",  # tailwind red-500 — danger but readable on dark BG
+        )
+        # NB: not packed initially — _apply_armed handles pack/forget.
+
         # --- Audio waveform visualizer (M17) ---
         # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
         # Pre-cache each bar's x1/x2 so the per-frame redraw only mutates y.
@@ -386,6 +397,13 @@ class JarvisConsole:
         if not self._destroyed:
             self.root.after(0, self._apply_engineer, bool(on))
 
+    def set_armed(self, on: bool) -> None:
+        """Thread-safe: show/hide the '🛡 ARMED' security-mode indicator (M34).
+        Called from SecurityWatcher's on_armed_changed callback whenever the
+        state flips via voice intent OR the tray toggle."""
+        if not self._destroyed:
+            self.root.after(0, self._apply_armed, bool(on))
+
     # ------------------------------------------------------------------
     # SRE status bar API — all thread-safe via .after().
     # ------------------------------------------------------------------
@@ -501,6 +519,15 @@ class JarvisConsole:
                 self._engineer_label.pack(side="left", padx=(8, 0))
             else:
                 self._engineer_label.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _apply_armed(self, on: bool) -> None:
+        try:
+            if on:
+                self._armed_label.pack(side="left", padx=(8, 0))
+            else:
+                self._armed_label.pack_forget()
         except tk.TclError:
             pass
 

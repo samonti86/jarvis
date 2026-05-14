@@ -50,3 +50,10 @@ paramiko>=3.4
 # describe. headless = no GUI/Qt bits we don't need. cv2.VideoCapture also
 # does RTSP, so this is forward-compatible if IP cameras get added later.
 opencv-python-headless>=4.8
+
+# Security mode (M34) — local person detection via YOLOv8n. Pulls in torch
+# CPU (~200 MB) + non-headless opencv-python as transitive deps. YOLO model
+# (yolov8n.pt, ~6 MB) auto-downloads to ~/.cache/torch/hub on first inference.
+# CPU inference at ~150-300ms per frame on a Ryzen 5 3400G — fits the 0.5Hz
+# polling rate at <10% one-core utilization. MIT licensed.
+ultralytics>=8.4

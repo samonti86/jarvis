@@ -57,6 +57,12 @@ class JarvisUI:
         self._memory_dir = memory_dir
         self._tray: JarvisTray | None = None
         self._on_reset: Callable[[], None] | None = None
+        # Security toggle wiring — set via set_on_security_toggle from main.py
+        # AFTER SecurityWatcher is instantiated. Until then the tray's
+        # checkbox label still renders but clicking is a no-op.
+        self._security_activate: Callable[[], None] | None = None
+        self._security_deactivate: Callable[[], None] | None = None
+        self._security_is_armed: Callable[[], bool] | None = None
         # When True, main() should call autostart.relaunch() after the listen
         # loop has joined + the active session is sealed. The tray's "Restart
         # Jarvis" click flips this, then triggers the normal quit path — the
@@ -176,6 +182,48 @@ class JarvisUI:
         self.set_engineer_mode(not self.is_engineer_mode())
 
     # ------------------------------------------------------------------
+    # Security-armed indicator (M34). Owned by SecurityWatcher, not us —
+    # we just provide a thread-safe surface for the indicator to flip and
+    # a pass-through that the tray toggle can call. The watcher fires
+    # on_armed_changed(bool) on every state flip, which lands here via
+    # set_armed_indicator.
+    # ------------------------------------------------------------------
+
+    def set_armed_indicator(self, on: bool) -> None:
+        """Thread-safe pass-through to the console's armed indicator.
+        Called from SecurityWatcher's on_armed_changed callback."""
+        self.console.set_armed(on)
+
+    def set_on_security_toggle(
+        self, on_activate: Callable[[], None], on_deactivate: Callable[[], None],
+        is_armed: Callable[[], bool],
+    ) -> None:
+        """Wire the tray menu's Security-mode toggle to the watcher.
+        main.py calls this after instantiating SecurityWatcher so the tray
+        has the same activate/deactivate access voice does. is_armed is
+        read each time the menu opens (pystray re-evaluates `checked`)."""
+        self._security_activate = on_activate
+        self._security_deactivate = on_deactivate
+        self._security_is_armed = is_armed
+
+    def _handle_toggle_security(self) -> None:
+        """Tray callback: flip armed state via the wired SecurityWatcher.
+        Same code path as the voice intent parser — watcher is idempotent."""
+        if self._security_is_armed is None:
+            return
+        if self._security_is_armed():
+            if self._security_deactivate is not None:
+                self._security_deactivate()
+        else:
+            if self._security_activate is not None:
+                self._security_activate()
+
+    def _security_is_armed_or_false(self) -> bool:
+        """Tray-checkbox safe wrapper: returns False before SecurityWatcher
+        is wired, so the menu still renders cleanly during early startup."""
+        return bool(self._security_is_armed and self._security_is_armed())
+
+    # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------
 
@@ -211,6 +259,8 @@ class JarvisUI:
             on_mute_toggle=self._handle_toggle_mute,
             engineer_enabled=self.is_engineer_mode,
             on_engineer_toggle=self._handle_toggle_engineer,
+            security_enabled=self._security_is_armed_or_false,
+            on_security_toggle=self._handle_toggle_security,
             on_restart=self._handle_restart,
             on_create_shortcut=self._handle_create_shortcut,
             shutdown_event=self.shutdown,

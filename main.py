@@ -166,6 +166,7 @@ def listen_loop(
     reset_event: threading.Event,
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
+    security_watcher: "SecurityWatcher | None" = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -468,6 +469,22 @@ def listen_loop(
                     print("[main] (no speech captured)\n")
                     continue
 
+                # Pre-LLM intent parser (M34). "Activate security" / "stand
+                # down" route to SecurityWatcher locally — they don't burn a
+                # Claude turn and don't get logged to the conversation
+                # history. Match is loose (handles Whisper word variations);
+                # see src/security.py for the regexes. Returns True only when
+                # it actually consumed the transcript.
+                if security_watcher is not None:
+                    try:
+                        from src.security import handle_voice_command
+                        if handle_voice_command(transcript.text, security_watcher):
+                            ui.add_user_text(transcript.text, transcript.language)
+                            ui.set_state(State.IDLE)
+                            continue
+                    except Exception as exc:
+                        print(f"[main] security intent parser raised: {exc}", file=sys.stderr)
+
                 process_question(transcript.text, transcript.language)
     finally:
         # Quit / shutdown: seal whatever's still in memory so we don't lose it.
@@ -577,14 +594,61 @@ def main() -> None:
     ui.set_integration("plex", plex_client is not None)
     ui.set_integration("laptop", plex_laptop_client is not None)
 
+    # M34: instantiate SecurityWatcher with a proactive-speech callback. The
+    # announce closure uses speak_streaming (single-chunk iterator) so the
+    # waveform visualizer pulses + the UI flips to SPEAKING during playback,
+    # same treatment as a normal voice reply. Bypasses the mute check by
+    # design — security alerts override quiet mode.
+    from src.security import SecurityWatcher
+    from src.text_to_speech import speak_streaming
+
+    def _announce(text: str) -> None:
+        """Proactive speech from a background thread. Mirrors process_question's
+        speak path but is one-shot and ignores mute. Adds the line to the
+        console transcript as a system-prefixed message so the user has a
+        visual record of what was said + when."""
+        if not text:
+            return
+        print(f"[announce] {text}")
+        ui.add_system_text(f"🚨 {text}")
+        try:
+            speak_streaming(
+                iter([text]),
+                "en",
+                on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                on_amplitude=ui.set_amplitude,
+            )
+        except Exception as exc:
+            print(f"[announce] TTS failed: {exc}", file=sys.stderr)
+        finally:
+            ui.set_state(State.IDLE)
+
+    security_watcher = SecurityWatcher(
+        announce=_announce,
+        on_armed_changed=ui.set_armed_indicator,
+    )
+    # Wire the tray's Security-mode toggle to the watcher. Tray was already
+    # constructed inside ui.run()'s worker thread, but the toggle's `checked`
+    # callback re-evaluates each menu open, so this late wiring is fine.
+    ui.set_on_security_toggle(
+        on_activate=security_watcher.activate,
+        on_deactivate=security_watcher.deactivate,
+        is_armed=security_watcher.is_armed,
+    )
+
     worker = threading.Thread(
         target=listen_loop,
-        args=(cfg, ui, reset_event, plex_client, plex_laptop_client),
+        args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
         daemon=True,
     )
     worker.start()
 
     ui.run()  # blocks main thread on Tk's mainloop until Quit is clicked
+
+    # M34: signal the security watcher to wind down. It's a daemon thread
+    # so it dies with the process either way, but explicit shutdown lets
+    # any in-flight inference complete cleanly without log noise.
+    security_watcher.shutdown()
 
     # Give listen_loop time to see the shutdown event, exit its loop cleanly,
     # and run its try/finally — which seals the active session to disk. Worst

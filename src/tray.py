@@ -61,6 +61,8 @@ class JarvisTray:
         on_mute_toggle: Callable[[], None] | None = None,
         engineer_enabled: Callable[[], bool] | None = None,
         on_engineer_toggle: Callable[[], None] | None = None,
+        security_enabled: Callable[[], bool] | None = None,
+        on_security_toggle: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
         on_create_shortcut: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
@@ -81,6 +83,8 @@ class JarvisTray:
         self._on_mute_toggle = on_mute_toggle
         self._engineer_enabled = engineer_enabled
         self._on_engineer_toggle = on_engineer_toggle
+        self._security_enabled = security_enabled
+        self._on_security_toggle = on_security_toggle
         self._on_restart = on_restart
         self._on_create_shortcut = on_create_shortcut
 
@@ -119,6 +123,16 @@ class JarvisTray:
                 "Engineer mode",
                 self._handle_toggle_engineer,
                 checked=lambda item: bool(self._engineer_enabled()),
+            ))
+        if security_enabled is not None and on_security_toggle is not None:
+            # Security mode (M34): arms the proactive vision watcher. Same
+            # state Voice "activate security" / "stand down" controls — the
+            # tray toggle is just a faster surface for testing. Overrides
+            # mute (security alerts are louder than quiet hours).
+            menu_items.append(pystray.MenuItem(
+                "Security mode",
+                self._handle_toggle_security,
+                checked=lambda item: bool(self._security_enabled()),
             ))
         if autostart_enabled is not None and on_autostart_toggle is not None:
             # Pystray re-evaluates `checked` each time the menu opens, so the
@@ -173,6 +187,10 @@ class JarvisTray:
     def _handle_toggle_engineer(self) -> None:
         if self._on_engineer_toggle is not None:
             self._on_engineer_toggle()
+
+    def _handle_toggle_security(self) -> None:
+        if self._on_security_toggle is not None:
+            self._on_security_toggle()
 
     def _handle_restart(self) -> None:
         if self._on_restart is not None:

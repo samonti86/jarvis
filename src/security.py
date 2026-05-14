@@ -1,0 +1,458 @@
+"""Security mode — proactive vision watcher (M34 foundation).
+
+The "armed mode" half of the proactive-vision design. While armed, a
+background thread polls the Logi webcam at ~0.5 Hz, runs YOLOv8n person
+detection on each frame, and fires a proactive announcement when a person
+enters the scene. M34 is announce-only; M35 layers the challenge-response
+protocol (passphrase / face match / 15s timer / deterrent) on top of this
+same detection backbone.
+
+State machine (M34):
+
+    DISARMED ──"activate security"──→ ARMED
+       ▲                                 │
+       │                                 │ (person detected → announce)
+       │                                 │ (presence-window timer suppresses
+       │                                 │  repeat alerts while same person
+       │                                 │  stays in frame)
+       │                                 ▼
+       └────"stand down"─────────────── ARMED
+
+Design choices:
+
+- **Open-on-demand camera capture.** Same privacy-friendly pattern as
+  cameras.py: open VideoCapture → warmup → grab → release. The watcher
+  closes the device between polls, so the in-use LED doesn't stay lit
+  while armed, and a `camera_snapshot` voice query during armed mode can
+  still grab the camera (worst case: one cycle's grab fails harmlessly).
+- **640×480 capture, not 1280×720.** Person detection works fine at low
+  resolution and YOLO inference scales with input size. Smaller frames =
+  faster inference = lower CPU during a long armed session.
+- **Lazy YOLO load.** `ultralytics` + torch CPU pulls ~200 MB into memory
+  on first import. Doing it at module-import-time would balloon Jarvis's
+  baseline RSS for every user, including ones who never use security
+  mode. Load happens inside `_watch_loop` on first iteration; subsequent
+  arms reuse the loaded model.
+- **Presence-window debounce.** Without it, a person sitting in frame
+  would trigger an announcement every 2s polling cycle — comically bad.
+  We track "person currently present" as a boolean: announce on the
+  transition EMPTY → PERSON, then suppress until the person has been
+  absent for `_PRESENCE_CLEAR_SECONDS` (30s by default). After that, the
+  next detection re-arms the announcement.
+- **5s arm-grace.** From the user's perspective: "activate security" →
+  Jarvis confirms → user has 5 seconds to walk away before the watcher
+  starts looking for them. Otherwise arming-while-at-desk would
+  immediately fire. Standard burglar-alarm UX.
+- **YOLO failure auto-disarms.** If the model fails to load (missing
+  cache, disk full, etc.), the watcher announces the failure and
+  clears the armed state rather than silently leaving security
+  "active" with no detection backbone.
+- **Defensive contract.** Camera busy, YOLO crash, frame decode failure
+  — all become log lines + a single graceful disarm. The watcher
+  never raises through to its thread boundary.
+
+Threading:
+- The watcher thread is daemon=True, so it dies with the process.
+- `activate()` and `deactivate()` are thread-safe (idempotent + lock-free
+  via a single `threading.Event`).
+- The announcement callback runs ON THE WATCHER THREAD. The callback is
+  responsible for its own thread safety; main.py wraps speak_streaming
+  which is thread-safe.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from typing import Callable
+
+
+# --- Tunables --------------------------------------------------------------
+# Polling cadence — every 2s gives 0.5 Hz inference, which at ~150-300ms per
+# frame on a Ryzen 5 3400G is ~10% of one core. Faster = more responsive but
+# higher idle CPU. A person can't traverse a small space in <2s, so this
+# is plenty for the use case.
+_POLL_SECONDS = 2.0
+
+# Grace period after arming before the watcher starts looking. Lets the user
+# walk away after saying "activate security" without immediately triggering
+# the alert on themselves. Five seconds is short enough that a real intruder
+# couldn't exploit it (they'd have to arm Jarvis from outside, which they
+# can't — voice only).
+_ARM_GRACE_SECONDS = 5.0
+
+# How long a person must be absent from frame before a fresh detection
+# counts as a "new" presence (and re-triggers the announcement). 30s avoids
+# both the spammy "every frame is a new event" failure and the silent "user
+# stepped out of frame for 2 seconds, came back, no re-alert" failure.
+_PRESENCE_CLEAR_SECONDS = 30.0
+
+# YOLO class 0 = "person" in the COCO dataset. Default v8n weights are
+# trained on COCO so this index is stable.
+_YOLO_PERSON_CLASS = 0
+
+# Confidence threshold for "this is a person". YOLOv8n at 0.5 has very low
+# false-positive rate on typical scenes. Lower would catch more (incl. pets
+# misidentified as small persons); higher would miss partial views.
+_YOLO_CONFIDENCE = 0.5
+
+# Capture resolution — smaller than cameras.py's 1280×720 because YOLO
+# resizes to 640×640 internally anyway, so a 640×480 source saves the
+# downsample step + halves the JPEG-decode work.
+_CAPTURE_WIDTH = 640
+_CAPTURE_HEIGHT = 480
+
+# Warmup frames per grab. cameras.py uses 6 for cold-open quality; we use 2
+# because the watcher grabs every 2s and we'd rather keep CPU low than
+# perfect-expose each frame. YOLO is robust to slightly underexposed input.
+_WARMUP_FRAMES = 2
+
+
+# --- Public API ------------------------------------------------------------
+# AnnounceFn signature: (text) → None. Caller-supplied; main.py wraps
+# speak_streaming so we get UI state coordination + the waveform pulse
+# during proactive speech.
+AnnounceFn = Callable[[str], None]
+
+
+class SecurityWatcher:
+    """Proactive person-detection watcher.
+
+    Usage (from main.py):
+
+        watcher = SecurityWatcher(announce_fn, set_armed_indicator_fn)
+        # Voice intent parser:
+        if "activate security" in transcript:
+            watcher.activate()
+        if "stand down" in transcript:
+            watcher.deactivate()
+    """
+
+    def __init__(
+        self,
+        announce: AnnounceFn,
+        on_armed_changed: Callable[[bool], None] | None = None,
+        camera_index: int = 0,
+    ) -> None:
+        self._announce = announce
+        self._on_armed_changed = on_armed_changed
+        self._camera_index = camera_index
+
+        # Coordination primitives. _armed is the public state; _stop fires
+        # when we need the watcher thread to wind down (overlaps with
+        # _armed.is_set() == False but distinct: deactivate sets _stop so an
+        # in-progress poll cycle short-circuits, even before the thread
+        # re-checks _armed at the top of its loop).
+        self._armed = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._armed_at = 0.0
+
+        # Presence-window state. _person_present is True between the
+        # transition (empty → person) and the timeout firing. Tracked
+        # entirely on the watcher thread so no lock needed.
+        self._person_present = False
+        self._person_last_seen = 0.0
+
+        # Lazy-loaded YOLO. Held across activate/deactivate cycles so the
+        # second arm is instant (no model reload). Becomes a sentinel
+        # "failed to load" value if init blew up — see _ensure_model.
+        self._model = None
+        self._model_load_failed = False
+
+    # ---------------------------------------------------------------------
+    # Public state queries / mutators — thread-safe.
+    # ---------------------------------------------------------------------
+
+    def is_armed(self) -> bool:
+        return self._armed.is_set()
+
+    def activate(self) -> None:
+        """Idempotent: arming an already-armed system is a no-op (no second
+        announcement, no second thread spawned)."""
+        if self._armed.is_set():
+            return
+        self._armed.set()
+        self._stop.clear()
+        self._armed_at = time.monotonic()
+        self._person_present = False
+        if self._on_armed_changed is not None:
+            try:
+                self._on_armed_changed(True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[security] on_armed_changed(True) raised: {exc}", file=sys.stderr)
+
+        # Announce BEFORE spawning the watcher so the user hears the
+        # confirmation immediately. The 5s grace window starts now; by the
+        # time the watcher's first inference fires, the user has had time
+        # to step away from the camera.
+        try:
+            self._announce("Security mode active, sir. I am standing watch.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] announce on activate raised: {exc}", file=sys.stderr)
+
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._watch_loop, name="SecurityWatcher", daemon=True
+            )
+            self._thread.start()
+
+    def deactivate(self) -> None:
+        """Idempotent: disarming an already-disarmed system is a no-op."""
+        if not self._armed.is_set():
+            return
+        self._armed.clear()
+        self._stop.set()
+        if self._on_armed_changed is not None:
+            try:
+                self._on_armed_changed(False)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[security] on_armed_changed(False) raised: {exc}", file=sys.stderr)
+        try:
+            self._announce("Standing down, sir.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] announce on deactivate raised: {exc}", file=sys.stderr)
+
+    def shutdown(self) -> None:
+        """Called on app quit. Just clears state and signals the thread to
+        exit; doesn't speak (the app is winding down)."""
+        self._armed.clear()
+        self._stop.set()
+        # Don't join — daemon thread dies with the process. Joining could
+        # block shutdown if the watcher is mid-inference (~300ms).
+
+    # ---------------------------------------------------------------------
+    # Watcher thread internals.
+    # ---------------------------------------------------------------------
+
+    def _watch_loop(self) -> None:
+        """Daemon: poll camera, detect, announce. Exits when _stop fires."""
+        # First iteration: lazy-load the model. Failure auto-disarms with
+        # an announcement so the user isn't left thinking they're protected.
+        if not self._ensure_model():
+            return
+
+        print("[security] watcher loop started", file=sys.stderr)
+
+        try:
+            while not self._stop.is_set() and self._armed.is_set():
+                # Grace period: don't fire detections in the first 5s after
+                # arming so the user has time to walk away from the camera.
+                if time.monotonic() - self._armed_at < _ARM_GRACE_SECONDS:
+                    if self._stop.wait(0.5):
+                        return
+                    continue
+
+                frame = self._grab_frame()
+                if frame is None:
+                    # Camera busy / closed / black frame — log once per 10
+                    # consecutive failures to avoid log spam, then sleep.
+                    # For v1 we just sleep and retry.
+                    if self._stop.wait(_POLL_SECONDS):
+                        return
+                    continue
+
+                person_detected = self._detect_person(frame)
+                now = time.monotonic()
+
+                if person_detected:
+                    if not self._person_present:
+                        # Transition empty → person: fire the announcement.
+                        print(
+                            f"[security] person detected — firing announcement",
+                            file=sys.stderr,
+                        )
+                        self._person_present = True
+                        try:
+                            self._announce(
+                                "Sir — I'm detecting movement in the monitored space."
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"[security] announce raised: {exc}",
+                                file=sys.stderr,
+                            )
+                    self._person_last_seen = now
+                else:
+                    # No person this cycle. If we were tracking a presence
+                    # and it's been gone long enough, reset so the next
+                    # detection counts as new.
+                    if self._person_present and (
+                        now - self._person_last_seen > _PRESENCE_CLEAR_SECONDS
+                    ):
+                        print(
+                            f"[security] presence window closed (no person "
+                            f"for {_PRESENCE_CLEAR_SECONDS:.0f}s)",
+                            file=sys.stderr,
+                        )
+                        self._person_present = False
+
+                # Sleep till the next poll, but wake instantly on _stop so
+                # disarming feels responsive.
+                if self._stop.wait(_POLL_SECONDS):
+                    return
+        finally:
+            print("[security] watcher loop exited", file=sys.stderr)
+
+    def _ensure_model(self) -> bool:
+        """Load YOLO once; cache across arm/disarm cycles. Returns True on
+        success, False on permanent failure (and auto-disarms with an
+        announcement so the user isn't silently unprotected)."""
+        if self._model is not None:
+            return True
+        if self._model_load_failed:
+            # Already tried this session and it didn't work — don't keep
+            # retrying. User would need to fix the install + restart Jarvis.
+            return False
+
+        try:
+            # Local import for the same reason cameras.py does it lazy:
+            # heavy dep, broken install should degrade to a readable error
+            # rather than crash the whole app at startup.
+            from ultralytics import YOLO  # type: ignore
+        except ImportError as exc:
+            self._model_load_failed = True
+            print(f"[security] ultralytics import failed: {exc}", file=sys.stderr)
+            try:
+                self._announce(
+                    "Security model unavailable, sir. The vision library isn't installed."
+                )
+            finally:
+                self._auto_disarm()
+            return False
+
+        t0 = time.monotonic()
+        try:
+            # First call downloads yolov8n.pt to ~/.cache/torch/hub (or
+            # similar) — ~6 MB. Subsequent loads are instant from disk.
+            # `verbose=False` is set per-inference, not per-construction.
+            self._model = YOLO("yolov8n.pt")
+        except Exception as exc:  # noqa: BLE001 — defensive
+            self._model_load_failed = True
+            print(
+                f"[security] YOLO load failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            try:
+                self._announce(
+                    "Security model failed to load, sir. Check the logs."
+                )
+            finally:
+                self._auto_disarm()
+            return False
+
+        print(
+            f"[security] YOLO loaded in {time.monotonic() - t0:.1f}s",
+            file=sys.stderr,
+        )
+        return True
+
+    def _grab_frame(self):
+        """Open camera → warmup → grab → release. Returns numpy frame or
+        None on any failure. Mirrors cameras.py's pattern but with shorter
+        warmup + smaller resolution since YOLO doesn't need full quality."""
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            return None
+
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, _CAPTURE_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _CAPTURE_HEIGHT)
+
+            frame = None
+            for _ in range(_WARMUP_FRAMES):
+                ok, f = cap.read()
+                if ok and f is not None:
+                    frame = f
+            return frame
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] frame grab failed: {exc}", file=sys.stderr)
+            return None
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+    def _detect_person(self, frame) -> bool:
+        """Run YOLO inference, return True if any high-confidence person
+        box is in the frame. Inference is ~150-300ms on CPU."""
+        try:
+            # verbose=False suppresses YOLO's per-call console banner that
+            # would otherwise spam jarvis.log every 2 seconds.
+            results = self._model(frame, verbose=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] inference failed: {exc}", file=sys.stderr)
+            return False
+
+        for r in results:
+            # r.boxes is the detected objects. Each box has .cls (class
+            # index) and .conf (confidence). Iterate looking for any person
+            # over the confidence threshold; short-circuit on first match.
+            boxes = getattr(r, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                try:
+                    cls = int(box.cls)
+                    conf = float(box.conf)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if cls == _YOLO_PERSON_CLASS and conf >= _YOLO_CONFIDENCE:
+                    return True
+        return False
+
+    def _auto_disarm(self) -> None:
+        """Internal: clear armed state + notify UI without an extra spoken
+        message (caller already announced the reason for the failure)."""
+        self._armed.clear()
+        self._stop.set()
+        if self._on_armed_changed is not None:
+            try:
+                self._on_armed_changed(False)
+            except Exception:
+                pass
+
+
+# --- Voice-intent parser ---------------------------------------------------
+# Pre-LLM intent matcher. main.py's listen_loop calls this BEFORE
+# process_question; if it returns True the transcript is handled locally
+# and Claude isn't called (saves a turn).
+#
+# Patterns are deliberately loose: Whisper sometimes hallucinates extra
+# words ("Activate THE security please"), so we match on the verb + the
+# noun via \b word boundaries, not on exact phrases. False-positive
+# tolerance is fine here — the keywords are uncommon in normal
+# conversation, and arming/disarming via voice is idempotent + low-impact.
+
+import re
+
+_ACTIVATE_RE = re.compile(
+    r"\b(activate|engage|enable|arm|turn\s+on)\b.*\bsecurity\b",
+    re.IGNORECASE,
+)
+_DEACTIVATE_RE = re.compile(
+    r"\b(stand\s+down|disarm|deactivate|disable|security\s+off|turn\s+off\s+security)\b",
+    re.IGNORECASE,
+)
+
+
+def handle_voice_command(transcript: str, watcher: SecurityWatcher) -> bool:
+    """Return True if the transcript was handled locally (don't pass to
+    Claude). False means fall through to the normal LLM path."""
+    if not transcript:
+        return False
+    if _ACTIVATE_RE.search(transcript):
+        watcher.activate()
+        return True
+    if _DEACTIVATE_RE.search(transcript):
+        watcher.deactivate()
+        return True
+    return False

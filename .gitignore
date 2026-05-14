@@ -17,6 +17,11 @@ models/
 *.onnx
 *.tflite
 
+# YOLO weights (M34 — security mode auto-downloads yolov8n.pt on first arm).
+# Ultralytics puts it in the current working directory by default, so it
+# lands in the repo root when Jarvis is run from there. ~6MB, regenerates.
+*.pt
+
 # IDE / OS
 .vscode/
 .idea/
