@@ -158,10 +158,12 @@ class RingWatcher:
 
             # Establish baseline: the most recent event at startup is NOT
             # something we should fire on (it could be hours/days old).
+            # ring_doorbell returns events as dicts with keys id, kind,
+            # created_at — NOT objects with .id/.kind attrs.
             try:
                 events = await cam.async_history(limit=1)
                 if events:
-                    self._last_event_id = events[0].id
+                    self._last_event_id = events[0]["id"]
             except Exception as exc:  # noqa: BLE001
                 print(f"[ring] baseline history fetch failed: {exc}",
                       file=sys.stderr)
@@ -195,11 +197,20 @@ class RingWatcher:
         if not events:
             return
 
-        # Events are returned newest-first. Collect everything newer than
-        # our last seen id.
+        # If baseline was never established (initial history fetch was empty
+        # or failed), set it now and DON'T fire on these events — they
+        # predate Jarvis being armed and would be spurious alerts.
+        if self._last_event_id is None:
+            self._last_event_id = events[0]["id"]
+            print(f"[ring] baseline established to event {self._last_event_id}",
+                  file=sys.stderr)
+            return
+
+        # Events are returned newest-first as dicts. Collect everything
+        # newer than our last seen id.
         new_events = []
         for event in events:
-            if event.id == self._last_event_id:
+            if event["id"] == self._last_event_id:
                 break
             new_events.append(event)
 
@@ -209,22 +220,20 @@ class RingWatcher:
         # Bump baseline to the newest event we just saw — important to do
         # this BEFORE firing alerts, so a slow snapshot fetch can't cause
         # us to re-process the same event on the next poll.
-        self._last_event_id = events[0].id
+        self._last_event_id = events[0]["id"]
 
         for event in new_events:
-            # Ring event "kind" is "motion" for camera motion, plus other
-            # kinds for doorbells (ding) and various device-specific events.
-            # Filter to motion only — that's the security signal.
-            kind = getattr(event, "kind", "")
-            if kind != "motion":
+            # Filter to motion events; doorbells emit "ding" + various
+            # device-specific kinds we don't care about here.
+            if event.get("kind") != "motion":
                 continue
             await self._fire_alert(cam, event)
 
-    async def _fire_alert(self, cam, event) -> None:
+    async def _fire_alert(self, cam, event: dict) -> None:
         """Fetch snapshot for an event and call into SecurityWatcher.
         Snapshot is best-effort — empty bytes is acceptable, the
         deterrent path still fires with no image attached."""
-        print(f"[ring] motion event id={event.id} at {event.created_at}",
+        print(f"[ring] motion event id={event['id']} at {event.get('created_at')}",
               file=sys.stderr)
         snap_bytes = b""
         try:
