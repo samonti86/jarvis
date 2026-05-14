@@ -155,12 +155,20 @@ def _record_until_silence(
     return audio
 
 
-# M36: how long to wait for the GPU server before giving up (and either
-# falling back to local CPU in "auto" mode, or erroring in "gpu" mode).
-# Typical GPU latency is 250-500ms; 15s is generous enough for a cold
-# server startup or transient slowness, short enough to fall back fast
-# if the server is genuinely dead.
-_REMOTE_STT_TIMEOUT_SECONDS = 15.0
+# M36: per-phase timeouts for remote STT.
+#
+# Split connect vs read so a DOWN server fails in ~2s (TCP SYN timeout)
+# instead of the full 15s read budget. The auto-fallback path retries on
+# every voice turn; without a fast connect timeout, every turn would
+# eat 15s before the user got their answer.
+#
+# Connect timeout 2s: enough for LAN handshake (~5ms typical), short
+# enough to be unmissable when the server is dead.
+# Read timeout 15s: covers cold model load, long audio, GPU queue from
+# a concurrent Plex transcode. Typical inference is 300-800ms; 15s is
+# generous headroom.
+_REMOTE_STT_CONNECT_TIMEOUT = 2.0
+_REMOTE_STT_READ_TIMEOUT = 15.0
 
 
 def transcribe_after_wake(
@@ -287,10 +295,18 @@ def _transcribe_remote(audio_i16: np.ndarray, server_url: str) -> Transcript:
     # in src/sports.py). Sync .post is fine here — we're already on a
     # worker thread (listen_loop or text_input_loop), no event loop to
     # block.
+    # Split connect vs read timeouts — see _REMOTE_STT_CONNECT_TIMEOUT for the
+    # rationale. A down server fails fast (2s connect timeout) instead of
+    # making every voice turn wait the full 15s read budget.
     resp = httpx.post(
         f"{server_url}/transcribe",
         files=files,
-        timeout=_REMOTE_STT_TIMEOUT_SECONDS,
+        timeout=httpx.Timeout(
+            connect=_REMOTE_STT_CONNECT_TIMEOUT,
+            read=_REMOTE_STT_READ_TIMEOUT,
+            write=_REMOTE_STT_READ_TIMEOUT,
+            pool=_REMOTE_STT_CONNECT_TIMEOUT,
+        ),
     )
     resp.raise_for_status()
     data = resp.json()

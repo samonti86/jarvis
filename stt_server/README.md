@@ -14,7 +14,11 @@ transcription than the desktop's CPU path.
 - NVIDIA driver 525+ (verify with `nvidia-smi` — current driver should be far newer).
 - Python 3.10+ (Jarvis tested with 3.13 on the laptop; the desktop client runs on 3.12).
 
-No CUDA Toolkit install needed. `ctranslate2` ships pre-built CUDA wheels with cuDNN 9 bundled.
+**No CUDA Toolkit (`nvcc`) install needed.** The four `nvidia-*-cu12` pip
+packages in `requirements.txt` ship the CUDA runtime DLLs (cuBLAS,
+cuDNN, NVRTC, cudart). `server.py` adds their `bin/` directories to
+the Windows DLL search path AND `PATH` at module load — both are
+required (see comments in `server.py`).
 
 ## Install
 
@@ -65,49 +69,63 @@ curl http://192.168.1.10:8000/health
 curl -F "audio=@test.wav" -F "language=en" http://192.168.1.10:8000/transcribe
 ```
 
-## Autostart via NSSM
+## Autostart on boot (Task Scheduler)
 
-[NSSM](https://nssm.cc/) (Non-Sucking Service Manager) is the standard way
-to run a Python app as a Windows service. Same pattern used for
-`PlexService` on this host.
+The simplest reliable autostart on Windows that doesn't need admin or
+extra tooling. The repo ships `run_server.bat` which `cd`s to its own
+directory and launches uvicorn with output redirected to `server.log`.
 
 ```powershell
-# Install NSSM if it's not already present:
+# No admin needed — runs under your own user. /sc onstart fires on every boot:
+schtasks /create /tn JarvisSTTServer /tr "C:\Users\youruser\repos\jarvis\stt_server\run_server.bat" /sc onstart /ru youruser /f
+
+# Verify:
+schtasks /query /tn JarvisSTTServer
+
+# Fire it immediately (for testing without rebooting):
+schtasks /run /tn JarvisSTTServer
+
+# Stop the running instance:
+taskkill /F /IM python.exe
+```
+
+The task runs at user logon (not session-locked). After a reboot, the
+server is up within ~15s of login (model-load time).
+
+### Alternative: NSSM service
+
+If you want it to start before user login (true service), use NSSM.
+This is what `PlexService` uses on this host. Requires admin install.
+
+```powershell
 winget install nssm
 
-# Create the service (run as Administrator):
+# Run as Administrator:
 nssm install JarvisSTTServer C:\Users\youruser\repos\jarvis\stt_server\venv\Scripts\python.exe
 nssm set    JarvisSTTServer AppParameters "-m uvicorn server:app --host 0.0.0.0 --port 8000"
 nssm set    JarvisSTTServer AppDirectory  C:\Users\youruser\repos\jarvis\stt_server
-nssm set    JarvisSTTServer DisplayName   "Jarvis STT GPU Server"
-nssm set    JarvisSTTServer Description   "Runs faster-whisper on the GPU for the Jarvis desktop client. See stt_server/README.md."
-nssm set    JarvisSTTServer Start         SERVICE_AUTO_START
 nssm set    JarvisSTTServer AppStdout     C:\Users\youruser\repos\jarvis\stt_server\service.log
 nssm set    JarvisSTTServer AppStderr     C:\Users\youruser\repos\jarvis\stt_server\service.log
 nssm set    JarvisSTTServer AppRotateFiles 1
-nssm set    JarvisSTTServer AppRotateBytes 10485760  # 10 MB
-
-# Start:
+nssm set    JarvisSTTServer AppRotateBytes 10485760
+nssm set    JarvisSTTServer Start         SERVICE_AUTO_START
 nssm start JarvisSTTServer
-
-# Check status:
-nssm status JarvisSTTServer
 ```
 
 ## Firewall
 
-Windows Defender Firewall blocks inbound port 8000 by default. Open it for
-the LAN only (not the public profile):
+Windows Defender Firewall blocks inbound port 8000 by default.
 
 ```powershell
-# Run as Administrator:
-New-NetFirewallRule -DisplayName "Jarvis STT Server" `
-    -Direction Inbound `
-    -LocalPort 8000 `
-    -Protocol TCP `
-    -Action Allow `
-    -Profile Private
+# Use netsh — works without admin if you're a local administrator.
+# DO NOT use New-NetFirewallRule on hosts with broken WMI/CIM
+# StandardCimv2 provider (e.g. MEDIA-HOST) — it errors with
+# "Invalid class". netsh is the WMI-free path.
+netsh advfirewall firewall add rule name="Jarvis STT Server" dir=in action=allow protocol=TCP localport=8000 profile=any
 ```
+
+`profile=any` covers Private + Public + Domain. If your LAN is correctly
+classified as Private, you can use `profile=private` for tighter scoping.
 
 ## Operations
 

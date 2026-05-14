@@ -3,11 +3,20 @@
 # Runs on MEDIA-HOST (the Plex laptop) — separate venv, separate deps from
 # the main Jarvis project. Install in stt_server/venv (NOT the main venv).
 
-# Whisper STT, GPU-accelerated. ctranslate2 backend ships pre-built CUDA
-# wheels (cuDNN 9 bundled) — no separate CUDA Toolkit install needed,
-# just the NVIDIA driver. faster-whisper auto-detects GPU when
-# device="cuda" is set.
+# Whisper STT, GPU-accelerated. ctranslate2 backend works against the
+# NVIDIA driver via these four pip-distributed CUDA runtime libraries:
+#   - nvidia-cublas-cu12      (cuBLAS — linear algebra)
+#   - nvidia-cudnn-cu12       (cuDNN — DNN primitives)
+#   - nvidia-cuda-nvrtc-cu12  (NVRTC — runtime compilation)
+#   - nvidia-cuda-runtime-cu12 (cudart — CUDA runtime; required by cuBLAS)
+# These are NOT pulled in transitively by faster-whisper/ctranslate2 —
+# must declare explicitly. Server.py adds their bin dirs to the Windows
+# DLL search path at module load.
 faster-whisper>=1.0.0
+nvidia-cublas-cu12>=12.0
+nvidia-cudnn-cu12>=9.0
+nvidia-cuda-nvrtc-cu12>=12.0
+nvidia-cuda-runtime-cu12>=12.0
 
 # Web framework + ASGI server. uvicorn[standard] pulls in `httptools` and
 # `websockets` for the faster HTTP parser path; not strictly required for
