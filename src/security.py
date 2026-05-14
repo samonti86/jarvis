@@ -573,9 +573,13 @@ class SecurityWatcher:
 
         with self._challenge_lock:
             if self._challenge_active:
-                # Already in a challenge from a previous transition (e.g.
-                # Logi flicker, or Ring + Logi co-firing). Let the existing
-                # challenge run its course — don't restart timer or re-prompt.
+                # Already in a challenge — second camera firing on the same
+                # person (Logi + Ring co-firing the same walk-through is the
+                # common case). Log so it's visible which camera won the
+                # race; otherwise the user only sees one source name and
+                # wonders if the other camera fired at all.
+                print(f"[security] motion ({source}) suppressed — challenge "
+                      f"already active from prior source", file=sys.stderr)
                 return
             self._challenge_active = True
             self._challenge_started_at = 0.0  # SENTINEL: armed by on_done

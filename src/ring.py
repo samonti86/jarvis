@@ -59,13 +59,15 @@ _BASE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
 _TOKEN_PATH = _BASE / "ring_token.json"
 _CONFIG_PATH = _BASE / "ring_config.json"
 
-# Poll interval in seconds. 5s = 12 requests/minute, well under Ring's
-# rate limits (anecdotally ~60/min). Worst-case detection latency for the
-# user is poll-interval + Ring's own event-propagation latency (~1-3s
-# from camera to cloud), so ~5-8s from the actual motion to the
-# challenge prompt firing. Acceptable for security; not great for
-# real-time but real-time needs FCM which is overkill here.
-_POLL_INTERVAL_SECONDS = 5.0
+# Poll interval in seconds. 3s = 20 polls/min × 2 API calls = 40 calls/min,
+# well under Ring's rate limits (~60/min anecdotal). Worst-case detection
+# latency for the user is poll-interval + Ring's camera-to-cloud
+# propagation (~1-3s), so ~3-6s from the actual motion to the challenge
+# prompt firing. Real-time push (FCM via RingEventListener) would give
+# sub-second latency but is significant additional complexity — 3s polling
+# is the sweet spot for security alerts where the prompt itself takes
+# ~4s to play anyway.
+_POLL_INTERVAL_SECONDS = 3.0
 
 
 def is_configured() -> bool:
