@@ -77,10 +77,12 @@ _POLL_SECONDS = 2.0
 
 # Grace period after arming before the watcher starts looking. Lets the user
 # walk away after saying "activate security" without immediately triggering
-# the alert on themselves. Five seconds is short enough that a real intruder
-# couldn't exploit it (they'd have to arm Jarvis from outside, which they
-# can't — voice only).
-_ARM_GRACE_SECONDS = 5.0
+# the alert on themselves. Ten seconds is comfortable for the "say activate,
+# walk to the door, step out" use case — bumped from M34's initial 5s after
+# live testing showed 5s wasn't enough margin. A real intruder couldn't
+# exploit this (they'd have to arm Jarvis from outside, which they can't —
+# voice activation requires being at the mic).
+_ARM_GRACE_SECONDS = 10.0
 
 # How long a person must be absent from frame before a fresh detection
 # counts as a "new" presence (and re-triggers the announcement). 30s avoids
@@ -96,6 +98,21 @@ _YOLO_PERSON_CLASS = 0
 # false-positive rate on typical scenes. Lower would catch more (incl. pets
 # misidentified as small persons); higher would miss partial views.
 _YOLO_CONFIDENCE = 0.5
+
+# Minimum person bounding-box height as a fraction of frame height. Defense
+# in depth against YOLO misclassifying a pet as a person at low confidence:
+# even if the class label is wrong, the SIZE never matches a human-scale
+# detection. Sanity numbers (~8ft indoor camera distance):
+#   - standing person:     50-70% of frame height
+#   - sitting/crouched:    30-50%
+#   - pet at same distance: 10-15%
+#   - close-up pet (3ft):  20-25% (still below threshold)
+#   - person at door (far): 30-40% (just above threshold — acceptable margin)
+# 0.30 picks the lowest-pet-can-grow-to value with comfortable headroom
+# for the smallest realistic person detection. If the user has children or
+# the camera is unusually wide, tune downward; if false positives persist,
+# tune upward.
+_MIN_PERSON_HEIGHT_RATIO = 0.30
 
 # Capture resolution — smaller than cameras.py's 1280×720 because YOLO
 # resizes to 640×640 internally anyway, so a 640×480 source saves the
@@ -383,7 +400,20 @@ class SecurityWatcher:
 
     def _detect_person(self, frame) -> bool:
         """Run YOLO inference, return True if any high-confidence person
-        box is in the frame. Inference is ~150-300ms on CPU."""
+        box is in the frame AND passes the size sanity check. Inference is
+        ~150-300ms on CPU.
+
+        Two-layer filter:
+          1. Class == person (0) AND confidence ≥ 0.5 — catches the
+             well-classified cases. Pets (class 15) and dogs (class 16) on
+             COCO are correctly classified the vast majority of the time
+             and rejected here.
+          2. Bbox height ≥ 30% of frame height — defense against YOLO
+             misclassifying a partially-visible pet as a "person" at low
+             confidence. The SIZE never matches a human-scale detection
+             regardless of label. Reasoning + thresholds documented at
+             _MIN_PERSON_HEIGHT_RATIO above.
+        """
         try:
             # verbose=False suppresses YOLO's per-call console banner that
             # would otherwise spam jarvis.log every 2 seconds.
@@ -392,10 +422,15 @@ class SecurityWatcher:
             print(f"[security] inference failed: {exc}", file=sys.stderr)
             return False
 
+        # frame.shape on a cv2 BGR frame is (H, W, 3).
+        frame_h = float(frame.shape[0]) if hasattr(frame, "shape") else 0.0
+        min_bbox_h = frame_h * _MIN_PERSON_HEIGHT_RATIO
+
         for r in results:
             # r.boxes is the detected objects. Each box has .cls (class
-            # index) and .conf (confidence). Iterate looking for any person
-            # over the confidence threshold; short-circuit on first match.
+            # index), .conf (confidence), and .xyxy ([x1,y1,x2,y2]).
+            # Iterate looking for any qualifying person; short-circuit on
+            # the first match.
             boxes = getattr(r, "boxes", None)
             if boxes is None:
                 continue
@@ -405,8 +440,29 @@ class SecurityWatcher:
                     conf = float(box.conf)
                 except (TypeError, ValueError, AttributeError):
                     continue
-                if cls == _YOLO_PERSON_CLASS and conf >= _YOLO_CONFIDENCE:
-                    return True
+                if cls != _YOLO_PERSON_CLASS or conf < _YOLO_CONFIDENCE:
+                    continue
+                # Size filter: extract bbox height. xyxy is [x1, y1, x2, y2]
+                # in pixels. Defensive — log + skip if shape unexpected.
+                try:
+                    coords = box.xyxy[0].tolist()
+                    bbox_h = float(coords[3]) - float(coords[1])
+                except (AttributeError, IndexError, ValueError, TypeError):
+                    continue
+                if bbox_h < min_bbox_h:
+                    # Looks like a person to YOLO but is too small for a
+                    # human-scale detection — almost certainly a pet or a
+                    # picture-frame face. Log so we can audit false-rejects
+                    # later if needed.
+                    print(
+                        f"[security] rejected: person@{conf:.2f} but bbox "
+                        f"height {bbox_h:.0f}px < {min_bbox_h:.0f}px "
+                        f"(< {_MIN_PERSON_HEIGHT_RATIO:.0%} of frame {frame_h:.0f}px) "
+                        f"— likely a pet",
+                        file=sys.stderr,
+                    )
+                    continue
+                return True
         return False
 
     def _auto_disarm(self) -> None:
