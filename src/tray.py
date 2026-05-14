@@ -61,6 +61,8 @@ class JarvisTray:
         on_mute_toggle: Callable[[], None] | None = None,
         engineer_enabled: Callable[[], bool] | None = None,
         on_engineer_toggle: Callable[[], None] | None = None,
+        on_restart: Callable[[], None] | None = None,
+        on_create_shortcut: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
         # Allow caller to share a shutdown event (UI coordinator) so a single
@@ -79,6 +81,8 @@ class JarvisTray:
         self._on_mute_toggle = on_mute_toggle
         self._engineer_enabled = engineer_enabled
         self._on_engineer_toggle = on_engineer_toggle
+        self._on_restart = on_restart
+        self._on_create_shortcut = on_create_shortcut
 
         menu_items: list[pystray.MenuItem] = []
         if on_show_window is not None:
@@ -89,6 +93,14 @@ class JarvisTray:
             menu_items.append(pystray.MenuItem("Open log", self._handle_open_log))
         if memory_dir is not None:
             menu_items.append(pystray.MenuItem("Open memory folder", self._handle_open_memory))
+        if on_create_shortcut is not None:
+            # One-shot utility: drops a Jarvis.lnk on the Desktop, then opens
+            # Explorer with it selected so the user can right-click → Pin to
+            # taskbar. Windows blocks programmatic pinning, so this is the
+            # closest we can get to a "pin to taskbar" button.
+            menu_items.append(pystray.MenuItem(
+                "Create desktop shortcut", self._handle_create_shortcut,
+            ))
         if mute_enabled is not None and on_mute_toggle is not None:
             # Voice-output mute. Toggle bypasses TTS while leaving voice input
             # + console transcript fully working — useful when someone's
@@ -118,6 +130,13 @@ class JarvisTray:
             ))
         if menu_items:
             menu_items.append(pystray.Menu.SEPARATOR)
+        if on_restart is not None:
+            # Sibling of Quit — same teardown path, then a detached relaunch
+            # of jarvis.pyw after the current process finishes sealing the
+            # session. See JarvisUI._handle_restart for the flag-and-defer
+            # mechanics; the relaunch itself fires from main() after worker
+            # join, so the new instance doesn't fight the old one for the mic.
+            menu_items.append(pystray.MenuItem("Restart Jarvis", self._handle_restart))
         menu_items.append(pystray.MenuItem("Quit", self._handle_quit))
 
         self.icon = pystray.Icon(
@@ -154,6 +173,14 @@ class JarvisTray:
     def _handle_toggle_engineer(self) -> None:
         if self._on_engineer_toggle is not None:
             self._on_engineer_toggle()
+
+    def _handle_restart(self) -> None:
+        if self._on_restart is not None:
+            self._on_restart()
+
+    def _handle_create_shortcut(self) -> None:
+        if self._on_create_shortcut is not None:
+            self._on_create_shortcut()
 
     def _handle_open_log(self) -> None:
         if self._log_path is not None and self._log_path.exists():

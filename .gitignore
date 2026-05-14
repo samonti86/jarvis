@@ -30,3 +30,6 @@ Thumbs.db
 build/
 dist/
 *.log
+
+# Generated icon — autostart.py regenerates lazily on first shortcut creation
+assets/jarvis.ico

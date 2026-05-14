@@ -21,6 +21,7 @@ Lifecycle:
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from pathlib import Path
 from typing import Callable
@@ -56,6 +57,12 @@ class JarvisUI:
         self._memory_dir = memory_dir
         self._tray: JarvisTray | None = None
         self._on_reset: Callable[[], None] | None = None
+        # When True, main() should call autostart.relaunch() after the listen
+        # loop has joined + the active session is sealed. The tray's "Restart
+        # Jarvis" click flips this, then triggers the normal quit path — the
+        # actual spawn happens later in main(), AFTER the mic is released,
+        # so the new instance doesn't race the old one for the audio device.
+        self._relaunch_requested = False
 
     def set_on_reset(self, callback: Callable[[], None]) -> None:
         """Wire a reset callback. Called when the tray menu's Reset item fires."""
@@ -204,6 +211,8 @@ class JarvisUI:
             on_mute_toggle=self._handle_toggle_mute,
             engineer_enabled=self.is_engineer_mode,
             on_engineer_toggle=self._handle_toggle_engineer,
+            on_restart=self._handle_restart,
+            on_create_shortcut=self._handle_create_shortcut,
             shutdown_event=self.shutdown,
         )
         self._tray.run()
@@ -231,3 +240,45 @@ class JarvisUI:
     def _handle_reset(self) -> None:
         if self._on_reset is not None:
             self._on_reset()
+
+    @property
+    def relaunch_requested(self) -> bool:
+        """True if the user clicked 'Restart Jarvis'. main() reads this after
+        the worker has joined to decide whether to spawn a fresh instance."""
+        return self._relaunch_requested
+
+    def _handle_restart(self) -> None:
+        """Tray callback: signal that this process should relaunch after it
+        finishes shutting down. We do NOT spawn the new process here —
+        doing so on pystray's thread would race the listen_loop for the
+        microphone. Instead, mark the intent and trigger the normal quit
+        path; main() picks up the flag after worker.join() and fires the
+        actual relaunch from there."""
+        self._relaunch_requested = True
+        self.console.add_system_text("restarting Jarvis…")
+        print("[ui] restart requested — will relaunch after shutdown completes")
+        self._handle_quit()
+
+    def _handle_create_shortcut(self) -> None:
+        """Tray callback: drop a Jarvis.lnk on the Desktop with the custom
+        icon, then open Explorer with the file selected so the user can
+        right-click → Pin to taskbar. All errors surface in the console
+        rather than crashing the tray thread."""
+        try:
+            path = autostart.create_desktop_shortcut()
+        except Exception as exc:
+            print(f"[shortcut] create failed: {exc}")
+            self.console.add_system_text(f"desktop shortcut failed: {exc}")
+            return
+
+        self.console.add_system_text(
+            f"desktop shortcut created: {path.name}. "
+            "Right-click it → Pin to taskbar."
+        )
+        # explorer.exe /select,<path>  opens the parent folder with the file
+        # pre-selected. Best-effort: if Explorer can't be invoked for some
+        # reason, the shortcut still exists and the user can find it manually.
+        try:
+            subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        except Exception as exc:
+            print(f"[shortcut] explorer reveal failed: {exc}")

@@ -612,6 +612,17 @@ def main() -> None:
         except Exception as exc:
             print(f"[plex-laptop] close failed: {exc}", file=sys.stderr)
 
+    # Restart-Jarvis tray click sets ui.relaunch_requested. We defer the
+    # actual respawn until here so the mic + Plex MCP + SSH have all
+    # released their handles — the new instance starts on a clean slate.
+    if ui.relaunch_requested:
+        try:
+            from src import autostart
+            autostart.relaunch()
+            print("[main] relaunched detached Jarvis instance")
+        except Exception as exc:
+            print(f"[main] relaunch failed: {exc}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     try:
