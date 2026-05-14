@@ -702,6 +702,7 @@ def main() -> None:
     security_watcher = SecurityWatcher(
         announce=_announce,
         on_armed_changed=ui.set_armed_indicator,
+        on_locked_changed=ui.set_locked_indicator,
         passphrase=cfg.security_passphrase,
         evidence_dir=default_base_dir() / "security" / "events",
     )

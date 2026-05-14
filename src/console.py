@@ -163,6 +163,21 @@ class JarvisConsole:
         )
         # NB: not packed initially — _apply_armed handles pack/forget.
 
+        # Security-LOCKED indicator (M35 follow-on). Appears when the
+        # 15s challenge timer expired without authentication — deterrent
+        # fired, system is now waiting for the passphrase indefinitely.
+        # Visually distinct from ARMED: padlock icon, deeper red, slightly
+        # larger weight so it reads as a more urgent state. Packed in place
+        # of (not in addition to) the ARMED label, since LOCKED implies
+        # armed — _apply_locked handles the swap.
+        self._locked_label = ctk.CTkLabel(
+            state_frame,
+            text="🔒 LOCKED",
+            font=("Segoe UI Emoji", 11, "bold"),
+            text_color="#dc2626",  # tailwind red-600 — one shade deeper than ARMED
+        )
+        # NB: not packed initially — _apply_locked handles pack/forget.
+
         # --- Audio waveform visualizer (M17) ---
         # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
         # Pre-cache each bar's x1/x2 so the per-frame redraw only mutates y.
@@ -404,6 +419,15 @@ class JarvisConsole:
         if not self._destroyed:
             self.root.after(0, self._apply_armed, bool(on))
 
+    def set_locked(self, on: bool) -> None:
+        """Thread-safe: show/hide the '🔒 LOCKED' security-mode indicator
+        (M35 follow-on). Called from SecurityWatcher's on_locked_changed
+        callback when the post-deterrent LOCKED state enters/exits.
+        While LOCKED, the ARMED label is hidden — LOCKED implies armed and
+        showing both would be visual noise."""
+        if not self._destroyed:
+            self.root.after(0, self._apply_locked, bool(on))
+
     # ------------------------------------------------------------------
     # SRE status bar API — all thread-safe via .after().
     # ------------------------------------------------------------------
@@ -528,6 +552,30 @@ class JarvisConsole:
                 self._armed_label.pack(side="left", padx=(8, 0))
             else:
                 self._armed_label.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _apply_locked(self, on: bool) -> None:
+        """Swap between 🛡 ARMED and 🔒 LOCKED. While LOCKED is on, the
+        ARMED label is hidden (LOCKED already implies armed; showing both
+        would be visual noise). On LOCKED off, restore the ARMED label
+        only if the watcher is still armed — which it should be, since
+        deactivate() clears _locked too."""
+        try:
+            if on:
+                # Hide ARMED first, then show LOCKED in its place so the
+                # layout doesn't briefly show both.
+                self._armed_label.pack_forget()
+                self._locked_label.pack(side="left", padx=(8, 0))
+            else:
+                self._locked_label.pack_forget()
+                # Show ARMED back — the watcher is still armed unless a
+                # separate _apply_armed(False) is also pending. Both are
+                # marshaled onto Tk's thread sequentially, so order is
+                # deterministic per call site (security.py fires
+                # on_locked_changed first, then on_armed_changed on
+                # deactivate).
+                self._armed_label.pack(side="left", padx=(8, 0))
         except tk.TclError:
             pass
 

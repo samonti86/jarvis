@@ -194,6 +194,12 @@ class JarvisUI:
         Called from SecurityWatcher's on_armed_changed callback."""
         self.console.set_armed(on)
 
+    def set_locked_indicator(self, on: bool) -> None:
+        """Thread-safe pass-through to the console's locked indicator
+        (M35 follow-on). Called from SecurityWatcher's on_locked_changed
+        callback when the post-deterrent LOCKED state enters/exits."""
+        self.console.set_locked(on)
+
     def set_on_security_toggle(
         self, on_activate: Callable[[], None], on_deactivate: Callable[[], None],
         is_armed: Callable[[], bool],

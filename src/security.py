@@ -208,12 +208,18 @@ class SecurityWatcher:
         self,
         announce: AnnounceFn,
         on_armed_changed: Callable[[bool], None] | None = None,
+        on_locked_changed: Callable[[bool], None] | None = None,
         camera_index: int = 0,
         passphrase: str = "",
         evidence_dir: Path | None = None,
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
+        # M35-LOCKED: fires (True/False) when LOCKED state enters/exits.
+        # Console uses this to swap the 🛡 ARMED indicator for 🔒 LOCKED.
+        # Optional — pre-LOCKED callers can pass None and the state is just
+        # invisible in the UI (still functional).
+        self._on_locked_changed = on_locked_changed
         self._camera_index = camera_index
         # M35: empty passphrase = skip CHALLENGE state entirely. Detection
         # just announces movement (M34 behavior). Lets the user opt out of
@@ -250,6 +256,17 @@ class SecurityWatcher:
         self._challenge_active = False
         self._challenge_started_at = 0.0
         self._cooldown_until = 0.0
+        # M35-LOCKED: after a deterrent fires, instead of returning to
+        # the normal ARMED+cooldown state, we enter LOCKED — _challenge_active
+        # stays True (so listen_loop keeps diverting transcripts to the
+        # passphrase comparator) but _challenge_started_at = 0 (no timer →
+        # no second deterrent). _locked = True flags this for the UI and
+        # for distinguishing log messages. Only a correct passphrase clears
+        # it (voice). Tray disarm also works (physical-access escape hatch).
+        # Critically: "stand down" by voice does NOT clear LOCKED, because
+        # the listen_loop diversion catches it before the intent parser —
+        # an intruder shouldn't be able to bypass with a guessed disarm.
+        self._locked = False
         # Most recent triggering frame, held in memory between detection
         # and challenge resolution so the deterrent path can save it as
         # evidence without re-grabbing (re-grab would capture the moment
@@ -278,8 +295,19 @@ class SecurityWatcher:
         """True if a passphrase challenge is currently open. listen_loop
         checks this AFTER STT but BEFORE the intent parser / process_question
         — when True, the transcript routes to try_authenticate() and Claude
-        isn't called for this turn."""
+        isn't called for this turn.
+
+        Includes both regular CHALLENGE (15s timer ticking) AND the LOCKED
+        state (deterrent fired, no timer, awaiting passphrase). The check
+        site doesn't need to distinguish: in both cases, transcripts go
+        to try_authenticate() with the same logic."""
         return self._challenge_active
+
+    def is_locked(self) -> bool:
+        """True if we're in the post-deterrent LOCKED state (deterrent
+        already fired, awaiting passphrase). Distinct from is_in_challenge()
+        which is True for BOTH regular challenge AND locked."""
+        return self._locked
 
     def try_authenticate(self, transcript: str) -> bool:
         """Check a transcript against the configured passphrase. Returns
@@ -334,14 +362,34 @@ class SecurityWatcher:
             return False
 
         # Match — resolve challenge as authenticated.
+        # M35-LOCKED: this path now handles BOTH the regular CHALLENGE
+        # clear and the LOCKED unlock. Both transitions look the same from
+        # here: flip _challenge_active to False, clear _locked, enter
+        # cooldown. The was_locked snapshot lets us update the UI
+        # indicator + log a different message for the lockout-cleared case.
         with self._challenge_lock:
             if not self._challenge_active:
                 # Already resolved (timer fired between transcript end and
-                # our taking the lock). Idempotent; don't announce twice.
+                # our taking the lock — pre-LOCKED behavior). Idempotent;
+                # don't announce twice.
                 return True
+            was_locked = self._locked
             self._challenge_active = False
+            self._locked = False
             self._cooldown_until = time.monotonic() + _CHALLENGE_COOLDOWN_SECONDS
             self._challenge_evidence_frame = None  # don't need it anymore
+
+        if was_locked:
+            print("[security] LOCKED state cleared by passphrase — back to ARMED+cooldown",
+                  file=sys.stderr)
+            # UI: clear the 🔒 LOCKED indicator. ARMED indicator stays on
+            # since the watcher is still armed.
+            if self._on_locked_changed is not None:
+                try:
+                    self._on_locked_changed(False)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[security] on_locked_changed(False) raised: {exc}",
+                          file=sys.stderr)
 
         try:
             self._announce("Welcome back, sir.")
@@ -380,7 +428,12 @@ class SecurityWatcher:
             self._thread.start()
 
     def deactivate(self) -> None:
-        """Idempotent: disarming an already-disarmed system is a no-op."""
+        """Idempotent: disarming an already-disarmed system is a no-op.
+
+        M35-LOCKED: this is the only path other than voice-passphrase that
+        clears the LOCKED state. Reachable from the tray menu (physical
+        access = authority), not from voice "stand down" while locked
+        (the listen_loop diversion catches that)."""
         if not self._armed.is_set():
             return
         self._armed.clear()
@@ -388,15 +441,22 @@ class SecurityWatcher:
         # M35: clear any pending challenge so disarming mid-challenge
         # doesn't leave stale state for the next arm. No deterrent fires
         # on this path — the user explicitly disarmed, so the trigger is
-        # resolved by user authority.
+        # resolved by user authority. Same for LOCKED clear.
         with self._challenge_lock:
             self._challenge_active = False
             self._challenge_evidence_frame = None
+            was_locked = self._locked
+            self._locked = False
         if self._on_armed_changed is not None:
             try:
                 self._on_armed_changed(False)
             except Exception as exc:  # noqa: BLE001
                 print(f"[security] on_armed_changed(False) raised: {exc}", file=sys.stderr)
+        if was_locked and self._on_locked_changed is not None:
+            try:
+                self._on_locked_changed(False)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[security] on_locked_changed(False) raised: {exc}", file=sys.stderr)
         try:
             self._announce("Standing down, sir.")
         except Exception as exc:  # noqa: BLE001
@@ -592,19 +652,36 @@ class SecurityWatcher:
             # race with try_authenticate (which might be running on the
             # listen_loop thread RIGHT NOW). Then release the lock before
             # the slow operations (file write + TTS).
-            self._challenge_active = False
-            self._cooldown_until = time.monotonic() + _CHALLENGE_COOLDOWN_SECONDS
+            #
+            # M35-LOCKED: instead of clearing _challenge_active + arming
+            # cooldown, we ENTER the LOCKED state. _challenge_active stays
+            # True (listen_loop keeps diverting transcripts to the passphrase
+            # comparator), _challenge_started_at = 0 disables the timer
+            # (no second deterrent fires), _locked = True flags it for the
+            # UI. Only a correct passphrase or a tray disarm clears LOCKED.
+            self._challenge_started_at = 0.0  # disable timer — no re-fire
+            self._locked = True
             evidence_frame = self._challenge_evidence_frame
-            self._challenge_evidence_frame = None
+            # Don't clear evidence_frame — leave it in case we want to
+            # re-save later or compare against new detections.
 
         print(
             f"[security] CHALLENGE timeout ({_CHALLENGE_TIMEOUT_SECONDS:.0f}s) — "
-            f"firing deterrent + saving evidence",
+            f"firing deterrent + entering LOCKED state",
             file=sys.stderr,
         )
         saved_path = self._save_evidence(evidence_frame)
         if saved_path is not None:
             print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
+
+        # Flip the LOCKED indicator BEFORE the announce so the UI updates
+        # immediately, not after the ~5s deterrent playback finishes.
+        if self._on_locked_changed is not None:
+            try:
+                self._on_locked_changed(True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[security] on_locked_changed(True) raised: {exc}",
+                      file=sys.stderr)
 
         try:
             self._announce(
