@@ -50,52 +50,17 @@ from pathlib import Path
 import numpy as np
 
 
-# --- CUDA DLL discovery (Windows) -----------------------------------------
-# ctranslate2 (under faster-whisper) wraps CUDA via cuBLAS + cuDNN + cuda_nvrtc.
-# When those are installed via pip (nvidia-cublas-cu12, nvidia-cudnn-cu12,
-# nvidia-cuda-nvrtc-cu12), the DLLs land in the venv's site-packages under
-# `nvidia/<lib>/bin/` — a location Windows DOES NOT search by default. We
-# register each directory via `os.add_dll_directory()` BEFORE importing
-# faster_whisper, otherwise ctranslate2 errors with
-# "Library cublas64_12.dll is not found or cannot be loaded".
-#
-# This is the standard pattern for CUDA-via-pip on Windows. Linux uses
-# LD_LIBRARY_PATH at process start; macOS doesn't have CUDA. On Windows
-# the equivalent is per-process via os.add_dll_directory (Python 3.8+).
+# Windows: CUDA DLLs from pip wheels (nvidia-*-cu12) need both
+# `os.add_dll_directory` (for ctranslate2's `.pyd` loader) AND PATH
+# prepending (for ctranslate2's internal plain LoadLibrary call on
+# first inference). Cookie references must be kept alive — GC closes
+# them, removing the directory from the search path.
 if sys.platform == "win32":
     _site_packages = Path(__file__).resolve().parent / "venv" / "Lib" / "site-packages"
     if not _site_packages.is_dir():
-        # Running outside the venv layout (e.g. from a different cwd) —
-        # try sys.prefix-based discovery as a fallback. uvicorn run from
-        # the venv's python.exe makes sys.prefix point at the venv root.
         _site_packages = Path(sys.prefix) / "Lib" / "site-packages"
 
-    # CRITICAL: keep references to the returned cookies. `os.add_dll_directory`
-    # returns an _AddedDllDirectory whose `close()` is auto-called on GC, and
-    # that removes the directory from the search path. Discovered during M36
-    # smoke testing: the model loaded fine (cookies still alive in for-loop
-    # scope), but inference 30s later failed with "cublas64_12.dll not found"
-    # because the cookies had been GC'd. Storing them at module scope keeps
-    # the paths registered for the lifetime of the process.
     _dll_cookies: list[object] = []
-    # We need BOTH `os.add_dll_directory` AND prepending to PATH:
-    #   - `os.add_dll_directory` covers Python's own extension-module loader
-    #     (works because ctranslate2's .pyd is loaded with LoadLibraryEx +
-    #     LOAD_LIBRARY_SEARCH_USER_DIRS).
-    #   - PATH prepending covers DEPENDENT library loading inside ctranslate2:
-    #     once ctranslate2 .pyd is up, its internal C++ code calls plain
-    #     LoadLibrary() to pull in cuBLAS/cuDNN/cudart at first inference.
-    #     Plain LoadLibrary uses the default search order (System32, exe dir,
-    #     PATH) — NOT the Python-added dirs. Without PATH, model.load works
-    #     (cuDNN loaded by the .pyd which honors search-user-dirs) but the
-    #     first inference fails with "cublas64_12.dll cannot be loaded"
-    #     because cuBLAS load happens through that secondary LoadLibrary path.
-    # Discovered the hard way during M36 install — three failed install
-    # cycles before the PATH prepending was added.
-    #
-    # cuda_runtime ships cudart64_12.dll, which cuBLAS depends on transitively.
-    # All four libs MUST be installed (nvidia-cuda-runtime-cu12 +
-    # nvidia-cublas-cu12 + nvidia-cudnn-cu12 + nvidia-cuda-nvrtc-cu12).
     _path_additions: list[str] = []
     for _lib in ("cublas", "cudnn", "cuda_nvrtc", "cuda_runtime"):
         _dll_dir = _site_packages / "nvidia" / _lib / "bin"

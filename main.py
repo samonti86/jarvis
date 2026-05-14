@@ -474,39 +474,20 @@ def listen_loop(
                     print("[main] (no speech captured)\n")
                     continue
 
-                # M35: challenge-response diversion. If security mode is
-                # currently in a CHALLENGE state (passphrase window open),
-                # the transcript routes to the watcher's authenticator
-                # instead of Claude — regardless of what was said. Either
-                # the passphrase matches and the challenge clears, or it
-                # doesn't and the user can keep trying within the 15s
-                # window (or the watcher times out and fires the deterrent).
-                # Voice activation/deactivation commands are still routed
-                # below since this check sits BEFORE the intent parser.
-                if security_watcher is not None and security_watcher.is_in_challenge():
-                    ui.add_user_text(transcript.text, transcript.language)
-                    try:
-                        security_watcher.try_authenticate(transcript.text)
-                    except Exception as exc:
-                        print(f"[main] try_authenticate raised: {exc}", file=sys.stderr)
-                    ui.set_state(State.IDLE)
-                    continue
-
-                # Pre-LLM intent parser (M34). "Activate security" / "stand
-                # down" route to SecurityWatcher locally — they don't burn a
-                # Claude turn and don't get logged to the conversation
-                # history. Match is loose (handles Whisper word variations);
-                # see src/security.py for the regexes. Returns True only when
-                # it actually consumed the transcript.
+                # Hand the transcript to the security subsystem first. It
+                # consumes the turn (returns True) for both challenge
+                # authentication AND activate/disarm intents — claude
+                # isn't called for either. Falls through to process_question
+                # on a non-match.
                 if security_watcher is not None:
                     try:
-                        from src.security import handle_voice_command
-                        if handle_voice_command(transcript.text, security_watcher):
+                        if security_watcher.handle_transcript(transcript.text):
                             ui.add_user_text(transcript.text, transcript.language)
                             ui.set_state(State.IDLE)
                             continue
                     except Exception as exc:
-                        print(f"[main] security intent parser raised: {exc}", file=sys.stderr)
+                        print(f"[main] security.handle_transcript raised: {exc}",
+                              file=sys.stderr)
 
                 process_question(transcript.text, transcript.language)
     finally:
@@ -617,45 +598,29 @@ def main() -> None:
     ui.set_integration("plex", plex_client is not None)
     ui.set_integration("laptop", plex_laptop_client is not None)
 
-    # M34: instantiate SecurityWatcher with a proactive-speech callback.
-    #
-    # Why a dedicated Announcer THREAD (not just an _announce closure):
-    # observed during M34 smoke testing — when the activate intent fires
-    # on the listen_loop thread, `speak_streaming` plays audio correctly,
-    # but when the same closure is invoked from the watcher thread (a
-    # fresh thread that hasn't previously touched sounddevice), `sd.play`
-    # silently produces no audio. No exception, no log line — just no
-    # sound. The cause is sounddevice's global state (sd.play uses the
-    # process-wide default stream) interacting badly with the long-lived
-    # `AudioSession` mic InputStream held by listen_loop. On Windows
-    # WASAPI, the THREAD that first establishes itself as audio-output-
-    # owner gets reliable playback; other threads get silence.
-    #
-    # The fix: marshal ALL proactive speech through a single dedicated
-    # thread. Watcher (and any future proactive-speech caller) just
-    # queues text; the Announcer thread dequeues and plays. Always the
-    # same thread => always reliable playback.
+    # SecurityWatcher with a proactive-speech callback. Speech is marshaled
+    # through a single dedicated Announcer thread because sd.play() on
+    # Windows WASAPI silently no-ops when called from worker threads that
+    # haven't previously played audio (the SecurityWatcher thread hits this
+    # exact case). Pinning all sd.play() calls to one thread sidesteps it.
     from src.security import SecurityWatcher
     from src.text_to_speech import speak_streaming
 
-    # M35-followon: announce queue carries (text, on_done) tuples instead
-    # of plain strings. on_done is fired AFTER playback completes (or fails)
-    # so callers like SecurityWatcher can use it to defer their internal
-    # timer until the user has actually heard the prompt — counting prompt
-    # playback time (~4s) against the 15s challenge window was eating most
-    # of the user's response budget. Optional: most callers pass None.
-    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None] | None] = queue.Queue()
+    # Queue items are (text, on_done) tuples; on_done fires after playback
+    # so callers can defer state until the user has actually heard the
+    # prompt (SecurityWatcher's 15s challenge timer uses this). maxsize
+    # caps memory growth if TTS wedges + announces pile up.
+    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None] | None] = (
+        queue.Queue(maxsize=16)
+    )
     announce_stop = threading.Event()
 
     def _announcer_loop() -> None:
-        """Dedicated proactive-speech thread. The reason this exists is
-        documented above — TL;DR sounddevice + WASAPI + fresh worker
-        threads = silent playback. Pinning all sd.play() calls to a
-        single dedicated thread sidesteps it.
+        """Dedicated proactive-speech thread (see comment above for why).
 
-        M35-followon: each queued item is now (text, on_done). on_done is
-        fired in `finally` after playback so it runs even on TTS failure —
-        a failed announce shouldn't strand the caller's state machine."""
+        Each queued item is (text, on_done). on_done is fired in `finally`
+        after playback so it runs even if TTS itself failed — a failed
+        announce shouldn't strand the caller's state machine."""
         print("[announcer] worker thread started", file=sys.stderr)
         while not announce_stop.is_set():
             item = announce_queue.get()
@@ -697,17 +662,35 @@ def main() -> None:
         used by SecurityWatcher's challenge path to defer the 15s timer
         start until the user has actually heard the prompt, otherwise
         prompt-playback time eats into the response budget."""
-        if text:
-            announce_queue.put((text, on_done))
+        if not text:
+            return
+        try:
+            announce_queue.put_nowait((text, on_done))
+        except queue.Full:
+            # Queue is wedged (TTS playback stuck?). Log + drop newest so
+            # callers don't block. on_done won't fire — callers using it
+            # for timing must handle a None return, but currently the only
+            # caller is SecurityWatcher's challenge path which has its
+            # own defensive immediate-arm fallback.
+            print(
+                f"[announce] queue full (TTS wedged?) — dropping: {text!r}",
+                file=sys.stderr,
+            )
 
     # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
     # M34 announce-only behavior) and the evidence directory (where
     # deterrent-fired triggering frames get saved as JPEGs).
     # M38: Discord webhook URL (empty → no notification, M35 bluff only).
+    # Reuse cameras.py's CAMERA_INDEX env reader so the watcher honors the
+    # same override as camera_snapshot — otherwise users with CAMERA_INDEX
+    # set get the right webcam for vision queries but the wrong one for
+    # security mode.
+    from src.cameras import _camera_index as _resolve_camera_index
     security_watcher = SecurityWatcher(
         announce=_announce,
         on_armed_changed=ui.set_armed_indicator,
         on_locked_changed=ui.set_locked_indicator,
+        camera_index=_resolve_camera_index(),
         passphrase=cfg.security_passphrase,
         evidence_dir=default_base_dir() / "security" / "events",
         discord_webhook_url=cfg.discord_webhook_url,

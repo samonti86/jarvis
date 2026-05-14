@@ -31,51 +31,20 @@ If `security_passphrase` is empty (env var unset), the CHALLENGE step is
 skipped — detection just announces movement (M34 announce-only behavior).
 Graceful fallback so the system works without auth configured.
 
-Design choices:
-
-- **Open-on-demand camera capture.** Same privacy-friendly pattern as
-  cameras.py: open VideoCapture → warmup → grab → release. The watcher
-  closes the device between polls, so the in-use LED doesn't stay lit
-  while armed, and a `camera_snapshot` voice query during armed mode can
-  still grab the camera (worst case: one cycle's grab fails harmlessly).
-- **640×480 capture, not 1280×720.** Person detection works fine at low
-  resolution and YOLO inference scales with input size. Smaller frames =
-  faster inference = lower CPU during a long armed session.
-- **Lazy YOLO load.** `ultralytics` + torch CPU pulls ~200 MB into memory
-  on first import. Doing it at module-import-time would balloon Jarvis's
-  baseline RSS for every user, including ones who never use security
-  mode. Load happens inside `_watch_loop` on first iteration; subsequent
-  arms reuse the loaded model.
-- **Presence-window debounce.** Without it, a person sitting in frame
-  would trigger an announcement every 2s polling cycle — comically bad.
-  We track "person currently present" as a boolean: announce on the
-  transition EMPTY → PERSON, then suppress until the person has been
-  absent for `_PRESENCE_CLEAR_SECONDS` (30s by default). After that, the
-  next detection re-arms the announcement.
-- **5s arm-grace.** From the user's perspective: "activate security" →
-  Jarvis confirms → user has 5 seconds to walk away before the watcher
-  starts looking for them. Otherwise arming-while-at-desk would
-  immediately fire. Standard burglar-alarm UX.
-- **YOLO failure auto-disarms.** If the model fails to load (missing
-  cache, disk full, etc.), the watcher announces the failure and
-  clears the armed state rather than silently leaving security
-  "active" with no detection backbone.
-- **Defensive contract.** Camera busy, YOLO crash, frame decode failure
-  — all become log lines + a single graceful disarm. The watcher
-  never raises through to its thread boundary.
-
 Threading:
 - The watcher thread is daemon=True, so it dies with the process.
-- `activate()` and `deactivate()` are thread-safe (idempotent + lock-free
-  via a single `threading.Event`).
-- The announcement callback runs ON THE WATCHER THREAD. The callback is
-  responsible for its own thread safety; main.py wraps speak_streaming
-  which is thread-safe.
+- `activate()`, `deactivate()`, `handle_transcript()` are thread-safe.
+- The `announce` callback fires on the watcher thread; main.py marshals
+  speech onto a dedicated Announcer thread (see main.py for why).
+
+Defensive contract — camera errors, YOLO failure, network errors all
+become log lines, never raise through the watcher's thread boundary.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -216,10 +185,8 @@ class SecurityWatcher:
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
-        # M35-LOCKED: fires (True/False) when LOCKED state enters/exits.
-        # Console uses this to swap the 🛡 ARMED indicator for 🔒 LOCKED.
-        # Optional — pre-LOCKED callers can pass None and the state is just
-        # invisible in the UI (still functional).
+        # Fires (True/False) on LOCKED state enter/exit. Optional; if None,
+        # the UI just doesn't show a LOCKED indicator (functionality intact).
         self._on_locked_changed = on_locked_changed
         self._camera_index = camera_index
         # M35: empty passphrase = skip CHALLENGE state entirely. Detection
@@ -230,8 +197,8 @@ class SecurityWatcher:
         # deterrent fire. Caller (main.py) computes the absolute path; we
         # just store it and stat/mkdir as needed.
         self._evidence_dir = evidence_dir
-        # M38: Discord webhook URL for deterrent-time push notifications.
-        # Empty string = no notification path active (M35 bluff only).
+        # Discord webhook URL for deterrent-time push notifications.
+        # Empty string = no notification path (bluff + local evidence only).
         self._discord_webhook_url = discord_webhook_url
 
         # Coordination primitives. _armed is the public state; _stop fires
@@ -290,6 +257,19 @@ class SecurityWatcher:
     def is_armed(self) -> bool:
         return self._armed.is_set()
 
+    # ---------------------------------------------------------------------
+    # Private utility: defensive call. Used by all the UI-callback and
+    # announce sites so a misbehaving caller never breaks the watcher.
+    # ---------------------------------------------------------------------
+
+    def _safe_call(self, fn, *args, label: str) -> None:
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] {label} raised: {exc}", file=sys.stderr)
+
     # M35: public API for listen_loop's challenge-transcript diversion.
     # is_in_challenge() is a hot read on every transcript, so it skips the
     # lock (single-word atomic load on CPython). try_authenticate() takes
@@ -312,6 +292,24 @@ class SecurityWatcher:
         already fired, awaiting passphrase). Distinct from is_in_challenge()
         which is True for BOTH regular challenge AND locked."""
         return self._locked
+
+    def handle_transcript(self, transcript: str) -> bool:
+        """Single entry point for listen_loop to hand a freshly-transcribed
+        utterance to the security subsystem. Returns True if consumed
+        locally (don't pass to Claude). Encapsulates the ordering:
+        challenge-auth check first, then activate/deactivate intent."""
+        if not transcript:
+            return False
+        if self._challenge_active:
+            self.try_authenticate(transcript)
+            return True  # challenge state owns ALL transcripts (even non-matches)
+        if _ACTIVATE_RE.search(transcript):
+            self.activate()
+            return True
+        if _DEACTIVATE_RE.search(transcript):
+            self.deactivate()
+            return True
+        return False
 
     def try_authenticate(self, transcript: str) -> bool:
         """Check a transcript against the configured passphrase. Returns
@@ -388,17 +386,10 @@ class SecurityWatcher:
                   file=sys.stderr)
             # UI: clear the 🔒 LOCKED indicator. ARMED indicator stays on
             # since the watcher is still armed.
-            if self._on_locked_changed is not None:
-                try:
-                    self._on_locked_changed(False)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[security] on_locked_changed(False) raised: {exc}",
-                          file=sys.stderr)
+            self._safe_call(self._on_locked_changed, False,
+                            label="on_locked_changed(False)")
 
-        try:
-            self._announce("Welcome back, sir.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[security] welcome-back announce raised: {exc}", file=sys.stderr)
+        self._safe_call(self._announce, "Welcome back, sir.", label="welcome-back announce")
         return True
 
     def activate(self) -> None:
@@ -410,20 +401,14 @@ class SecurityWatcher:
         self._stop.clear()
         self._armed_at = time.monotonic()
         self._person_present = False
-        if self._on_armed_changed is not None:
-            try:
-                self._on_armed_changed(True)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[security] on_armed_changed(True) raised: {exc}", file=sys.stderr)
+        self._safe_call(self._on_armed_changed, True, label="on_armed_changed(True)")
 
         # Announce BEFORE spawning the watcher so the user hears the
         # confirmation immediately. The 5s grace window starts now; by the
         # time the watcher's first inference fires, the user has had time
         # to step away from the camera.
-        try:
-            self._announce("Security mode active, sir. I am standing watch.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[security] announce on activate raised: {exc}", file=sys.stderr)
+        self._safe_call(self._announce, "Security mode active, sir. I am standing watch.",
+                        label="announce on activate")
 
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(
@@ -451,20 +436,12 @@ class SecurityWatcher:
             self._challenge_evidence_frame = None
             was_locked = self._locked
             self._locked = False
-        if self._on_armed_changed is not None:
-            try:
-                self._on_armed_changed(False)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[security] on_armed_changed(False) raised: {exc}", file=sys.stderr)
-        if was_locked and self._on_locked_changed is not None:
-            try:
-                self._on_locked_changed(False)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[security] on_locked_changed(False) raised: {exc}", file=sys.stderr)
-        try:
-            self._announce("Standing down, sir.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[security] announce on deactivate raised: {exc}", file=sys.stderr)
+        self._safe_call(self._on_armed_changed, False, label="on_armed_changed(False)")
+        if was_locked:
+            self._safe_call(self._on_locked_changed, False,
+                            label="on_locked_changed(False)")
+        self._safe_call(self._announce, "Standing down, sir.",
+                        label="announce on deactivate")
 
     def shutdown(self) -> None:
         """Called on app quit. Just clears state and signals the thread to
@@ -566,10 +543,9 @@ class SecurityWatcher:
             # M34 fallback: no challenge configured, just announce.
             print("[security] person detected — firing announcement (M34 mode)",
                   file=sys.stderr)
-            try:
-                self._announce("Sir — I'm detecting movement in the monitored space.")
-            except Exception as exc:  # noqa: BLE001
-                print(f"[security] announce raised: {exc}", file=sys.stderr)
+            self._safe_call(self._announce,
+                            "Sir — I'm detecting movement in the monitored space.",
+                            label="movement announce")
             return
 
         # M35: enter CHALLENGE state.
@@ -616,19 +592,17 @@ class SecurityWatcher:
             print("[security] challenge prompt finished — 15s timer armed",
                   file=sys.stderr)
 
+        # Announcer fires _start_challenge_timer after playback completes
+        # (finally-block, so failed playback still unblocks). On announce
+        # itself failing, arm the timer now so the user can't be stranded
+        # in an un-timed challenge.
         try:
-            # M35 follow-on: announce with the timer-arming callback. The
-            # Announcer thread fires _start_challenge_timer after playback
-            # completes (or fails — finally block, so the user never gets
-            # stranded in an un-timed challenge).
             self._announce(
                 "Please identify yourself within the next 15 seconds, sir.",
                 on_done=_start_challenge_timer,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[security] challenge announce raised: {exc}", file=sys.stderr)
-            # Announce path is broken — arm the timer NOW as a defensive
-            # fallback so the user doesn't sit in a never-ending challenge.
             with self._challenge_lock:
                 if self._challenge_active:
                     self._challenge_started_at = time.monotonic()
@@ -674,83 +648,69 @@ class SecurityWatcher:
             f"firing deterrent + entering LOCKED state",
             file=sys.stderr,
         )
-        saved_path = self._save_evidence(evidence_frame)
+        saved_path, jpeg_bytes = self._save_evidence(evidence_frame)
         if saved_path is not None:
             print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
 
-        # M38: Discord webhook notification. Fired on a daemon thread so a
-        # slow Discord POST (~500ms typical, but could spike) doesn't delay
-        # the spoken deterrent or the LOCKED state transition. Send the
-        # SAME evidence frame (from before, in memory) rather than re-reading
-        # from disk — saves a stat + read.
-        if self._discord_webhook_url and saved_path is not None:
-            self._send_discord_alert_async(saved_path)
+        # Discord notification on a daemon thread so a slow POST doesn't delay
+        # the spoken deterrent or the LOCKED transition. Pass the in-memory
+        # JPEG bytes directly rather than re-reading from disk.
+        if self._discord_webhook_url and jpeg_bytes:
+            self._send_discord_alert_async(jpeg_bytes, saved_path)
 
         # Flip the LOCKED indicator BEFORE the announce so the UI updates
         # immediately, not after the ~5s deterrent playback finishes.
-        if self._on_locked_changed is not None:
-            try:
-                self._on_locked_changed(True)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[security] on_locked_changed(True) raised: {exc}",
-                      file=sys.stderr)
+        self._safe_call(self._on_locked_changed, True, label="on_locked_changed(True)")
+        self._safe_call(
+            self._announce,
+            "Identity not confirmed. Authorities have been notified. "
+            "Images of the intruder have been transmitted to law enforcement.",
+            label="deterrent announce",
+        )
 
-        try:
-            self._announce(
-                "Identity not confirmed. Authorities have been notified. "
-                "Images of the intruder have been transmitted to law enforcement."
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[security] deterrent announce raised: {exc}", file=sys.stderr)
+    def _send_discord_alert_async(
+        self, jpeg_bytes: bytes, evidence_path: Path | None
+    ) -> None:
+        """Fire-and-forget Discord push on a daemon thread. Errors all
+        swallowed inside send_discord_alert."""
+        from src.notifications import send_discord_alert
 
-    def _send_discord_alert_async(self, evidence_path: Path) -> None:
-        """Fire-and-forget Discord notification on a daemon thread.
-
-        Done off the watcher's main loop because a Discord POST is up to
-        ~500ms typical / ~10s worst case (if Discord is slow or we get
-        rate-limited). The watcher should keep ticking — the spoken
-        deterrent has already played, the user has already authenticated
-        their phone, this is just the push. Errors all swallowed inside
-        send_discord_alert_for_path; nothing this method does can crash
-        the watcher.
-        """
-        # Local import: keep notifications.py off the import chain for
-        # users who never configure a webhook URL (same lazy-import
-        # pattern as ultralytics in _ensure_model).
-        from src.notifications import send_discord_alert_for_path
+        filename = evidence_path.name if evidence_path else "evidence.jpg"
 
         def _worker():
-            send_discord_alert_for_path(
-                self._discord_webhook_url, evidence_path, when=datetime.now()
+            send_discord_alert(
+                self._discord_webhook_url, jpeg_bytes,
+                image_filename=filename, when=datetime.now(),
             )
 
         threading.Thread(
             target=_worker, name="DiscordNotify", daemon=True
         ).start()
 
-    def _save_evidence(self, frame) -> Path | None:
-        """Write the triggering frame to disk as a JPEG. Returns the path
-        on success, None on any failure. Defensive — never raises into
-        the watcher loop, since "we couldn't save evidence" must not
-        block the deterrent message."""
+    def _save_evidence(self, frame) -> tuple[Path | None, bytes]:
+        """Encode frame as JPEG, write to disk, return both path and bytes.
+        The bytes are reused by the Discord notification path to skip a
+        disk re-read. Defensive — never raises; partial failure returns
+        (None, b'')."""
         if frame is None or self._evidence_dir is None:
-            return None
+            return None, b""
         try:
             import cv2  # type: ignore
         except ImportError:
-            return None
+            return None, b""
         try:
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                return None, b""
+            jpeg_bytes = bytes(buf)
             self._evidence_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             path = self._evidence_dir / f"{timestamp}.jpg"
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                return None
-            path.write_bytes(bytes(buf))
-            return path
+            path.write_bytes(jpeg_bytes)
+            return path, jpeg_bytes
         except Exception as exc:  # noqa: BLE001 — defensive
             print(f"[security] evidence save failed: {exc}", file=sys.stderr)
-            return None
+            return None, b""
 
     def _ensure_model(self) -> bool:
         """Load YOLO once; cache across arm/disarm cycles. Returns True on
@@ -917,18 +877,10 @@ class SecurityWatcher:
                 pass
 
 
-# --- Voice-intent parser ---------------------------------------------------
-# Pre-LLM intent matcher. main.py's listen_loop calls this BEFORE
-# process_question; if it returns True the transcript is handled locally
-# and Claude isn't called (saves a turn).
-#
-# Patterns are deliberately loose: Whisper sometimes hallucinates extra
-# words ("Activate THE security please"), so we match on the verb + the
-# noun via \b word boundaries, not on exact phrases. False-positive
-# tolerance is fine here — the keywords are uncommon in normal
-# conversation, and arming/disarming via voice is idempotent + low-impact.
-
-import re
+# --- Voice-intent regexes --------------------------------------------------
+# Loose patterns — Whisper sometimes hallucinates extra words ("Activate THE
+# security please"). False-positive tolerance is fine here: arming/disarming
+# is idempotent + low-impact, and the keywords don't occur in casual chat.
 
 _ACTIVATE_RE = re.compile(
     r"\b(activate|engage|enable|arm|turn\s+on)\b.*\bsecurity\b",
@@ -938,17 +890,3 @@ _DEACTIVATE_RE = re.compile(
     r"\b(stand\s+down|disarm|deactivate|disable|security\s+off|turn\s+off\s+security)\b",
     re.IGNORECASE,
 )
-
-
-def handle_voice_command(transcript: str, watcher: SecurityWatcher) -> bool:
-    """Return True if the transcript was handled locally (don't pass to
-    Claude). False means fall through to the normal LLM path."""
-    if not transcript:
-        return False
-    if _ACTIVATE_RE.search(transcript):
-        watcher.activate()
-        return True
-    if _DEACTIVATE_RE.search(transcript):
-        watcher.deactivate()
-        return True
-    return False

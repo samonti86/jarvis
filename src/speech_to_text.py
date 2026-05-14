@@ -197,10 +197,10 @@ def transcribe_after_wake(
       - backend="auto" + server_url set → remote GPU, silent fallback to
         local CPU on any failure (the default + recommended)
     """
-    # Pre-load local model unless we're forcing GPU-only. In "auto" mode
-    # the model might still be needed as fallback, so eager-load is right.
-    # In "gpu" mode we skip the load — saves ~5s of startup for that path.
-    if backend != "gpu":
+    # Pre-load local model only when we KNOW we'll use it. In "auto" mode
+    # we defer the load to the fallback path — users whose GPU server is
+    # always reachable never pay the ~5s load + ~250MB RSS cost.
+    if backend == "cpu" or not server_url:
         _get_model(model_name)
 
     audio_i16 = _record_until_silence(session, on_amplitude=on_amplitude)
@@ -225,13 +225,11 @@ def _dispatch_transcription(
     """Choose local vs remote based on backend + URL, with auto-fallback.
 
     Routing rules:
-      - "cpu" or no server URL → local CPU (today's behavior).
-      - "gpu" → remote only; propagate failures as a clear error string
-        (returned as the Transcript text so the listen_loop doesn't crash
-        on a network blip — but the user sees "[STT GPU offload failed: ...]"
-        in the transcript instead of garbage).
-      - "auto" → try remote first; on ANY exception, silently fall back to
-        local CPU. Log to stderr so audit/debugging is possible.
+      - "cpu" or no server URL → local CPU.
+      - "gpu" → remote only; failures return an empty Transcript so the
+        listen_loop's "no speech captured" path drops the turn instead of
+        treating an error string as user input.
+      - "auto" → try remote, silently fall back to local CPU on any failure.
     """
     if backend == "cpu" or not server_url:
         return _transcribe_local(audio_i16, model_name)
@@ -240,18 +238,14 @@ def _dispatch_transcription(
         try:
             return _transcribe_remote(audio_i16, server_url)
         except Exception as exc:
-            # Forced GPU mode — don't fall back, but don't crash either.
             print(
                 f"[stt] GPU backend forced but server unreachable: "
-                f"{type(exc).__name__}: {exc}",
+                f"{type(exc).__name__}: {exc} — dropping turn",
                 file=sys.stderr,
             )
-            return Transcript(
-                text=f"[STT GPU offload failed: {type(exc).__name__}]",
-                language="en",
-            )
+            return Transcript(text="", language="")
 
-    # backend == "auto" — try remote, silently fall back.
+    # backend == "auto"
     t0 = time.monotonic()
     try:
         result = _transcribe_remote(audio_i16, server_url)
@@ -260,9 +254,6 @@ def _dispatch_transcription(
         return result
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        # Silent fallback by design — see the M36 design note in
-        # CLAUDE.md. The log line gives us audit trail; the user just
-        # sees a slightly slower turn.
         print(
             f"[stt] remote failed after {elapsed_ms}ms "
             f"({type(exc).__name__}: {exc}) — falling back to local CPU",
@@ -291,13 +282,6 @@ def _transcribe_remote(audio_i16: np.ndarray, server_url: str) -> Transcript:
     to fall back."""
     wav_bytes = _encode_wav(audio_i16)
     files = {"audio": ("audio.wav", wav_bytes, "audio/wav")}
-    # httpx is already a dep (anthropic SDK pulls it; we use it directly
-    # in src/sports.py). Sync .post is fine here — we're already on a
-    # worker thread (listen_loop or text_input_loop), no event loop to
-    # block.
-    # Split connect vs read timeouts — see _REMOTE_STT_CONNECT_TIMEOUT for the
-    # rationale. A down server fails fast (2s connect timeout) instead of
-    # making every voice turn wait the full 15s read budget.
     resp = httpx.post(
         f"{server_url}/transcribe",
         files=files,
