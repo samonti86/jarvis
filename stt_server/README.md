@@ -82,8 +82,13 @@ extra tooling. The repo ships:
   the server.
 
 ```powershell
-# No admin needed — runs under your own user. /sc onstart fires on every boot:
-schtasks /create /tn JarvisSTTServer /tr "wscript.exe C:\Users\youruser\repos\jarvis\stt_server\run_server_hidden.vbs" /sc onstart /ru youruser /f
+# No admin needed — runs under your own user. /sc onlogon fires when
+# YOU log in (interactive session, full GPU access). DO NOT use
+# /sc onstart — it fires before login in Session 0 (Services), where
+# python + CUDA fail to bind ports / initialize properly. Symptom of
+# the Session 0 failure: zombie python.exe in tasklist with no
+# LISTENING on 8000 — discovered after first M36 reboot test.
+schtasks /create /tn JarvisSTTServer /tr "wscript.exe C:\Users\youruser\repos\jarvis\stt_server\run_server_hidden.vbs" /sc onlogon /ru youruser /f
 
 # Verify:
 schtasks /query /tn JarvisSTTServer
@@ -97,8 +102,9 @@ schtasks /run /tn JarvisSTTServer
 taskkill /F /IM python.exe
 ```
 
-The task runs at user logon (not session-locked). After a reboot, the
-server is up within ~15s of login (model-load time).
+After a reboot, the server is up within ~15s of YOUR login (model-load
+time). If the laptop auto-logs-you-in (typical for Plex hosts), it's
+~15s after boot completes; if you log in manually, ~15s after that.
 
 ### Manual restart from the desktop (no RDP needed)
 
