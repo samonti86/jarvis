@@ -87,6 +87,9 @@ class RingWatcher:
         # Set the first time we successfully read history; subsequent polls
         # use it to filter for "events newer than this".
         self._last_event_id: int | None = None
+        # Counts polls between heartbeat log lines so we can see the loop
+        # is actually ticking without spamming jarvis.log every 5s.
+        self._poll_count = 0
 
     def start(self) -> None:
         """Spawn the poll-loop thread. Idempotent — re-starting an already-
@@ -164,6 +167,13 @@ class RingWatcher:
                 events = await cam.async_history(limit=1)
                 if events:
                     self._last_event_id = events[0]["id"]
+                    print(f"[ring] baseline event id={self._last_event_id} "
+                          f"(kind={events[0].get('kind')}, "
+                          f"at={events[0].get('created_at')})",
+                          file=sys.stderr)
+                else:
+                    print("[ring] no history yet — will set baseline on first poll",
+                          file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[ring] baseline history fetch failed: {exc}",
                       file=sys.stderr)
@@ -192,8 +202,19 @@ class RingWatcher:
 
     async def _poll_once(self, ring, cam) -> None:
         """One polling cycle: refresh, check history, dispatch new motion."""
+        self._poll_count += 1
         await ring.async_update_data()
         events = await cam.async_history(limit=5)
+
+        # Heartbeat every 12 polls (~60s) — tells us the loop is alive
+        # and what the API is returning, without spamming every 5s.
+        if self._poll_count % 12 == 1:
+            recent_id = events[0]["id"] if events else None
+            recent_kind = events[0].get("kind") if events else None
+            print(f"[ring] poll #{self._poll_count}: {len(events)} events, "
+                  f"newest id={recent_id} kind={recent_kind}, "
+                  f"baseline={self._last_event_id}", file=sys.stderr)
+
         if not events:
             return
 
