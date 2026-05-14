@@ -183,10 +183,12 @@ _EVIDENCE_SUBDIR = "security/events"
 
 
 # --- Public API ------------------------------------------------------------
-# AnnounceFn signature: (text) → None. Caller-supplied; main.py wraps
-# speak_streaming so we get UI state coordination + the waveform pulse
-# during proactive speech.
-AnnounceFn = Callable[[str], None]
+# AnnounceFn signature: (text, on_done=None) → None. Caller-supplied;
+# main.py wraps speak_streaming so we get UI state coordination + the
+# waveform pulse during proactive speech. The optional on_done callback
+# fires AFTER playback completes (added in M35 follow-on so the watcher
+# can defer its 15s challenge timer until the prompt has been heard).
+AnnounceFn = Callable[..., None]
 
 
 class SecurityWatcher:
@@ -507,6 +509,14 @@ class SecurityWatcher:
             return
 
         # M35: enter CHALLENGE state.
+        # M35 follow-on: the 15s timer is DEFERRED until after the prompt
+        # finishes playing — otherwise prompt-playback (~4s) eats into the
+        # user's response budget, leaving ~11s, which after Whisper STT
+        # latency (~5-9s on CPU) leaves almost no margin. We set
+        # _challenge_started_at = 0 as a sentinel meaning "timer not yet
+        # armed"; _check_challenge_timeout treats that as a no-op. The
+        # _start_challenge_timer callback fires when the Announcer thread
+        # finishes playing the prompt.
         with self._challenge_lock:
             if self._challenge_active:
                 # Already in a challenge from a previous transition (the
@@ -514,7 +524,7 @@ class SecurityWatcher:
                 # or re-prompt — let the existing challenge run its course.
                 return
             self._challenge_active = True
-            self._challenge_started_at = now
+            self._challenge_started_at = 0.0  # SENTINEL: armed by callback
             # Cache the triggering frame for evidence-on-timeout. Copy via
             # OpenCV's .copy() if available, otherwise the raw reference
             # (frame is freshly grabbed and not modified after this point).
@@ -523,22 +533,57 @@ class SecurityWatcher:
             except AttributeError:
                 self._challenge_evidence_frame = frame
 
-        print("[security] person detected — entering CHALLENGE state (15s)",
-              file=sys.stderr)
+        print("[security] person detected — entering CHALLENGE state "
+              "(15s, timer starts after prompt)", file=sys.stderr)
+
+        def _start_challenge_timer() -> None:
+            """Fired by the Announcer thread when the challenge prompt has
+            finished playing. Arms the 15s timer from THIS moment, so the
+            user gets the full window for their response — not 'prompt +
+            response'."""
+            with self._challenge_lock:
+                # Defensive: only set the timer if the challenge is still
+                # active. Auth could resolve during prompt playback (the
+                # listen_loop diversion checks is_in_challenge(), which is
+                # already True, so an early "your-passphrase-here" still works).
+                if not self._challenge_active:
+                    return
+                self._challenge_started_at = time.monotonic()
+            print("[security] challenge prompt finished — 15s timer armed",
+                  file=sys.stderr)
+
         try:
+            # M35 follow-on: announce with the timer-arming callback. The
+            # Announcer thread fires _start_challenge_timer after playback
+            # completes (or fails — finally block, so the user never gets
+            # stranded in an un-timed challenge).
             self._announce(
-                "Please identify yourself within the next 15 seconds, sir."
+                "Please identify yourself within the next 15 seconds, sir.",
+                on_done=_start_challenge_timer,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[security] challenge announce raised: {exc}", file=sys.stderr)
+            # Announce path is broken — arm the timer NOW as a defensive
+            # fallback so the user doesn't sit in a never-ending challenge.
+            with self._challenge_lock:
+                if self._challenge_active:
+                    self._challenge_started_at = time.monotonic()
 
     def _check_challenge_timeout(self) -> None:
         """Called once per watcher poll. If the 15s window has elapsed,
         fire the deterrent path: save the evidence snapshot, speak the
         bluff, enter cooldown. Idempotent — if no challenge is active or
-        the timer hasn't expired, no-op."""
+        the timer hasn't expired, no-op.
+
+        M35 follow-on: a `_challenge_started_at` of 0 means the prompt is
+        still playing — timer hasn't been armed yet. Skip the check; the
+        Announcer's on_done callback will arm it shortly."""
         with self._challenge_lock:
             if not self._challenge_active:
+                return
+            if self._challenge_started_at <= 0:
+                # Prompt still playing (or announce path failed and the
+                # defensive fallback hasn't fired yet). Wait.
                 return
             elapsed = time.monotonic() - self._challenge_started_at
             if elapsed < _CHALLENGE_TIMEOUT_SECONDS:

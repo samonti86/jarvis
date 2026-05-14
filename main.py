@@ -40,6 +40,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from src.audio import AudioSession
 from src.config import Config, load
@@ -633,19 +634,30 @@ def main() -> None:
     from src.security import SecurityWatcher
     from src.text_to_speech import speak_streaming
 
-    announce_queue: queue.Queue[str | None] = queue.Queue()
+    # M35-followon: announce queue carries (text, on_done) tuples instead
+    # of plain strings. on_done is fired AFTER playback completes (or fails)
+    # so callers like SecurityWatcher can use it to defer their internal
+    # timer until the user has actually heard the prompt — counting prompt
+    # playback time (~4s) against the 15s challenge window was eating most
+    # of the user's response budget. Optional: most callers pass None.
+    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None] | None] = queue.Queue()
     announce_stop = threading.Event()
 
     def _announcer_loop() -> None:
         """Dedicated proactive-speech thread. The reason this exists is
         documented above — TL;DR sounddevice + WASAPI + fresh worker
         threads = silent playback. Pinning all sd.play() calls to a
-        single dedicated thread sidesteps it."""
+        single dedicated thread sidesteps it.
+
+        M35-followon: each queued item is now (text, on_done). on_done is
+        fired in `finally` after playback so it runs even on TTS failure —
+        a failed announce shouldn't strand the caller's state machine."""
         print("[announcer] worker thread started", file=sys.stderr)
         while not announce_stop.is_set():
-            text = announce_queue.get()
-            if text is None or announce_stop.is_set():
+            item = announce_queue.get()
+            if item is None or announce_stop.is_set():
                 break
+            text, on_done = item
             print(f"[announce] {text}")
             ui.add_system_text(f"🚨 {text}")
             try:
@@ -659,6 +671,11 @@ def main() -> None:
                 print(f"[announce] TTS failed: {exc}", file=sys.stderr)
             finally:
                 ui.set_state(State.IDLE)
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception as exc:
+                        print(f"[announce] on_done callback raised: {exc}", file=sys.stderr)
         print("[announcer] worker thread exited", file=sys.stderr)
 
     announcer_thread = threading.Thread(
@@ -666,13 +683,18 @@ def main() -> None:
     )
     announcer_thread.start()
 
-    def _announce(text: str) -> None:
+    def _announce(text: str, on_done: Callable[[], None] | None = None) -> None:
         """Public entry: enqueue a proactive announcement. Non-blocking —
         returns immediately and the Announcer thread plays it. Bypasses
         the mute check (security alerts override quiet mode by design).
-        Multiple announcements queue FIFO so they don't overlap."""
+        Multiple announcements queue FIFO so they don't overlap.
+
+        on_done (optional) fires AFTER the playback completes (or fails) —
+        used by SecurityWatcher's challenge path to defer the 15s timer
+        start until the user has actually heard the prompt, otherwise
+        prompt-playback time eats into the response budget."""
         if text:
-            announce_queue.put(text)
+            announce_queue.put((text, on_done))
 
     # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
     # M34 announce-only behavior) and the evidence directory (where
