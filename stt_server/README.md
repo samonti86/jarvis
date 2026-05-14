@@ -69,28 +69,44 @@ curl http://192.168.1.10:8000/health
 curl -F "audio=@test.wav" -F "language=en" http://192.168.1.10:8000/transcribe
 ```
 
-## Autostart on boot (Task Scheduler)
+## Autostart on boot (Task Scheduler, hidden via VBS wrapper)
 
 The simplest reliable autostart on Windows that doesn't need admin or
-extra tooling. The repo ships `run_server.bat` which `cd`s to its own
-directory and launches uvicorn with output redirected to `server.log`.
+extra tooling. The repo ships:
+- `run_server.bat` — `cd`s to its own dir, launches uvicorn, redirects
+  output to `server.log`.
+- `run_server_hidden.vbs` — invokes the .bat with WindowStyle=Hidden so
+  no cmd.exe window appears in the interactive user session. Without
+  this wrapper, a visible CMD window appears whenever the task fires
+  during an active login session, and accidentally closing it kills
+  the server.
 
 ```powershell
 # No admin needed — runs under your own user. /sc onstart fires on every boot:
-schtasks /create /tn JarvisSTTServer /tr "C:\Users\youruser\repos\jarvis\stt_server\run_server.bat" /sc onstart /ru youruser /f
+schtasks /create /tn JarvisSTTServer /tr "wscript.exe C:\Users\youruser\repos\jarvis\stt_server\run_server_hidden.vbs" /sc onstart /ru youruser /f
 
 # Verify:
 schtasks /query /tn JarvisSTTServer
 
-# Fire it immediately (for testing without rebooting):
+# Fire it immediately (use after a manual taskkill or anytime you need
+# to restart the server without rebooting):
 schtasks /run /tn JarvisSTTServer
 
-# Stop the running instance:
+# Stop the running instance (the server is just python.exe instances
+# — taskkill them all and the schtasks /run brings it back fresh):
 taskkill /F /IM python.exe
 ```
 
 The task runs at user logon (not session-locked). After a reboot, the
 server is up within ~15s of login (model-load time).
+
+### Manual restart from the desktop (no RDP needed)
+
+```powershell
+# From the Jarvis desktop's PowerShell — assumes SSH key auth is set up
+# (which it is, per M24):
+ssh youruser@192.168.1.10 "taskkill /F /IM python.exe & schtasks /run /tn JarvisSTTServer"
+```
 
 ### Alternative: NSSM service
 
