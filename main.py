@@ -594,34 +594,67 @@ def main() -> None:
     ui.set_integration("plex", plex_client is not None)
     ui.set_integration("laptop", plex_laptop_client is not None)
 
-    # M34: instantiate SecurityWatcher with a proactive-speech callback. The
-    # announce closure uses speak_streaming (single-chunk iterator) so the
-    # waveform visualizer pulses + the UI flips to SPEAKING during playback,
-    # same treatment as a normal voice reply. Bypasses the mute check by
-    # design — security alerts override quiet mode.
+    # M34: instantiate SecurityWatcher with a proactive-speech callback.
+    #
+    # Why a dedicated Announcer THREAD (not just an _announce closure):
+    # observed during M34 smoke testing — when the activate intent fires
+    # on the listen_loop thread, `speak_streaming` plays audio correctly,
+    # but when the same closure is invoked from the watcher thread (a
+    # fresh thread that hasn't previously touched sounddevice), `sd.play`
+    # silently produces no audio. No exception, no log line — just no
+    # sound. The cause is sounddevice's global state (sd.play uses the
+    # process-wide default stream) interacting badly with the long-lived
+    # `AudioSession` mic InputStream held by listen_loop. On Windows
+    # WASAPI, the THREAD that first establishes itself as audio-output-
+    # owner gets reliable playback; other threads get silence.
+    #
+    # The fix: marshal ALL proactive speech through a single dedicated
+    # thread. Watcher (and any future proactive-speech caller) just
+    # queues text; the Announcer thread dequeues and plays. Always the
+    # same thread => always reliable playback.
     from src.security import SecurityWatcher
     from src.text_to_speech import speak_streaming
 
+    announce_queue: queue.Queue[str | None] = queue.Queue()
+    announce_stop = threading.Event()
+
+    def _announcer_loop() -> None:
+        """Dedicated proactive-speech thread. The reason this exists is
+        documented above — TL;DR sounddevice + WASAPI + fresh worker
+        threads = silent playback. Pinning all sd.play() calls to a
+        single dedicated thread sidesteps it."""
+        print("[announcer] worker thread started", file=sys.stderr)
+        while not announce_stop.is_set():
+            text = announce_queue.get()
+            if text is None or announce_stop.is_set():
+                break
+            print(f"[announce] {text}")
+            ui.add_system_text(f"🚨 {text}")
+            try:
+                speak_streaming(
+                    iter([text]),
+                    "en",
+                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                    on_amplitude=ui.set_amplitude,
+                )
+            except Exception as exc:
+                print(f"[announce] TTS failed: {exc}", file=sys.stderr)
+            finally:
+                ui.set_state(State.IDLE)
+        print("[announcer] worker thread exited", file=sys.stderr)
+
+    announcer_thread = threading.Thread(
+        target=_announcer_loop, name="Announcer", daemon=True
+    )
+    announcer_thread.start()
+
     def _announce(text: str) -> None:
-        """Proactive speech from a background thread. Mirrors process_question's
-        speak path but is one-shot and ignores mute. Adds the line to the
-        console transcript as a system-prefixed message so the user has a
-        visual record of what was said + when."""
-        if not text:
-            return
-        print(f"[announce] {text}")
-        ui.add_system_text(f"🚨 {text}")
-        try:
-            speak_streaming(
-                iter([text]),
-                "en",
-                on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                on_amplitude=ui.set_amplitude,
-            )
-        except Exception as exc:
-            print(f"[announce] TTS failed: {exc}", file=sys.stderr)
-        finally:
-            ui.set_state(State.IDLE)
+        """Public entry: enqueue a proactive announcement. Non-blocking —
+        returns immediately and the Announcer thread plays it. Bypasses
+        the mute check (security alerts override quiet mode by design).
+        Multiple announcements queue FIFO so they don't overlap."""
+        if text:
+            announce_queue.put(text)
 
     security_watcher = SecurityWatcher(
         announce=_announce,
@@ -649,6 +682,12 @@ def main() -> None:
     # so it dies with the process either way, but explicit shutdown lets
     # any in-flight inference complete cleanly without log noise.
     security_watcher.shutdown()
+
+    # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
+    # _announcer_loop so it can check the stop flag and exit cleanly,
+    # instead of being killed mid-playback as a daemon.
+    announce_stop.set()
+    announce_queue.put(None)
 
     # Give listen_loop time to see the shutdown event, exit its loop cleanly,
     # and run its try/finally — which seals the active session to disk. Worst
