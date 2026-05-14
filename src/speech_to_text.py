@@ -1,11 +1,33 @@
-"""faster-whisper wrapper: state-machine endpointing + transcription."""
+"""faster-whisper wrapper: state-machine endpointing + transcription.
+
+M36: dual STT backend with auto-fallback. Two transcription paths:
+
+  Local CPU (default, today's behavior):
+    faster-whisper with device="cpu", int8 quant. 5-10s for a typical
+    voice command on a Ryzen 5 3400G — fine for casual chat, the
+    bottleneck when M35's 15s challenge window is tight.
+
+  Remote GPU (M36):
+    POST WAV to the FastAPI server running on MEDIA-HOST
+    (stt_server/server.py). GTX 1650 + float16 = ~250-500ms per
+    transcription, 10-20x faster than local CPU.
+
+Backend selection driven by `backend` param ("auto" / "gpu" / "cpu") and
+`server_url`. Auto-fallback: in "auto" mode, any remote failure (network,
+HTTP error, parse error) silently degrades to local CPU and the turn
+completes — never strand the user.
+"""
 
 from __future__ import annotations
 
+import io
 import sys
+import time
+import wave
 from dataclasses import dataclass
 from typing import Callable
 
+import httpx
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -133,11 +155,21 @@ def _record_until_silence(
     return audio
 
 
+# M36: how long to wait for the GPU server before giving up (and either
+# falling back to local CPU in "auto" mode, or erroring in "gpu" mode).
+# Typical GPU latency is 250-500ms; 15s is generous enough for a cold
+# server startup or transient slowness, short enough to fall back fast
+# if the server is genuinely dead.
+_REMOTE_STT_TIMEOUT_SECONDS = 15.0
+
+
 def transcribe_after_wake(
     session: AudioSession,
     model_name: str = "small",
     on_speech_ended: "Callable[[], None] | None" = None,
     on_amplitude: "Callable[[float], None] | None" = None,
+    server_url: str = "",
+    backend: str = "auto",
 ) -> Transcript:
     """Record from `session` until silence, then transcribe.
 
@@ -150,8 +182,19 @@ def transcribe_after_wake(
     `on_amplitude` (M18) fires once per audio chunk during recording with the
     current normalized level in [0, 1]. Used by the waveform visualizer to
     react in real time while LISTENING.
+
+    `server_url` + `backend` (M36) select the STT backend:
+      - backend="cpu" or server_url="" → local CPU (today's behavior)
+      - backend="gpu" + server_url set → remote GPU, no fallback
+      - backend="auto" + server_url set → remote GPU, silent fallback to
+        local CPU on any failure (the default + recommended)
     """
-    model = _get_model(model_name)
+    # Pre-load local model unless we're forcing GPU-only. In "auto" mode
+    # the model might still be needed as fallback, so eager-load is right.
+    # In "gpu" mode we skip the load — saves ~5s of startup for that path.
+    if backend != "gpu":
+        _get_model(model_name)
+
     audio_i16 = _record_until_silence(session, on_amplitude=on_amplitude)
 
     if audio_i16.size == 0:
@@ -163,6 +206,66 @@ def transcribe_after_wake(
         except Exception:
             pass  # never let a UI callback break STT
 
+    return _dispatch_transcription(audio_i16, model_name, server_url, backend)
+
+
+# --- M36: backend dispatch + helpers --------------------------------------
+
+def _dispatch_transcription(
+    audio_i16: np.ndarray, model_name: str, server_url: str, backend: str
+) -> Transcript:
+    """Choose local vs remote based on backend + URL, with auto-fallback.
+
+    Routing rules:
+      - "cpu" or no server URL → local CPU (today's behavior).
+      - "gpu" → remote only; propagate failures as a clear error string
+        (returned as the Transcript text so the listen_loop doesn't crash
+        on a network blip — but the user sees "[STT GPU offload failed: ...]"
+        in the transcript instead of garbage).
+      - "auto" → try remote first; on ANY exception, silently fall back to
+        local CPU. Log to stderr so audit/debugging is possible.
+    """
+    if backend == "cpu" or not server_url:
+        return _transcribe_local(audio_i16, model_name)
+
+    if backend == "gpu":
+        try:
+            return _transcribe_remote(audio_i16, server_url)
+        except Exception as exc:
+            # Forced GPU mode — don't fall back, but don't crash either.
+            print(
+                f"[stt] GPU backend forced but server unreachable: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return Transcript(
+                text=f"[STT GPU offload failed: {type(exc).__name__}]",
+                language="en",
+            )
+
+    # backend == "auto" — try remote, silently fall back.
+    t0 = time.monotonic()
+    try:
+        result = _transcribe_remote(audio_i16, server_url)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[stt] remote ok in {elapsed_ms}ms", file=sys.stderr)
+        return result
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        # Silent fallback by design — see the M36 design note in
+        # CLAUDE.md. The log line gives us audit trail; the user just
+        # sees a slightly slower turn.
+        print(
+            f"[stt] remote failed after {elapsed_ms}ms "
+            f"({type(exc).__name__}: {exc}) — falling back to local CPU",
+            file=sys.stderr,
+        )
+        return _transcribe_local(audio_i16, model_name)
+
+
+def _transcribe_local(audio_i16: np.ndarray, model_name: str) -> Transcript:
+    """Local CPU transcription path — the M35-and-earlier behavior."""
+    model = _get_model(model_name)
     audio_f32 = audio_i16.astype(np.float32) / 32768.0
     segments, info = model.transcribe(
         audio_f32,
@@ -172,3 +275,39 @@ def transcribe_after_wake(
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return Transcript(text=text, language=info.language)
+
+
+def _transcribe_remote(audio_i16: np.ndarray, server_url: str) -> Transcript:
+    """POST WAV-encoded audio to the GPU server's /transcribe endpoint.
+    Raises on any HTTP / network / parse failure — caller decides whether
+    to fall back."""
+    wav_bytes = _encode_wav(audio_i16)
+    files = {"audio": ("audio.wav", wav_bytes, "audio/wav")}
+    # httpx is already a dep (anthropic SDK pulls it; we use it directly
+    # in src/sports.py). Sync .post is fine here — we're already on a
+    # worker thread (listen_loop or text_input_loop), no event loop to
+    # block.
+    resp = httpx.post(
+        f"{server_url}/transcribe",
+        files=files,
+        timeout=_REMOTE_STT_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return Transcript(
+        text=(data.get("text") or "").strip(),
+        language=(data.get("language") or "").strip(),
+    )
+
+
+def _encode_wav(audio_i16: np.ndarray, sample_rate: int = 16000) -> bytes:
+    """Encode int16 mono audio as WAV bytes for HTTP upload. WAV (not raw
+    PCM) so the server doesn't need separate sample-rate/channels/bit-depth
+    metadata — it's all in the header. Trivial overhead (44 bytes) vs raw."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)  # int16 = 2 bytes per sample
+        wav.setframerate(sample_rate)
+        wav.writeframes(audio_i16.tobytes())
+    return buf.getvalue()

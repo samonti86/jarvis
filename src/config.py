@@ -27,6 +27,8 @@ class Config:
     plex_laptop_key_path: str  # M24 — path to private key (~ expanded); blank → default ed25519
     plex_laptop_log_path: str  # M24 — Plex Media Server.log path on the laptop; blank → default
     security_passphrase: str   # M35 — voice passphrase to clear a security-mode challenge; blank disables challenge step
+    stt_server_url: str        # M36 — HTTP URL of the GPU STT server (e.g. http://192.168.1.10:8000); blank = local CPU only
+    stt_backend: str           # M36 — "auto" | "gpu" | "cpu"; auto = try GPU server first, fall back to CPU silently
 
 
 def load() -> Config:
@@ -47,4 +49,6 @@ def load() -> Config:
         plex_laptop_key_path=os.getenv("PLEX_LAPTOP_KEY_PATH", "").strip(),
         plex_laptop_log_path=os.getenv("PLEX_LAPTOP_LOG_PATH", "").strip(),
         security_passphrase=os.getenv("JARVIS_SECURITY_PASSPHRASE", "").strip(),
+        stt_server_url=os.getenv("STT_SERVER_URL", "").strip().rstrip("/"),
+        stt_backend=os.getenv("STT_BACKEND", "auto").strip().lower(),
     )

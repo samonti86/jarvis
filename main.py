@@ -461,6 +461,10 @@ def listen_loop(
                         # while LISTENING. SPEAKING and LISTENING never overlap
                         # so the same callback safely serves both phases.
                         on_amplitude=ui.set_amplitude,
+                        # M36: GPU offload (or local CPU if unset / forced).
+                        # Auto-fallback by default.
+                        server_url=cfg.stt_server_url,
+                        backend=cfg.stt_backend,
                     )
                 except Exception as exc:
                     print(f"[main] STT failed: {exc}")

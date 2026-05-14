@@ -1,0 +1,27 @@
+# Jarvis STT GPU offload server (M36).
+#
+# Runs on MEDIA-HOST (the Plex laptop) — separate venv, separate deps from
+# the main Jarvis project. Install in stt_server/venv (NOT the main venv).
+
+# Whisper STT, GPU-accelerated. ctranslate2 backend ships pre-built CUDA
+# wheels (cuDNN 9 bundled) — no separate CUDA Toolkit install needed,
+# just the NVIDIA driver. faster-whisper auto-detects GPU when
+# device="cuda" is set.
+faster-whisper>=1.0.0
+
+# Web framework + ASGI server. uvicorn[standard] pulls in `httptools` and
+# `websockets` for the faster HTTP parser path; not strictly required for
+# this single-endpoint server, but adds maybe 1-2 MB and noticeably faster
+# request parsing.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Required by FastAPI for `UploadFile` / `Form` parsing on multipart
+# requests. Not pulled in transitively — must declare explicitly.
+python-multipart>=0.0.6
+
+# numpy is a transitive dep of faster-whisper, but the server's WAV
+# decoder uses it directly so declare it explicitly to make the
+# requirement legible. faster-whisper would install a compatible
+# version anyway.
+numpy>=1.24
