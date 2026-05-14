@@ -686,15 +686,41 @@ def main() -> None:
     # set get the right webcam for vision queries but the wrong one for
     # security mode.
     from src.cameras import _camera_index as _resolve_camera_index
+
+    # M37: RingWatcher polls Ring's cloud API for motion events. Only
+    # active while security is armed (gated via on_armed_changed below).
+    # Skipped entirely if setup_ring.py hasn't been run.
+    from src.ring import RingWatcher, is_configured as ring_is_configured
+    ring_watcher: RingWatcher | None = None
+
+    def _on_security_armed(armed: bool) -> None:
+        """Fan-out on armed-state change: update UI + start/stop Ring."""
+        ui.set_armed_indicator(armed)
+        if ring_watcher is not None:
+            if armed:
+                ring_watcher.start()
+            else:
+                ring_watcher.stop()
+
     security_watcher = SecurityWatcher(
         announce=_announce,
-        on_armed_changed=ui.set_armed_indicator,
+        on_armed_changed=_on_security_armed,
         on_locked_changed=ui.set_locked_indicator,
         camera_index=_resolve_camera_index(),
         passphrase=cfg.security_passphrase,
         evidence_dir=default_base_dir() / "security" / "events",
         discord_webhook_url=cfg.discord_webhook_url,
     )
+
+    # Construct RingWatcher AFTER SecurityWatcher (it holds a reference back).
+    # Graceful skip if Ring isn't configured — same shape as Plex when
+    # PLEX_URL is unset.
+    if ring_is_configured():
+        ring_watcher = RingWatcher(security_watcher=security_watcher)
+        print("[main] Ring camera integration enabled", file=sys.stderr)
+    else:
+        print("[main] Ring not configured (run setup_ring.py to enable)",
+              file=sys.stderr)
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`
     # callback re-evaluates each menu open, so this late wiring is fine.
@@ -717,6 +743,8 @@ def main() -> None:
     # so it dies with the process either way, but explicit shutdown lets
     # any in-flight inference complete cleanly without log noise.
     security_watcher.shutdown()
+    if ring_watcher is not None:
+        ring_watcher.stop()
 
     # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
     # _announcer_loop so it can check the stop flag and exit cleanly,

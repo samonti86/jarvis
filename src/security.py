@@ -238,11 +238,14 @@ class SecurityWatcher:
         # the listen_loop diversion catches it before the intent parser —
         # an intruder shouldn't be able to bypass with a guessed disarm.
         self._locked = False
-        # Most recent triggering frame, held in memory between detection
-        # and challenge resolution so the deterrent path can save it as
-        # evidence without re-grabbing (re-grab would capture the moment
-        # AFTER the 15s timeout, missing the actual triggering view).
-        self._challenge_evidence_frame = None
+        # JPEG bytes of the triggering frame, captured at challenge entry
+        # so the deterrent path can save them without a re-grab (which
+        # would capture the moment AFTER the 15s timeout, missing the
+        # actual triggering view). Local YOLO path encodes from numpy
+        # at entry; external camera paths (Ring) supply pre-encoded bytes
+        # directly. Either way, one in-memory copy lives until the
+        # challenge resolves.
+        self._challenge_evidence_bytes: bytes = b""
 
         # Lazy-loaded YOLO. Held across activate/deactivate cycles so the
         # second arm is instant (no model reload). Becomes a sentinel
@@ -520,82 +523,75 @@ class SecurityWatcher:
             print("[security] watcher loop exited", file=sys.stderr)
 
     def _handle_person_first_seen(self, frame, now: float) -> None:
-        """Called once per EMPTY→PERSON transition. Decides between three
-        outcomes:
+        """Local YOLO detected a person (EMPTY→PERSON transition). Encode
+        the frame to JPEG bytes and feed into the shared challenge entry."""
+        try:
+            import cv2  # type: ignore
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            jpeg_bytes = bytes(buf) if ok else b""
+        except Exception as exc:  # noqa: BLE001 — defensive
+            print(f"[security] failed to encode evidence frame: {exc}", file=sys.stderr)
+            jpeg_bytes = b""
+        self._enter_challenge(jpeg_bytes, source="local", now=now)
 
-        1. **Cooldown active** — silently skip. Recently-resolved challenge
-           is still suppressing alerts. Logged so audit data shows the
-           cooldown is doing its job.
-        2. **No passphrase configured (M34 mode)** — announce movement and
-           we're done. Graceful fallback.
-        3. **Passphrase configured (M35 mode)** — enter CHALLENGE state,
-           cache the triggering frame as evidence, start the 15s timer."""
+    def trigger_external_motion(
+        self, source: str, jpeg_bytes: bytes | None = None,
+    ) -> None:
+        """Public entry for an external camera (e.g. Ring) that detected
+        motion. Feeds into the same challenge/deterrent state machine as
+        local YOLO detection. Honors armed-state, cooldown, and the "one
+        challenge at a time" rule — the watcher decides whether to act."""
+        if not self._armed.is_set():
+            return
+        self._enter_challenge(jpeg_bytes or b"", source=source, now=time.monotonic())
+
+    def _enter_challenge(self, jpeg_bytes: bytes, source: str, now: float) -> None:
+        """Shared challenge-entry path used by local YOLO and external
+        cameras. Three exit paths:
+            1. In cooldown — silently skip.
+            2. No passphrase configured — announce-only (M34 fallback).
+            3. Passphrase configured — enter CHALLENGE state with evidence
+               cached as JPEG bytes; the 15s timer is deferred until the
+               prompt finishes playing (see _start_challenge_timer below).
+        """
         if now < self._cooldown_until:
             remaining = self._cooldown_until - now
             print(
-                f"[security] person detected but in cooldown "
+                f"[security] motion ({source}) but in cooldown "
                 f"({remaining:.1f}s left) — skipping alert",
                 file=sys.stderr,
             )
             return
 
         if not self._passphrase:
-            # M34 fallback: no challenge configured, just announce.
-            print("[security] person detected — firing announcement (M34 mode)",
+            print(f"[security] motion ({source}) — firing announcement (M34 mode)",
                   file=sys.stderr)
             self._safe_call(self._announce,
                             "Sir — I'm detecting movement in the monitored space.",
                             label="movement announce")
             return
 
-        # M35: enter CHALLENGE state.
-        # M35 follow-on: the 15s timer is DEFERRED until after the prompt
-        # finishes playing — otherwise prompt-playback (~4s) eats into the
-        # user's response budget, leaving ~11s, which after Whisper STT
-        # latency (~5-9s on CPU) leaves almost no margin. We set
-        # _challenge_started_at = 0 as a sentinel meaning "timer not yet
-        # armed"; _check_challenge_timeout treats that as a no-op. The
-        # _start_challenge_timer callback fires when the Announcer thread
-        # finishes playing the prompt.
         with self._challenge_lock:
             if self._challenge_active:
-                # Already in a challenge from a previous transition (the
-                # presence window must have flickered). Don't restart timer
-                # or re-prompt — let the existing challenge run its course.
+                # Already in a challenge from a previous transition (e.g.
+                # Logi flicker, or Ring + Logi co-firing). Let the existing
+                # challenge run its course — don't restart timer or re-prompt.
                 return
             self._challenge_active = True
-            self._challenge_started_at = 0.0  # SENTINEL: armed by callback
-            # Cache the triggering frame for evidence-on-timeout. Copy via
-            # OpenCV's .copy() if available, otherwise the raw reference
-            # (frame is freshly grabbed and not modified after this point).
-            try:
-                self._challenge_evidence_frame = frame.copy()
-            except AttributeError:
-                self._challenge_evidence_frame = frame
+            self._challenge_started_at = 0.0  # SENTINEL: armed by on_done
+            self._challenge_evidence_bytes = jpeg_bytes
 
-        print("[security] person detected — entering CHALLENGE state "
-              "(15s, timer starts after prompt)", file=sys.stderr)
+        print(f"[security] motion ({source}) — entering CHALLENGE state "
+              f"(15s timer starts after prompt)", file=sys.stderr)
 
         def _start_challenge_timer() -> None:
-            """Fired by the Announcer thread when the challenge prompt has
-            finished playing. Arms the 15s timer from THIS moment, so the
-            user gets the full window for their response — not 'prompt +
-            response'."""
             with self._challenge_lock:
-                # Defensive: only set the timer if the challenge is still
-                # active. Auth could resolve during prompt playback (the
-                # listen_loop diversion checks is_in_challenge(), which is
-                # already True, so an early "your-passphrase-here" still works).
                 if not self._challenge_active:
-                    return
+                    return  # auth resolved during playback — no-op
                 self._challenge_started_at = time.monotonic()
             print("[security] challenge prompt finished — 15s timer armed",
                   file=sys.stderr)
 
-        # Announcer fires _start_challenge_timer after playback completes
-        # (finally-block, so failed playback still unblocks). On announce
-        # itself failing, arm the timer now so the user can't be stranded
-        # in an un-timed challenge.
         try:
             self._announce(
                 "Please identify yourself within the next 15 seconds, sir.",
@@ -603,6 +599,8 @@ class SecurityWatcher:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[security] challenge announce raised: {exc}", file=sys.stderr)
+            # Announce path is broken — arm the timer NOW so the user
+            # can't be stranded in an un-timed challenge.
             with self._challenge_lock:
                 if self._challenge_active:
                     self._challenge_started_at = time.monotonic()
@@ -639,16 +637,16 @@ class SecurityWatcher:
             # UI. Only a correct passphrase or a tray disarm clears LOCKED.
             self._challenge_started_at = 0.0  # disable timer — no re-fire
             self._locked = True
-            evidence_frame = self._challenge_evidence_frame
-            # Don't clear evidence_frame — leave it in case we want to
-            # re-save later or compare against new detections.
+            jpeg_bytes = self._challenge_evidence_bytes
+            # Keep _challenge_evidence_bytes set — useful if we ever want
+            # to re-save or re-send to Discord on user request.
 
         print(
             f"[security] CHALLENGE timeout ({_CHALLENGE_TIMEOUT_SECONDS:.0f}s) — "
             f"firing deterrent + entering LOCKED state",
             file=sys.stderr,
         )
-        saved_path, jpeg_bytes = self._save_evidence(evidence_frame)
+        saved_path = self._save_evidence_bytes(jpeg_bytes)
         if saved_path is not None:
             print(f"[security] evidence saved: {saved_path}", file=sys.stderr)
 
@@ -687,30 +685,20 @@ class SecurityWatcher:
             target=_worker, name="DiscordNotify", daemon=True
         ).start()
 
-    def _save_evidence(self, frame) -> tuple[Path | None, bytes]:
-        """Encode frame as JPEG, write to disk, return both path and bytes.
-        The bytes are reused by the Discord notification path to skip a
-        disk re-read. Defensive — never raises; partial failure returns
-        (None, b'')."""
-        if frame is None or self._evidence_dir is None:
-            return None, b""
+    def _save_evidence_bytes(self, jpeg_bytes: bytes) -> Path | None:
+        """Write pre-encoded JPEG bytes to the evidence dir. Returns path
+        on success, None on any failure. Defensive — never raises."""
+        if not jpeg_bytes or self._evidence_dir is None:
+            return None
         try:
-            import cv2  # type: ignore
-        except ImportError:
-            return None, b""
-        try:
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                return None, b""
-            jpeg_bytes = bytes(buf)
             self._evidence_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             path = self._evidence_dir / f"{timestamp}.jpg"
             path.write_bytes(jpeg_bytes)
-            return path, jpeg_bytes
+            return path
         except Exception as exc:  # noqa: BLE001 — defensive
             print(f"[security] evidence save failed: {exc}", file=sys.stderr)
-            return None, b""
+            return None
 
     def _ensure_model(self) -> bool:
         """Load YOLO once; cache across arm/disarm cycles. Returns True on

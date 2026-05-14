@@ -1,5 +1,7 @@
 # Secrets
 .env
+ring_token.json
+ring_config.json
 
 # Python
 venv/
