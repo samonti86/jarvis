@@ -400,6 +400,23 @@ def listen_loop(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
                 file=sys.stderr,
             )
+
+            # Same security-intent dispatch as the voice listen_loop:
+            # "activate security", "stand down", and challenge-passphrase
+            # responses are handled locally without calling Claude. Without
+            # this, typed "activate security" gets routed to Claude, which
+            # has no tool to arm the watcher and ends up calling
+            # system_control to lock the workstation instead.
+            if security_watcher is not None and not attachments:
+                try:
+                    if security_watcher.handle_transcript(text):
+                        ui.add_user_text(text, "en")
+                        ui.set_state(State.IDLE)
+                        continue
+                except Exception as exc:
+                    print(f"[text-input] security.handle_transcript raised: {exc}",
+                          file=sys.stderr)
+
             ui.set_state(State.THINKING)
             try:
                 # Hardcoded 'en' for now — Claude still replies in the input's

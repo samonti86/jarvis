@@ -62,13 +62,12 @@ from typing import Callable
 _POLL_SECONDS = 2.0
 
 # Grace period after arming before the watcher starts looking. Lets the user
-# walk away after saying "activate security" without immediately triggering
-# the alert on themselves. Ten seconds is comfortable for the "say activate,
-# walk to the door, step out" use case — bumped from M34's initial 5s after
-# live testing showed 5s wasn't enough margin. A real intruder couldn't
-# exploit this (they'd have to arm Jarvis from outside, which they can't —
-# voice activation requires being at the mic).
-_ARM_GRACE_SECONDS = 10.0
+# walk away from the PC, to the door, and out without triggering on
+# themselves. 30s comfortably covers an room-sized walk; tighter (10s)
+# left the user feeling rushed in live testing. A real intruder couldn't
+# exploit this — they'd have to arm Jarvis from outside, which requires
+# being at the mic, which means being inside.
+_ARM_GRACE_SECONDS = 30.0
 
 # How long a person must be absent from frame before a fresh detection
 # counts as a "new" presence (and re-triggers the announcement). 30s avoids
@@ -80,10 +79,14 @@ _PRESENCE_CLEAR_SECONDS = 30.0
 # trained on COCO so this index is stable.
 _YOLO_PERSON_CLASS = 0
 
-# Confidence threshold for "this is a person". YOLOv8n at 0.5 has very low
-# false-positive rate on typical scenes. Lower would catch more (incl. pets
-# misidentified as small persons); higher would miss partial views.
-_YOLO_CONFIDENCE = 0.5
+# Confidence threshold for "this is a person". 0.7 is the empirical floor
+# for filtering character-shaped objects (action-figure backpacks, mannequin
+# torsos, large posters of people) which score 0.5-0.7 — caught the user's
+# wall of character backpacks during live testing. Real people score 0.85+
+# even in partial view. Tighter (0.85) would miss partial-view edge cases;
+# looser (0.5) admits the false-positive class of "person-shaped static
+# objects in the room."
+_YOLO_CONFIDENCE = 0.7
 
 # Minimum person bounding-box height as a fraction of frame height. Defense
 # in depth against YOLO misclassifying a pet as a person at low confidence:
