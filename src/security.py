@@ -550,6 +550,41 @@ class SecurityWatcher:
             return
         self._enter_challenge(jpeg_bytes or b"", source=source, now=time.monotonic())
 
+    def verify_person(self, jpeg_bytes: bytes) -> bool | None:
+        """Decode JPEG bytes and run the same person-detection filter as
+        the local Logi watcher (class==person + conf>=0.5 + bbox height
+        >=30% of frame). Returns True if person confirmed, False if the
+        image is clear-of-people (pet / pet / nothing), None if we
+        couldn't make a determination (cv2 missing, decode failure,
+        model unavailable, empty bytes).
+
+        Callers should treat None as "unknown" and decide whether to
+        fail open (fire alert) or fail closed (skip) based on context.
+        Ring's _fire_alert fails OPEN — better to challenge an
+        unverifiable event than miss a real intruder.
+
+        Lazy-loads YOLO if not already loaded (so a Ring-armed-only
+        session can use this before the Logi watcher does)."""
+        if not jpeg_bytes:
+            return None
+        try:
+            import cv2  # type: ignore
+            import numpy as np
+        except ImportError:
+            return None
+        try:
+            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return None
+        except Exception as exc:  # noqa: BLE001
+            print(f"[security] verify_person decode failed: {exc}",
+                  file=sys.stderr)
+            return None
+        if not self._ensure_model():
+            return None
+        return self._detect_person(frame)
+
     def update_challenge_evidence(self, jpeg_bytes: bytes) -> None:
         """Attach late-arriving evidence bytes to an active challenge.
         Used by RingWatcher when its parallel snapshot fetch completes

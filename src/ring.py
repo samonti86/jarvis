@@ -253,48 +253,69 @@ class RingWatcher:
             await self._fire_alert(cam, event)
 
     async def _fire_alert(self, cam, event: dict) -> None:
-        """Fire the challenge IMMEDIATELY and fetch the snapshot in
-        parallel. Ring's async_get_snapshot requests a fresh capture and
-        polls for ~3-9s waiting for the camera to deliver — if we awaited
-        that before entering the challenge, the prompt would start 3-9s
-        late and the user's response window shrinks. Better: announce
-        first, attach evidence via update_challenge_evidence() if the
-        snapshot arrives before the deterrent fires."""
-        print(f"[ring] motion event id={event['id']} at {event.get('created_at')}",
+        """Fetch snapshot, verify a person is in it, then fire the
+        challenge. Filters out false positives (Ring's PIR/CV picks up
+        pets, curtain motion, light changes, etc.) by reusing the same
+        person-detection logic the local Logi watcher already applies.
+
+        Trade-off: adds 3-8s of latency before the challenge fires (we
+        wait for Ring to deliver the snapshot, then run YOLO). For a
+        real intruder that's fine — they're still inside the monitored space
+        when the prompt fires. For false positives (pets), they get
+        filtered silently with no prompt at all.
+
+        Fail-open on snapshot failure: if Ring can't deliver a snapshot
+        within 8s, fire the challenge anyway (we can't verify person,
+        but missing a real event is worse than challenging the user)."""
+        event_id = event["id"]
+        print(f"[ring] motion event id={event_id} at {event.get('created_at')}",
               file=sys.stderr)
-        try:
-            self._security.trigger_external_motion(source="ring", jpeg_bytes=None)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ring] trigger_external_motion raised: {exc}", file=sys.stderr)
-            return
 
-        # Fetch snapshot in the background. asyncio.create_task() lets the
-        # poll loop continue while this awaits Ring's slow snapshot pipeline.
-        asyncio.create_task(self._fetch_and_attach(cam, event["id"]))
-
-    async def _fetch_and_attach(self, cam, event_id: int) -> None:
-        """Background coroutine: request a fresh snapshot for the event,
-        attach to the active challenge if it arrives in time. retries=8
-        gives Ring 8s of grace to capture+deliver (default is 3s which
-        was failing for the user on back-to-back events). Latency is
-        invisible to the user because the challenge already fired."""
         try:
             snap = await cam.async_get_snapshot(retries=8, delay=1)
         except Exception as exc:  # noqa: BLE001
-            print(f"[ring] snapshot fetch failed for event {event_id}: {exc}",
-                  file=sys.stderr)
+            print(f"[ring] snapshot fetch failed: {exc} — firing challenge "
+                  f"defensively", file=sys.stderr)
+            self._fire_challenge(b"", event_id)
             return
+
         if not snap:
-            print(f"[ring] snapshot timed out for event {event_id} "
-                  f"(8s window) — deterrent will fire without image",
-                  file=sys.stderr)
+            print(f"[ring] snapshot timed out (8s) — firing challenge "
+                  f"defensively (can't verify, won't miss)", file=sys.stderr)
+            self._fire_challenge(b"", event_id)
             return
+
         print(f"[ring] snapshot fetched: {len(snap)} bytes for event {event_id}",
               file=sys.stderr)
+
+        # Person verification — same filter the Logi watcher uses.
+        verified = self._security.verify_person(snap)
+        if verified is False:
+            # Clear false positive: snapshot decoded fine, YOLO found no
+            # person (or person bbox too small — pet-sized).
+            print(f"[ring] no person in snapshot — false trigger ignored "
+                  f"(event {event_id})", file=sys.stderr)
+            return
+        # verified is True OR None (unknown). Either way, fire — better to
+        # challenge an ambiguous event than miss a real intruder.
+        if verified is None:
+            print(f"[ring] couldn't verify person (cv2/YOLO unavailable) — "
+                  f"firing challenge defensively", file=sys.stderr)
+        else:
+            print(f"[ring] person confirmed in snapshot — firing challenge",
+                  file=sys.stderr)
+        self._fire_challenge(snap, event_id)
+
+    def _fire_challenge(self, jpeg_bytes: bytes, event_id: int) -> None:
+        """Hand off to SecurityWatcher. Sync method; safe to call from
+        async context. Wrapped in try/except as a last-resort net."""
         try:
-            self._security.update_challenge_evidence(snap)
+            self._security.trigger_external_motion(
+                source="ring", jpeg_bytes=jpeg_bytes or None,
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"[ring] update_challenge_evidence raised: {exc}", file=sys.stderr)
+            print(f"[ring] trigger_external_motion raised for event "
+                  f"{event_id}: {exc}", file=sys.stderr)
 
     # ---------------------------------------------------------------------
     # Helpers.
