@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
-import httpx
+from src.http_util import http_get_with_retry
 
 
 # --- Anthropic tool definition ---------------------------------------------
@@ -93,12 +93,6 @@ _RAWG_BASE = "https://api.rawg.io/api"
 # Voice cap — Claude editorializes anyway, but we keep raw payloads short.
 _MAX_RESULTS = 8
 
-# Same defensive HTTP policy as weather.py / sports.py: 10s timeout, single
-# retry on transport errors only (timeouts / DNS / connection drops). HTTP
-# 4xx/5xx is returned immediately — those don't fix themselves.
-_HTTP_TIMEOUT_SEC = 10.0
-_RETRY_BACKOFF_SEC = 0.5
-
 
 # RAWG's platform IDs. Voice queries say "Switch" / "PS5" / "PlayStation 5",
 # not "187". This map normalizes those into RAWG's numeric IDs. Only commonly-
@@ -149,33 +143,11 @@ _PLATFORM_IDS: dict[str, str] = {
 }
 
 
-def _http_get_with_retry(
-    url: str, params: dict[str, Any] | None = None
-) -> httpx.Response | None:
-    """GET with one retry on transport errors. Returns None on final failure
-    or any non-2xx response. Caller checks for None."""
-    last_exc: Exception | None = None
-    for attempt in (1, 2):
-        try:
-            r = httpx.get(url, params=params, timeout=_HTTP_TIMEOUT_SEC)
-            r.raise_for_status()
-            return r
-        except httpx.HTTPStatusError as exc:
-            print(f"[games] HTTP {exc.response.status_code} on {url}", file=sys.stderr)
-            return None
-        except httpx.RequestError as exc:
-            last_exc = exc
-            if attempt == 1:
-                print(
-                    f"[games] {type(exc).__name__} on {url} — retrying in "
-                    f"{_RETRY_BACKOFF_SEC}s",
-                    file=sys.stderr,
-                )
-                time.sleep(_RETRY_BACKOFF_SEC)
-                continue
-            break
-    print(f"[games] gave up after retry: {last_exc}", file=sys.stderr)
-    return None
+# M43: the retry helper moved to src/http_util.py (it had been triplicated
+# across sports/weather/games — the rule-of-three extraction the M22 note
+# flagged). partial() pre-binds our log tag so every existing
+# _http_get_with_retry(url, params=...) call site below is unchanged.
+_http_get_with_retry = partial(http_get_with_retry, tag="games")
 
 
 def _api_key() -> str | None:

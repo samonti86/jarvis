@@ -16,11 +16,11 @@ cities, towns, and well-known regions.
 from __future__ import annotations
 
 import sys
-import time
 from datetime import datetime
+from functools import partial
 from typing import Any
 
-import httpx
+from src.http_util import http_get_with_retry
 
 
 # --- Anthropic tool definition ---------------------------------------------
@@ -73,43 +73,12 @@ WEATHER_TOOL = {
 _GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-# M19 hardening: Open-Meteo occasionally lags. We use a generous timeout and
-# one retry with brief backoff, but ONLY for transport-level failures
-# (timeouts / connection errors) — never for HTTP 4xx/5xx, which won't get
-# better with a retry and just waste the user's time.
-_HTTP_TIMEOUT_SEC = 10.0
-_RETRY_BACKOFF_SEC = 0.5
-
-
-def _http_get_with_retry(
-    url: str, params: dict[str, Any] | None = None
-) -> httpx.Response | None:
-    """GET with one retry on transport errors. Returns None on final failure
-    or on any non-2xx response. Caller checks for None."""
-    last_exc: Exception | None = None
-    for attempt in (1, 2):
-        try:
-            r = httpx.get(url, params=params, timeout=_HTTP_TIMEOUT_SEC)
-            r.raise_for_status()
-            return r
-        except httpx.HTTPStatusError as exc:
-            # 4xx/5xx — won't fix itself; don't retry.
-            print(f"[weather] HTTP {exc.response.status_code} on {url}", file=sys.stderr)
-            return None
-        except httpx.RequestError as exc:
-            # Timeout, connect error, DNS — worth one retry.
-            last_exc = exc
-            if attempt == 1:
-                print(
-                    f"[weather] {type(exc).__name__} on {url} — retrying in "
-                    f"{_RETRY_BACKOFF_SEC}s",
-                    file=sys.stderr,
-                )
-                time.sleep(_RETRY_BACKOFF_SEC)
-                continue
-            break
-    print(f"[weather] gave up after retry: {last_exc}", file=sys.stderr)
-    return None
+# M43: retry helper extracted to src/http_util.py (was triplicated across
+# sports/weather/games — the rule-of-three extraction the M22 note flagged).
+# partial() pre-binds the log tag so the _http_get_with_retry(...) call sites
+# below stay unchanged. The "transport errors only, never 4xx/5xx" policy and
+# the 10s timeout / 0.5s backoff defaults moved with it, unchanged.
+_http_get_with_retry = partial(http_get_with_retry, tag="weather")
 
 
 # WMO weather interpretation codes collapsed to voice-friendly phrases.

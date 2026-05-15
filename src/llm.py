@@ -66,6 +66,7 @@ from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.pc_shell import PC_SHELL_TOOL, execute_pc_shell
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
+from src.tmdb import TMDB_TOOL, execute_tmdb_tool
 from src.weather import WEATHER_TOOL, execute_weather_tool
 
 
@@ -104,7 +105,7 @@ Memory of past sessions:
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
 
-Live information (you have five tools — pick the right one):
+Live information (you have six tools — pick the right one):
 1. get_sports_info — for live scores, schedules, and recent results in major leagues
    (NFL, NBA, MLB, NHL, MLS, EPL, Champions League, NCAA football and basketball, WNBA,
    UFC, F1, PGA, ATP, WTA). ALWAYS prefer this over web_search for any sports query —
@@ -118,20 +119,31 @@ Live information (you have five tools — pick the right one):
    the user names a game they liked and wants recommendations. NOTE: this tool covers
    reference data only — it cannot see the user's personal library, trophies, or
    playtime, so don't claim it can.
-4. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
+4. get_movie_tv_info — for movies and TV shows: release and air dates, plot
+   summaries, cast, ratings, runtime, what's trending, and recommendations.
+   ALWAYS prefer this over web_search for general movie/TV info queries. Use
+   mode=details when the user asks about a specific title; mode=popular for
+   "what's trending"; mode=similar when the user names a film or show they
+   liked and wants recommendations. If a game shares its title with a film or
+   show adaptation, the user saying "the movie/show X" means THIS tool, not
+   get_game_info — don't infer from training which they meant. NOTE: reference
+   data only — it cannot see the user's personal Plex library, watchlist, or
+   ratings. For what the user actually owns or is watching, use the Plex tools,
+   not this.
+5. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
    the user names a particular site or document ("check ESPN for Giants news", "what
    does IGN say about Super Mario", "summarize this PDF at <url>"). You may chain
    web_search → web_fetch when you need to find a URL first, then read it in depth.
-5. web_search — for general info-finding when no specific source is named: news,
+6. web_search — for general info-finding when no specific source is named: news,
    market prices, recent releases, "who is the current X", anything that changes
    over time.
 
 Local PC control (you have five tools — pick the right one):
-6. pc_diagnostics — read-only LIVE telemetry on THIS Windows PC: CPU, RAM, disk,
+7. pc_diagnostics — read-only LIVE telemetry on THIS Windows PC: CPU, RAM, disk,
    processes, services, network, recent System event-log entries. Use for any
    "how is my PC doing", "what's slowing me down", "any recent errors", "is X
    service running" question. One-shot static snapshot. NEVER modifies state.
-7. pc_shell — investigate dynamically with ONE read-only Windows command from
+8. pc_shell — investigate dynamically with ONE read-only Windows command from
    a fixed allowlist (ipconfig, Get-NetAdapter, Get-NetRoute, Get-NetTCPConnection,
    netstat, arp, ping, tracert, Test-NetConnection, Resolve-DnsName, nslookup,
    Get-Process, Get-Service, Get-WinEvent, Get-CimInstance, systeminfo,
@@ -141,15 +153,15 @@ Local PC control (you have five tools — pick the right one):
    freely: ping → tracert → Resolve-DnsName is the classic network-debug
    sequence. Output is truncated; re-call with narrower filters if needed.
    NEVER modifies state — no confirmation needed.
-8. system_control — fixed allowlist of safe actions on THIS PC: open_app,
+9. system_control — fixed allowlist of safe actions on THIS PC: open_app,
    lock_workstation, volume_set, volume_mute, volume_unmute, screen_off,
    kill_process. Each action is individually scoped — there is NO arbitrary-
    command path.
-9. read_local_file — read a text file on THIS PC that the user points you at:
+10. read_local_file — read a text file on THIS PC that the user points you at:
    a config file, a log, a Dockerfile, ~/.ssh/config, an error log. Read-only.
    Whatever you read joins the conversation, so only read what the user asked
    about. Refuses binary files and private-key material.
-10. run_pc_diagnostics_collector — a DEEP snapshot: collects host / security /
+11. run_pc_diagnostics_collector — a DEEP snapshot: collects host / security /
    package / event-log data into a bundle of text files and returns their
    paths. Use for "run a full diagnostic", "deep system check", "collect
    everything for a support ticket", or follow-up troubleshooting that needs
@@ -179,7 +191,7 @@ Local-PC safety rules:
   depth or a ticket bundle.
 
 Vision (you can see — two tools):
-11. camera_snapshot — capture a still photo from the webcam and look at it:
+12. camera_snapshot — capture a still photo from the webcam and look at it:
     your eyes on the physical world. Use it whenever the user asks what you
     see, what's in the room, whether something is there or in a certain state
     ("is the package on the porch?", "did the pet get on the couch?", "is the
@@ -189,7 +201,7 @@ Vision (you can see — two tools):
     and remarking on it, not narrating a photo. Don't say "let me take a
     picture" — just look and report. If it comes back as an error string
     (camera in use, shutter closed), relay that plainly.
-12. screen_snapshot — capture the user's primary monitor and look at it:
+13. screen_snapshot — capture the user's primary monitor and look at it:
     your eyes on the DIGITAL world (what's on their PC). Use it whenever
     the user asks what's on their screen, asks you to read or explain
     something they're looking at ("what does this error mean?", "what is
@@ -204,6 +216,15 @@ Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
   training data. Even if a similar answer is in your "Recent conversations" memory or
   feels familiar from training, fetch again — the world has likely moved on.
+- Trust the user's noun for what something IS. "The movie X", "the show X", or
+  "the game X" → use the matching tool (get_movie_tv_info or get_game_info) for
+  X, even if you recall X as a different medium. The same title routinely spans
+  media — a game gets a film adaptation, a book becomes a series — and a new
+  release can post-date your knowledge cutoff. NEVER tell the user "X isn't a
+  movie" or "that's actually a game" from memory or training; that is exactly a
+  fetch-first case. Let the tool's result, not your prior knowledge, decide what
+  exists and what medium it is. Say it doesn't exist only if the tool, called
+  with the user's stated medium, returns nothing.
 - When the user names a specific website or asks about a PDF, prefer web_fetch (or
   web_search → web_fetch if you need to find the right URL on that site first).
 - Do NOT call tools for things that don't change: math, geography, definitions,
@@ -229,8 +250,8 @@ Media library (Plex):
   library, what's currently playing on their TVs/clients, or wants to control
   playback ("play X on the living room", "what's on my Plex right now?",
   "show me recently added films").
-- Do NOT use Plex tools for general movie/TV info — for that, web_search /
-  web_fetch are right. Plex tools are scoped to what the user owns.
+- Do NOT use Plex tools for general movie/TV info — for that, get_movie_tv_info
+  (or web_search / web_fetch) is right. Plex tools are scoped to what the user owns.
 - For voice replies, summarize Plex results briefly. Don't read full IDs, file
   paths, or long lists. If a search returns many matches, name a few and offer
   to narrow down."""
@@ -439,6 +460,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_sports_info":              _ClientTool(execute_sports_tool, "sports_tool"),
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
+    "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -544,7 +566,7 @@ def stream_response(
     ]
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
-        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL,
+        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,
