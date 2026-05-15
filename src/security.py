@@ -590,7 +590,7 @@ class SecurityWatcher:
 
     def update_challenge_evidence(self, jpeg_bytes: bytes) -> None:
         """Attach late-arriving evidence bytes to an active challenge.
-        Used by RingWatcher when its parallel snapshot fetch completes
+        For external camera integrations whose snapshot fetch completes
         AFTER the challenge prompt has already started playing. Silent
         no-op if no challenge is active, evidence is already set, or
         bytes are empty — first writer wins."""

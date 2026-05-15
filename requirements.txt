@@ -58,9 +58,3 @@ opencv-python-headless>=4.8
 # polling rate at <10% one-core utilization. MIT licensed.
 ultralytics>=8.4
 
-# Ring camera integration (M37) — async cloud API client for motion events
-# + snapshot fetch. Pure Python; pulls firebase-messaging + websockets as
-# transitive deps for the optional push-event channel. Auth tokens cached
-# to %LOCALAPPDATA%\Jarvis\ring_token.json after one-time setup via
-# setup_ring.py. See src/ring.py for the watcher.
-ring_doorbell>=0.9
