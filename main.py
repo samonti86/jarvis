@@ -697,7 +697,8 @@ def main() -> None:
     # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
     # M34 announce-only behavior) and the evidence directory (where
     # deterrent-fired triggering frames get saved as JPEGs).
-    # M38: Discord webhook URL (empty → no notification, M35 bluff only).
+    # M38: Discord webhook URL + SMTP credentials. Both channels fire in
+    # parallel on deterrent; either being blank simply disables that channel.
     # Reuse cameras.py's CAMERA_INDEX env reader so the watcher honors the
     # same override as camera_snapshot — otherwise users with CAMERA_INDEX
     # set get the right webcam for vision queries but the wrong one for
@@ -712,6 +713,11 @@ def main() -> None:
         passphrase=cfg.security_passphrase,
         evidence_dir=default_base_dir() / "security" / "events",
         discord_webhook_url=cfg.discord_webhook_url,
+        smtp_host=cfg.smtp_host,
+        smtp_port=cfg.smtp_port,
+        smtp_username=cfg.smtp_username,
+        smtp_password=cfg.smtp_password,
+        smtp_to=cfg.smtp_to,
     )
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`

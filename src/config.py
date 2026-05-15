@@ -30,6 +30,11 @@ class Config:
     stt_server_url: str        # M36 — HTTP URL of the GPU STT server (e.g. http://192.168.1.10:8000); blank = local CPU only
     stt_backend: str           # M36 — "auto" | "gpu" | "cpu"; auto = try GPU server first, fall back to CPU silently
     discord_webhook_url: str   # M38 — Discord webhook URL for security deterrent alerts; blank = no notification (M35 bluff only)
+    smtp_host: str             # M38 — SMTP server (default: Gmail). Email fires in parallel with Discord when both are configured.
+    smtp_port: int             # M38 — 587 = STARTTLS (default), 465 = implicit SSL
+    smtp_username: str         # M38 — SMTP login (typically the From address). Blank disables email path.
+    smtp_password: str         # M38 — for Gmail: a 16-char App Password, NOT the account password
+    smtp_to: str               # M38 — recipient address (comma-separated allowed). Blank disables email path.
 
 
 def load() -> Config:
@@ -53,4 +58,12 @@ def load() -> Config:
         stt_server_url=os.getenv("STT_SERVER_URL", "").strip().rstrip("/"),
         stt_backend=os.getenv("STT_BACKEND", "auto").strip().lower(),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com").strip(),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+        # Password may contain meaningful trailing/leading whitespace? Gmail
+        # App Passwords are alphanumeric 16-char strings — stripping is safe
+        # and protects against an accidental newline in the .env value.
+        smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
+        smtp_to=os.getenv("SMTP_TO", "").strip(),
     )

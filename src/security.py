@@ -184,6 +184,11 @@ class SecurityWatcher:
         passphrase: str = "",
         evidence_dir: Path | None = None,
         discord_webhook_url: str = "",
+        smtp_host: str = "",
+        smtp_port: int = 587,
+        smtp_username: str = "",
+        smtp_password: str = "",
+        smtp_to: str = "",
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
@@ -202,6 +207,15 @@ class SecurityWatcher:
         # Discord webhook URL for deterrent-time push notifications.
         # Empty string = no notification path (bluff + local evidence only).
         self._discord_webhook_url = discord_webhook_url
+        # SMTP email alert path. Fires in parallel with Discord when both are
+        # configured. Any of the required fields blank → email path disabled.
+        # Defensive check at fire-time mirrors the Discord pattern: missing
+        # creds → silent skip, never a noisy exception in the watcher thread.
+        self._smtp_host = smtp_host
+        self._smtp_port = smtp_port
+        self._smtp_username = smtp_username
+        self._smtp_password = smtp_password
+        self._smtp_to = smtp_to
 
         # Coordination primitives. _armed is the public state; _stop fires
         # when we need the watcher thread to wind down (overlaps with
@@ -721,6 +735,12 @@ class SecurityWatcher:
         # ping. Better to ship a text-only alert than to skip.
         if self._discord_webhook_url:
             self._send_discord_alert_async(jpeg_bytes, saved_path)
+        # SMTP email — same parallel fire-and-forget pattern. Both channels
+        # are independent: Discord rate-limit doesn't suppress email and vice
+        # versa. send_email_alert short-circuits if any required SMTP field
+        # is blank, so we just check the username as the cheap gate.
+        if self._smtp_username and self._smtp_to:
+            self._send_email_alert_async(jpeg_bytes, saved_path)
 
         # Flip the LOCKED indicator BEFORE the announce so the UI updates
         # immediately, not after the ~5s deterrent playback finishes.
@@ -749,6 +769,35 @@ class SecurityWatcher:
 
         threading.Thread(
             target=_worker, name="DiscordNotify", daemon=True
+        ).start()
+
+    def _send_email_alert_async(
+        self, jpeg_bytes: bytes, evidence_path: Path | None
+    ) -> None:
+        """Fire-and-forget SMTP email push on a daemon thread. Errors all
+        swallowed inside send_email_alert (same contract as Discord)."""
+        from src.notifications import send_email_alert
+
+        filename = evidence_path.name if evidence_path else "evidence.jpg"
+        # Capture the trigger timestamp now, on the watcher thread, so the
+        # email's body matches what the user just heard rather than the
+        # moment SMTP eventually completes (which can lag a second or two).
+        when = datetime.now()
+
+        def _worker():
+            send_email_alert(
+                self._smtp_host,
+                self._smtp_port,
+                self._smtp_username,
+                self._smtp_password,
+                self._smtp_to,
+                jpeg_bytes,
+                image_filename=filename,
+                when=when,
+            )
+
+        threading.Thread(
+            target=_worker, name="EmailNotify", daemon=True
         ).start()
 
     def _save_evidence_bytes(self, jpeg_bytes: bytes) -> Path | None:
