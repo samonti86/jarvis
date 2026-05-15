@@ -615,6 +615,13 @@ def main() -> None:
     # even when the laptop is off.
     plex_laptop_client = _try_connect_plex_laptop(cfg)
 
+    # M41: log elevation status to jarvis.log on every startup. Makes it
+    # trivial to grep "was this session elevated?" without digging through
+    # tool-call traces. The mutating verbs in system_control (M40 —
+    # flush_dns, restart_service) only work when this is True.
+    from src.autostart import is_admin as _is_admin  # noqa: PLC0415
+    print(f"[main] running elevated: {_is_admin()}")
+
     print("Jarvis ready. Tray icon active — left-click to show window. Say 'Hey Jarvis' to begin.\n")
 
     reset_event = threading.Event()
@@ -821,14 +828,31 @@ def main() -> None:
         except Exception as exc:
             print(f"[plex-laptop] close failed: {exc}", file=sys.stderr)
 
-    # Restart-Jarvis tray click sets ui.relaunch_requested. We defer the
-    # actual respawn until here so the mic + Plex MCP + SSH have all
-    # released their handles — the new instance starts on a clean slate.
-    if ui.relaunch_requested:
+    # Restart-Jarvis tray click sets ui.relaunch_mode. We defer the actual
+    # respawn until here so the mic + Plex MCP + SSH have all released
+    # their handles — the new instance starts on a clean slate.
+    #
+    # M41: tristate dispatch. "normal" uses subprocess.Popen (silent,
+    # always works). "elevated" uses ShellExecuteW(verb="runas") which
+    # fires UAC — if the user clicks No, no new instance starts and
+    # this process still exits (acceptable "occasional sudo" UX).
+    mode = ui.relaunch_mode
+    if mode is not None:
         try:
             from src import autostart
-            autostart.relaunch()
-            print("[main] relaunched detached Jarvis instance")
+            if mode == "elevated":
+                ok = autostart.relaunch_elevated()
+                if ok:
+                    print("[main] relaunched elevated Jarvis instance")
+                else:
+                    print(
+                        "[main] elevated relaunch was cancelled or failed — "
+                        "Jarvis will not restart",
+                        file=sys.stderr,
+                    )
+            else:  # "normal"
+                autostart.relaunch()
+                print("[main] relaunched detached Jarvis instance")
         except Exception as exc:
             print(f"[main] relaunch failed: {exc}", file=sys.stderr)
 

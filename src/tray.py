@@ -65,6 +65,7 @@ class JarvisTray:
         on_security_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
+        on_restart_elevated: Callable[[], None] | None = None,
         on_create_shortcut: Callable[[], None] | None = None,
         shutdown_event: threading.Event | None = None,
     ) -> None:
@@ -88,6 +89,7 @@ class JarvisTray:
         self._on_security_toggle = on_security_toggle
         self._on_enroll_face = on_enroll_face
         self._on_restart = on_restart
+        self._on_restart_elevated = on_restart_elevated
         self._on_create_shortcut = on_create_shortcut
 
         menu_items: list[pystray.MenuItem] = []
@@ -162,6 +164,20 @@ class JarvisTray:
             # mechanics; the relaunch itself fires from main() after worker
             # join, so the new instance doesn't fight the old one for the mic.
             menu_items.append(pystray.MenuItem("Restart Jarvis", self._handle_restart))
+        if on_restart_elevated is not None:
+            # M41: "Restart Jarvis (Administrator)" — only shown when the
+            # current process is NOT already elevated. No point offering an
+            # upgrade path when there's nothing to upgrade to; hiding the
+            # item also signals to the user, at-a-glance, that the current
+            # session already has SRE-grade powers. Same flag-and-defer
+            # plumbing as the normal restart; the only delta is that the
+            # final spawn uses ShellExecuteW(verb="runas"), which fires a
+            # UAC prompt. See autostart.relaunch_elevated().
+            from src.autostart import is_admin  # noqa: PLC0415 — defer to break import cycle
+            if not is_admin():
+                menu_items.append(pystray.MenuItem(
+                    "Restart Jarvis (Administrator)", self._handle_restart_elevated,
+                ))
         menu_items.append(pystray.MenuItem("Quit", self._handle_quit))
 
         self.icon = pystray.Icon(
@@ -210,6 +226,10 @@ class JarvisTray:
     def _handle_restart(self) -> None:
         if self._on_restart is not None:
             self._on_restart()
+
+    def _handle_restart_elevated(self) -> None:
+        if self._on_restart_elevated is not None:
+            self._on_restart_elevated()
 
     def _handle_create_shortcut(self) -> None:
         if self._on_create_shortcut is not None:

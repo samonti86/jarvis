@@ -22,8 +22,10 @@ straight at the venv is one less hop on launch.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -202,6 +204,23 @@ def create_desktop_shortcut() -> Path:
     return _DESKTOP_SHORTCUT_PATH
 
 
+def is_admin() -> bool:
+    """True if THIS process is running elevated (Windows "Run as
+    administrator"). Single source of truth for elevation status across
+    the codebase — system_control imports it for its mutating-verb
+    gates, tray.py for menu visibility, main.py for the startup log.
+
+    ctypes call is dirt cheap (~microseconds) so we don't bother caching
+    here; callers that hammer it can cache locally if they care."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        # AttributeError if shell32 surface ever changes; OSError on
+        # the off chance the syscall fails. Treat unknown as non-admin —
+        # that's the safe direction (mutating gates remain closed).
+        return False
+
+
 def relaunch() -> None:
     """Spawn a new silent-launcher Jarvis detached from this process.
 
@@ -226,3 +245,80 @@ def relaunch() -> None:
         close_fds=True,
         creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
     )
+
+
+def relaunch_elevated() -> bool:
+    """Spawn a new silent-launcher Jarvis under UAC elevation.
+
+    Mirrors `relaunch()` exactly except for the process-creation API:
+    `subprocess.Popen` can't elevate (Windows requires the "runas" shell
+    verb, which Popen doesn't expose), so we drop down to
+    `ShellExecuteW` directly. ShellExecuteW with `lpOperation="runas"`
+    is the canonical Windows API for "launch this program elevated" —
+    the same path Explorer uses for the right-click "Run as
+    administrator" menu. Triggers a UAC prompt; if the user clicks Yes,
+    the child process starts elevated. If No, ShellExecuteW returns a
+    value <=32 (typically 5 = SE_ERR_ACCESSDENIED) and the parent
+    process should log it without re-attempting.
+
+    Returns True on apparent success (UAC accepted, process launched),
+    False on UAC cancel or any other failure. Callers should invoke
+    this AFTER worker.join() — same mic-release reasoning as `relaunch`.
+
+    Note on return semantics: ShellExecuteW returns an HINSTANCE-coded
+    success indicator (>32 = OK). It does NOT block waiting for the
+    child; it returns as soon as the UAC + spawn handshake completes.
+    A True return therefore means "child was spawned" not "child is
+    healthy" — but that's fine because we're about to exit anyway.
+    """
+    if not _VENV_PYTHONW.exists() or not _LAUNCHER.exists():
+        print(
+            f"[autostart] relaunch_elevated failed: missing "
+            f"{_VENV_PYTHONW} or {_LAUNCHER}",
+            file=sys.stderr,
+        )
+        return False
+
+    # ShellExecuteW signature:
+    #   HINSTANCE ShellExecuteW(
+    #       HWND     hwnd,            # NULL = no parent window
+    #       LPCWSTR  lpOperation,     # "runas" triggers UAC
+    #       LPCWSTR  lpFile,          # the exe to launch
+    #       LPCWSTR  lpParameters,    # CLI args (the .pyw path)
+    #       LPCWSTR  lpDirectory,     # cwd for the new process
+    #       INT      nShowCmd         # SW_SHOWNORMAL = 1
+    #   );
+    # Return: HINSTANCE cast to int. >32 = success; <=32 = error code.
+    # We pass jarvis.pyw quoted so paths with spaces survive shell parsing
+    # inside the Windows API (which DOES tokenize lpParameters).
+    SW_SHOWNORMAL = 1
+    try:
+        # Cast to int explicitly — ShellExecuteW returns a 64-bit handle
+        # on 64-bit Windows but Python treats it as a regular int.
+        rc = int(ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            str(_VENV_PYTHONW),
+            f'"{_LAUNCHER}"',
+            str(_PROJECT_ROOT),
+            SW_SHOWNORMAL,
+        ))
+    except (AttributeError, OSError) as exc:
+        print(f"[autostart] ShellExecuteW raised: {exc}", file=sys.stderr)
+        return False
+
+    if rc > 32:
+        print(f"[autostart] relaunch_elevated: UAC accepted, child spawning (rc={rc})")
+        return True
+
+    # The common "user clicked No" path is rc=1223 (ERROR_CANCELLED) on
+    # modern Windows, but ShellExecuteW historically also returns
+    # SE_ERR_ACCESSDENIED (5) for the same cancel. Log whatever we got so
+    # the user / future-Claude can correlate against MSDN if it ever
+    # behaves oddly.
+    print(
+        f"[autostart] relaunch_elevated: UAC cancelled or failed (rc={rc}) — "
+        f"Jarvis will exit without restarting",
+        file=sys.stderr,
+    )
+    return False

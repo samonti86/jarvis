@@ -43,16 +43,13 @@ import psutil
 # So cache it once at module import. The mutating verbs (M40 — flush_dns,
 # restart_service) check this and fail loudly rather than discovering the
 # Access Denied from subprocess output.
-def _detect_admin() -> bool:
-    """True if this Jarvis process is running elevated. Defensive — any
-    failure to query the Windows API returns False (treat as non-admin)."""
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except (AttributeError, OSError):
-        return False
+#
+# M41: single source of truth for `is_admin()` lives in `src.autostart`
+# (alongside the elevated-relaunch helper that the tray uses). Importing
+# at module top is cheap — autostart has no expensive deps.
+from src.autostart import is_admin as _is_admin  # noqa: E402
 
-
-_IS_ADMIN: bool = _detect_admin()
+_IS_ADMIN: bool = _is_admin()
 
 
 # --- Anthropic tool definition ---------------------------------------------

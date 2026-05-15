@@ -67,12 +67,13 @@ class JarvisUI:
         # face_auth / cameras / announce are available in main.py) so the
         # tray menu can render before the dependency graph is complete.
         self._on_enroll_face: Callable[[], None] | None = None
-        # When True, main() should call autostart.relaunch() after the listen
-        # loop has joined + the active session is sealed. The tray's "Restart
-        # Jarvis" click flips this, then triggers the normal quit path — the
-        # actual spawn happens later in main(), AFTER the mic is released,
-        # so the new instance doesn't race the old one for the audio device.
-        self._relaunch_requested = False
+        # When non-None, main() should respawn Jarvis after the listen loop
+        # has joined + the active session is sealed. The tray's "Restart
+        # Jarvis" click flips this to "normal"; M41's "Restart Jarvis
+        # (Administrator)" flips it to "elevated". The actual spawn fires
+        # from main() AFTER the mic is released, so the new instance
+        # doesn't race the old one for the audio device.
+        self._relaunch_mode: str | None = None  # None | "normal" | "elevated"
 
     def set_on_reset(self, callback: Callable[[], None]) -> None:
         """Wire a reset callback. Called when the tray menu's Reset item fires."""
@@ -285,6 +286,7 @@ class JarvisUI:
             on_security_toggle=self._handle_toggle_security,
             on_enroll_face=self._handle_enroll_face,
             on_restart=self._handle_restart,
+            on_restart_elevated=self._handle_restart_elevated,
             on_create_shortcut=self._handle_create_shortcut,
             shutdown_event=self.shutdown,
         )
@@ -316,9 +318,17 @@ class JarvisUI:
 
     @property
     def relaunch_requested(self) -> bool:
-        """True if the user clicked 'Restart Jarvis'. main() reads this after
-        the worker has joined to decide whether to spawn a fresh instance."""
-        return self._relaunch_requested
+        """True if the user clicked any 'Restart Jarvis' variant. main()
+        reads this after the worker has joined to decide whether to spawn
+        a fresh instance. Use `relaunch_mode` for the specific variant."""
+        return self._relaunch_mode is not None
+
+    @property
+    def relaunch_mode(self) -> str | None:
+        """M41: which restart variant was requested. None = no restart,
+        'normal' = standard `autostart.relaunch()`, 'elevated' = UAC-prompt
+        `autostart.relaunch_elevated()`."""
+        return self._relaunch_mode
 
     def _handle_restart(self) -> None:
         """Tray callback: signal that this process should relaunch after it
@@ -327,9 +337,23 @@ class JarvisUI:
         microphone. Instead, mark the intent and trigger the normal quit
         path; main() picks up the flag after worker.join() and fires the
         actual relaunch from there."""
-        self._relaunch_requested = True
+        self._relaunch_mode = "normal"
         self.console.add_system_text("restarting Jarvis…")
         print("[ui] restart requested — will relaunch after shutdown completes")
+        self._handle_quit()
+
+    def _handle_restart_elevated(self) -> None:
+        """M41 tray callback: identical to `_handle_restart` except the mode
+        flag tells main() to use `autostart.relaunch_elevated()` (which
+        triggers UAC) instead of the standard `autostart.relaunch()`.
+
+        UAC cancel is handled in main() — if the user clicks No on the
+        Windows prompt, the current Jarvis still exits (it's already
+        shutting down by then) but no new instance starts. That's the
+        "occasional sudo" tradeoff documented in the M41 milestone."""
+        self._relaunch_mode = "elevated"
+        self.console.add_system_text("restarting Jarvis (Administrator)…")
+        print("[ui] elevated restart requested — UAC will fire after shutdown")
         self._handle_quit()
 
     def _handle_create_shortcut(self) -> None:
