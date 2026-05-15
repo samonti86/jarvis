@@ -189,6 +189,8 @@ class SecurityWatcher:
         smtp_username: str = "",
         smtp_password: str = "",
         smtp_to: str = "",
+        face_encoding_path: Path | None = None,
+        face_match_threshold: float = 0.5,
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
@@ -216,6 +218,13 @@ class SecurityWatcher:
         self._smtp_username = smtp_username
         self._smtp_password = smtp_password
         self._smtp_to = smtp_to
+        # M39: face-recognition auth path. Encoding is loaded lazily on
+        # activate() so re-enrollment between arm cycles takes effect
+        # without a Jarvis restart. None = face auth disabled (no path
+        # configured or no enrollment yet).
+        self._face_encoding_path = face_encoding_path
+        self._face_match_threshold = face_match_threshold
+        self._enrolled_face = None  # numpy (128,) array, set on activate()
 
         # Coordination primitives. _armed is the public state; _stop fires
         # when we need the watcher thread to wind down (overlaps with
@@ -382,17 +391,25 @@ class SecurityWatcher:
             # gives an intruder feedback to brute-force. Silent rejection.
             return False
 
-        # Match — resolve challenge as authenticated.
-        # M35-LOCKED: this path now handles BOTH the regular CHALLENGE
-        # clear and the LOCKED unlock. Both transitions look the same from
-        # here: flip _challenge_active to False, clear _locked, enter
-        # cooldown. The was_locked snapshot lets us update the UI
-        # indicator + log a different message for the lockout-cleared case.
+        return self._mark_authenticated("voice")
+
+    def _mark_authenticated(self, method: str) -> bool:
+        """Resolve an active CHALLENGE (or LOCKED) state. Shared by the
+        voice-passphrase path (try_authenticate) and the face-recognition
+        path (_try_face_auth). `method` is "voice" or "face" for logging.
+
+        Idempotent: if the challenge is no longer active (e.g. timer fired
+        between the auth event and our taking the lock), returns True
+        without announcing or re-firing UI callbacks.
+        """
+        # M35-LOCKED: handles BOTH the regular CHALLENGE clear and the
+        # LOCKED unlock. Both transitions look the same from here: flip
+        # _challenge_active to False, clear _locked, enter cooldown. The
+        # was_locked snapshot lets us update the UI indicator + log a
+        # different message for the lockout-cleared case.
         with self._challenge_lock:
             if not self._challenge_active:
-                # Already resolved (timer fired between transcript end and
-                # our taking the lock — pre-LOCKED behavior). Idempotent;
-                # don't announce twice.
+                # Already resolved — idempotent, don't announce twice.
                 return True
             was_locked = self._locked
             self._challenge_active = False
@@ -401,15 +418,34 @@ class SecurityWatcher:
             self._challenge_evidence_bytes = b""  # no longer needed
 
         if was_locked:
-            print("[security] LOCKED state cleared by passphrase — back to ARMED+cooldown",
-                  file=sys.stderr)
+            print(f"[security] LOCKED state cleared by {method} auth — "
+                  f"back to ARMED+cooldown", file=sys.stderr)
             # UI: clear the 🔒 LOCKED indicator. ARMED indicator stays on
             # since the watcher is still armed.
             self._safe_call(self._on_locked_changed, False,
                             label="on_locked_changed(False)")
+        else:
+            print(f"[security] CHALLENGE cleared by {method} auth",
+                  file=sys.stderr)
 
-        self._safe_call(self._announce, "Welcome back, sir.", label="welcome-back announce")
+        self._safe_call(self._announce, "Welcome back, sir.",
+                        label=f"welcome-back ({method})")
         return True
+
+    def _try_face_auth(self, frame) -> bool:
+        """During an active CHALLENGE, check the current frame for the
+        enrolled face. Returns True if a match cleared the challenge,
+        False otherwise. Never raises (face_auth.verify_frame is
+        defensive-on-import-failure).
+
+        Frame is a BGR ndarray straight from the watcher's grab — same
+        format _detect_person consumes, so no extra conversion."""
+        from src import face_auth  # noqa: PLC0415 — defer until needed
+        if face_auth.verify_frame(
+            frame, self._enrolled_face, threshold=self._face_match_threshold,
+        ):
+            return self._mark_authenticated("face")
+        return False
 
     def activate(self) -> None:
         """Idempotent: arming an already-armed system is a no-op (no second
@@ -420,6 +456,20 @@ class SecurityWatcher:
         self._stop.clear()
         self._armed_at = time.monotonic()
         self._person_present = False
+        # M39: refresh the enrolled face encoding from disk at each arm.
+        # Cheap (~1ms numpy load) and picks up re-enrollment without a
+        # Jarvis restart. None on any failure (no path configured, no
+        # enrollment yet, corrupt file) — face auth path is just skipped.
+        self._enrolled_face = None
+        if self._face_encoding_path is not None:
+            from src import face_auth  # noqa: PLC0415 — defer the ~100 MB import
+            self._enrolled_face = face_auth.load_encoding(self._face_encoding_path)
+            if self._enrolled_face is not None:
+                print("[security] face auth enabled — enrolled encoding loaded",
+                      file=sys.stderr)
+            else:
+                print("[security] face auth disabled — no enrolled encoding",
+                      file=sys.stderr)
         self._safe_call(self._on_armed_changed, True, label="on_armed_changed(True)")
 
         # Announce BEFORE spawning the watcher so the user hears the
@@ -507,6 +557,17 @@ class SecurityWatcher:
                     if self._stop.wait(_POLL_SECONDS):
                         return
                     continue
+
+                # M39: during a CHALLENGE (or LOCKED) state, also try face
+                # auth on the frame. Match → resolve like voice passphrase.
+                # Cheap when no challenge is active (the bool short-circuits
+                # before face_recognition runs). Skips YOLO this cycle on
+                # match — cooldown handles the next cycle.
+                if self._challenge_active and self._enrolled_face is not None:
+                    if self._try_face_auth(frame):
+                        if self._stop.wait(_POLL_SECONDS):
+                            return
+                        continue
 
                 person_detected = self._detect_person(frame)
                 now = time.monotonic()

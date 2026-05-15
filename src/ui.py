@@ -63,6 +63,10 @@ class JarvisUI:
         self._security_activate: Callable[[], None] | None = None
         self._security_deactivate: Callable[[], None] | None = None
         self._security_is_armed: Callable[[], bool] | None = None
+        # M39: face-enrollment trigger. Wired post-construction (after
+        # face_auth / cameras / announce are available in main.py) so the
+        # tray menu can render before the dependency graph is complete.
+        self._on_enroll_face: Callable[[], None] | None = None
         # When True, main() should call autostart.relaunch() after the listen
         # loop has joined + the active session is sealed. The tray's "Restart
         # Jarvis" click flips this, then triggers the normal quit path — the
@@ -212,6 +216,18 @@ class JarvisUI:
         self._security_deactivate = on_deactivate
         self._security_is_armed = is_armed
 
+    def set_on_enroll_face(self, callback: Callable[[], None]) -> None:
+        """Wire the tray's 'Enroll my face' menu callback. main.py calls this
+        after the dependency graph (announce + cameras + face_auth) is wired."""
+        self._on_enroll_face = callback
+
+    def _handle_enroll_face(self) -> None:
+        """Tray callback. Runs on pystray's thread; the actual orchestration
+        (announce → capture → enroll → announce) is non-blocking and runs
+        on the Announcer thread via on_done."""
+        if self._on_enroll_face is not None:
+            self._on_enroll_face()
+
     def _handle_toggle_security(self) -> None:
         """Tray callback: flip armed state via the wired SecurityWatcher.
         Same code path as the voice intent parser — watcher is idempotent."""
@@ -267,6 +283,7 @@ class JarvisUI:
             on_engineer_toggle=self._handle_toggle_engineer,
             security_enabled=self._security_is_armed_or_false,
             on_security_toggle=self._handle_toggle_security,
+            on_enroll_face=self._handle_enroll_face,
             on_restart=self._handle_restart,
             on_create_shortcut=self._handle_create_shortcut,
             shutdown_event=self.shutdown,

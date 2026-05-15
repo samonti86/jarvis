@@ -168,6 +168,7 @@ def listen_loop(
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
     security_watcher: "SecurityWatcher | None" = None,
+    on_enroll_face: "Callable[[], None] | None" = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -417,6 +418,18 @@ def listen_loop(
                     print(f"[text-input] security.handle_transcript raised: {exc}",
                           file=sys.stderr)
 
+            # M39: typed "enroll my face" — same dispatch as the voice path.
+            # Uses the on_enroll_face kwarg (wired by main()) rather than a
+            # bare name — _trigger_face_enrollment lives in main()'s scope,
+            # not listen_loop's.
+            if not attachments and on_enroll_face is not None:
+                from src.face_auth import matches_enroll_intent  # noqa: PLC0415
+                if matches_enroll_intent(text):
+                    ui.add_user_text(text, "en")
+                    on_enroll_face()
+                    ui.set_state(State.IDLE)
+                    continue
+
             ui.set_state(State.THINKING)
             try:
                 # Hardcoded 'en' for now — Claude still replies in the input's
@@ -505,6 +518,18 @@ def listen_loop(
                     except Exception as exc:
                         print(f"[main] security.handle_transcript raised: {exc}",
                               file=sys.stderr)
+
+                # M39: "enroll my face" / "remember my face" intent. Checked
+                # AFTER security so a challenge-time utterance can't be
+                # hijacked into an enrollment; BEFORE Claude so the LLM
+                # doesn't try to fulfill the intent with the wrong tool.
+                if on_enroll_face is not None:
+                    from src.face_auth import matches_enroll_intent  # noqa: PLC0415
+                    if matches_enroll_intent(transcript.text):
+                        ui.add_user_text(transcript.text, transcript.language)
+                        on_enroll_face()
+                        ui.set_state(State.IDLE)
+                        continue
 
                 process_question(transcript.text, transcript.language)
     finally:
@@ -718,7 +743,28 @@ def main() -> None:
         smtp_username=cfg.smtp_username,
         smtp_password=cfg.smtp_password,
         smtp_to=cfg.smtp_to,
+        # M39: face-recognition auth path. Encoding (if enrolled) lives
+        # alongside the deterrent evidence at %LOCALAPPDATA%/Jarvis/security/.
+        # SecurityWatcher loads it lazily on each activate() so re-enrollment
+        # mid-session takes effect without a restart.
+        face_encoding_path=default_base_dir() / "security" / "face_encoding.npy",
+        face_match_threshold=cfg.face_match_threshold,
     )
+
+    # M39: face-enrollment trigger. Shared by the tray menu "Enroll my face"
+    # AND the voice intent ("Jarvis, enroll my face"). Non-blocking — queues
+    # the announce prompt and returns; capture + enrollment run later on the
+    # Announcer thread via on_done. Both triggers reach the same flow.
+    def _trigger_face_enrollment() -> None:
+        from src import face_auth as _face_auth  # noqa: PLC0415 — lazy
+        from src import cameras as _cameras  # noqa: PLC0415
+        _face_auth.run_voice_enrollment(
+            _announce,
+            _cameras.capture_frames,
+            default_base_dir() / "security" / "face_encoding.npy",
+        )
+
+    ui.set_on_enroll_face(_trigger_face_enrollment)
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`
     # callback re-evaluates each menu open, so this late wiring is fine.
@@ -731,6 +777,7 @@ def main() -> None:
     worker = threading.Thread(
         target=listen_loop,
         args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
+        kwargs={"on_enroll_face": _trigger_face_enrollment},
         daemon=True,
     )
     worker.start()

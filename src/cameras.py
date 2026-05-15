@@ -142,3 +142,71 @@ def execute_camera_snapshot(params: dict) -> str | list[dict]:
         image_block(jpg, "image/jpeg"),
         {"type": "text", "text": f"Live webcam snapshot, captured just now ({when})."},
     ]
+
+
+def capture_frames(n: int, interval_seconds: float = 0.5):
+    """Open the configured webcam once, capture `n` frames spaced by
+    `interval_seconds`, release. Returns a list of BGR ndarrays on success
+    or None on any error (camera busy, cv2 missing, black frames, etc.).
+
+    Used by face_auth enrollment — capturing N frames in one camera-open
+    cycle (instead of N independent open/close cycles) saves ~3-4s of
+    DirectShow init per frame, and avoids the "in-use LED flickers N times"
+    UX. Same warmup + black-frame guard as execute_camera_snapshot.
+
+    Never raises — all failures become a None return with a log line.
+    """
+    try:
+        import cv2  # type: ignore
+        import time as _time
+    except ImportError:
+        print("[cameras] capture_frames: cv2 not installed", file=sys.stderr)
+        return None
+
+    index = _camera_index()
+    cap = None
+    frames: list = []
+    try:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            print(f"[cameras] capture_frames: couldn't open device {index}",
+                  file=sys.stderr)
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, _CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _CAPTURE_HEIGHT)
+
+        # Same warmup as execute_camera_snapshot — discard the dark/stale
+        # first frames the C920e emits before auto-exposure settles.
+        for _ in range(_WARMUP_FRAMES):
+            cap.read()
+
+        for i in range(n):
+            ok, f = cap.read()
+            if not ok or f is None:
+                print(f"[cameras] capture_frames: frame {i} read failed",
+                      file=sys.stderr)
+                continue
+            if float(f.mean()) < _BLACK_FRAME_MEAN:
+                # Almost certainly the privacy shutter closed mid-capture.
+                # Skip this frame; let the others proceed.
+                print(f"[cameras] capture_frames: frame {i} too dark, skipped",
+                      file=sys.stderr)
+                continue
+            frames.append(f)
+            # Sleep BETWEEN frames, not after the last — saves interval_seconds
+            # on the total wall-clock time.
+            if i < n - 1:
+                _time.sleep(interval_seconds)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        print(f"[cameras] capture_frames failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return None
+    finally:
+        if cap is not None:
+            cap.release()
+
+    if not frames:
+        return None
+    print(f"[cameras] capture_frames: got {len(frames)}/{n} frames",
+          file=sys.stderr)
+    return frames

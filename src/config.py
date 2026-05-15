@@ -35,6 +35,7 @@ class Config:
     smtp_username: str         # M38 — SMTP login (typically the From address). Blank disables email path.
     smtp_password: str         # M38 — for Gmail: a 16-char App Password, NOT the account password
     smtp_to: str               # M38 — recipient address (comma-separated allowed). Blank disables email path.
+    face_match_threshold: float  # M39 — max Euclidean distance for a face match. 0.5 = security-grade strict; 0.6 = face_recognition's permissive default.
 
 
 def load() -> Config:
@@ -66,4 +67,5 @@ def load() -> Config:
         # and protects against an accidental newline in the .env value.
         smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
         smtp_to=os.getenv("SMTP_TO", "").strip(),
+        face_match_threshold=float(os.getenv("JARVIS_FACE_MATCH_THRESHOLD", "0.5")),
     )
