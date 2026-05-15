@@ -28,11 +28,31 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 import psutil
+
+
+# --- Elevation status ------------------------------------------------------
+# Admin status is fixed for the life of a process — Windows decides at
+# launch whether you're elevated and never changes its mind mid-session.
+# So cache it once at module import. The mutating verbs (M40 — flush_dns,
+# restart_service) check this and fail loudly rather than discovering the
+# Access Denied from subprocess output.
+def _detect_admin() -> bool:
+    """True if this Jarvis process is running elevated. Defensive — any
+    failure to query the Windows API returns False (treat as non-admin)."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+_IS_ADMIN: bool = _detect_admin()
 
 
 # --- Anthropic tool definition ---------------------------------------------
@@ -41,13 +61,18 @@ SYSTEM_CONTROL_TOOL = {
     "description": (
         "Control THIS Windows PC with a fixed allowlist of safe actions: "
         "open an app, lock the workstation, set or mute system volume, "
-        "turn off the display, or kill a running process. "
-        "IMPORTANT for kill_process: you MUST first ask the user to confirm "
-        "in plain language ('Confirm: terminate chrome.exe?'), wait for "
-        "their explicit yes, THEN call this tool with confirmed=true. "
-        "Other actions (open_app, lock, volume, screen_off) are low-impact "
-        "and can run without explicit confirmation, but always announce "
-        "what you're about to do."
+        "turn off the display, kill a running process, flush the DNS "
+        "resolver cache, or restart a Windows service. "
+        "IMPORTANT for the mutating actions (kill_process, flush_dns, "
+        "restart_service): you MUST first ask the user to confirm in "
+        "plain language ('Confirm: flush the DNS cache?' / 'Confirm: "
+        "restart the Spooler service?'), wait for their explicit yes, "
+        "THEN call this tool with confirmed=true. flush_dns and "
+        "restart_service additionally require Jarvis to be running as "
+        "Administrator — the tool returns a clear error if not, which "
+        "you should relay to the user. Other actions (open_app, lock, "
+        "volume, screen_off) are low-impact and can run without explicit "
+        "confirmation, but always announce what you're about to do."
     ),
     "input_schema": {
         "type": "object",
@@ -58,6 +83,7 @@ SYSTEM_CONTROL_TOOL = {
                     "open_app", "lock_workstation",
                     "volume_set", "volume_mute", "volume_unmute",
                     "screen_off", "kill_process",
+                    "flush_dns", "restart_service",
                 ],
             },
             "target": {
@@ -67,6 +93,9 @@ SYSTEM_CONTROL_TOOL = {
                     "calculator, file explorer, vs code, terminal, task "
                     "manager, settings, control panel, powershell, cmd). "
                     "For kill_process: process name ('chrome.exe' or 'chrome'). "
+                    "For restart_service: the Windows service name as it "
+                    "appears in services.msc (e.g. 'Spooler', 'PlexService', "
+                    "'WSearch'). Must match [A-Za-z0-9._-]{1,128}. "
                     "Ignored for other actions."
                 ),
             },
@@ -79,9 +108,10 @@ SYSTEM_CONTROL_TOOL = {
             "confirmed": {
                 "type": "boolean",
                 "description": (
-                    "Required true for kill_process — only set this AFTER the "
-                    "user has explicitly confirmed in conversation. The tool "
-                    "rejects kill_process without it. Ignored for other actions."
+                    "Required true for kill_process, flush_dns, and "
+                    "restart_service — only set this AFTER the user has "
+                    "explicitly confirmed in conversation. The tool rejects "
+                    "those actions without it. Ignored for other actions."
                 ),
             },
         },
@@ -321,6 +351,148 @@ def _do_kill_process(target: str, confirmed: bool) -> str:
     return " ".join(parts)
 
 
+def _do_flush_dns(confirmed: bool) -> str:
+    """Run `ipconfig.exe /flushdns`. Requires confirmed=true AND admin.
+
+    Why ipconfig and not the PowerShell `Clear-DnsClientCache` cmdlet:
+    they do effectively the same thing on Windows 10/11 (both invoke the
+    DnsApi flush via the same RPC), but ipconfig.exe is older, smaller,
+    and always present — `Clear-DnsClientCache` lives in a PowerShell
+    module that has occasionally broken across Windows updates. ipconfig
+    is the "always works" path.
+    """
+    if not confirmed:
+        return (
+            "flush_dns requires explicit user confirmation. Ask the user "
+            "to confirm flushing the DNS resolver cache, then call this "
+            "tool again with confirmed=true."
+        )
+    if not _IS_ADMIN:
+        return (
+            "Flushing the DNS cache requires Jarvis to be running as "
+            "Administrator, sir. Restart Jarvis from an elevated prompt "
+            "and try again."
+        )
+
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["ipconfig.exe", "/flushdns"],
+            capture_output=True, text=True, timeout=20, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[system_control] flush_dns timed out after 20s", file=sys.stderr)
+        return "DNS flush timed out after 20 seconds."
+    except (OSError, FileNotFoundError) as exc:
+        print(f"[system_control] flush_dns spawn failed: {exc}", file=sys.stderr)
+        return f"Could not run ipconfig: {exc}"
+
+    elapsed = time.monotonic() - started
+    rc = result.returncode
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    print(
+        f"[system_control] flush_dns exit={rc} in {elapsed:.2f}s",
+        file=sys.stderr,
+    )
+    if rc != 0:
+        # Non-zero exit despite us being admin is unusual — surface
+        # whatever ipconfig said so Claude can paraphrase to the user.
+        return f"DNS flush failed (exit {rc}). {stderr or stdout}".strip()
+    return "DNS resolver cache flushed."
+
+
+# Service-name validator. Windows service names are alphanumeric plus a
+# handful of separators in practice (Spooler, PlexService, WSearch,
+# Themes, RpcSs, w3svc, MSSQL$SQLEXPRESS — that $ is the only common
+# special char and we exclude it deliberately to avoid PowerShell
+# expansion surprises; users with named SQL instances can request that
+# later). 128-char cap mirrors the documented Windows SCM limit.
+_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _do_restart_service(target: str, confirmed: bool) -> str:
+    """Run `Restart-Service -Name <target>` via PowerShell. Requires
+    confirmed=true AND admin AND a service name that matches the regex.
+
+    PowerShell (rather than `net stop` + `net start` or `sc.exe`):
+    Restart-Service handles dependent services correctly, propagates
+    errors as exceptions with usable messages, and the -ErrorAction Stop
+    + try/catch idiom lets us exit non-zero on failure so we can
+    distinguish "service not found" from "denied" from "succeeded."
+    """
+    if not target:
+        return "Service name required for restart_service."
+    if not _SERVICE_NAME_RE.match(target):
+        # Reject anything with spaces, quotes, semicolons, pipes,
+        # backticks, ampersands, $, etc. before it ever reaches PowerShell.
+        # Validation IS the security boundary — same principle as pc_shell.
+        return (
+            f"Service name '{target}' contains invalid characters. "
+            f"Names must match {_SERVICE_NAME_RE.pattern}."
+        )
+    if not confirmed:
+        return (
+            f"restart_service requires explicit user confirmation. Ask the "
+            f"user to confirm restarting the '{target}' service, then call "
+            f"this tool again with confirmed=true."
+        )
+    if not _IS_ADMIN:
+        return (
+            "Restarting a Windows service requires Jarvis to be running as "
+            "Administrator, sir. Restart Jarvis from an elevated prompt "
+            "and try again."
+        )
+
+    # -NoProfile skips $PROFILE.ps1 (faster, deterministic). The Restart-
+    # Service cmdlet by default doesn't fail loudly when the service is
+    # missing or denied — `-ErrorAction Stop` promotes those to terminating
+    # errors that our try/catch surfaces, and `exit 1` makes the subprocess
+    # exit non-zero so we know to look at stderr.
+    ps_script = (
+        f"try {{ Restart-Service -Name '{target}' -ErrorAction Stop; "
+        f"Write-Output 'Restarted {target}.' }} "
+        f"catch {{ Write-Error $_.Exception.Message; exit 1 }}"
+    )
+
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[system_control] restart_service '{target}' timed out after 30s",
+            file=sys.stderr,
+        )
+        return f"Restarting '{target}' timed out after 30 seconds."
+    except (OSError, FileNotFoundError) as exc:
+        print(
+            f"[system_control] restart_service '{target}' spawn failed: {exc}",
+            file=sys.stderr,
+        )
+        return f"Could not run PowerShell: {exc}"
+
+    elapsed = time.monotonic() - started
+    rc = result.returncode
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    print(
+        f"[system_control] restart_service '{target}' exit={rc} in {elapsed:.2f}s",
+        file=sys.stderr,
+    )
+    if rc != 0:
+        # PowerShell error wraps the SCM error — typical messages: "Cannot
+        # find any service with service name 'foo'.", "Cannot open <name>
+        # service on computer '.'." (the denied-access shape). Pass it
+        # through so the user knows whether the name was wrong or whether
+        # something else blocked it.
+        msg = stderr or stdout or "no output"
+        return f"Could not restart '{target}': {msg}"
+    return stdout or f"Restarted {target}."
+
+
 def execute_system_control_tool(params: dict) -> str:
     """Run the tool. Always returns a string — never raises."""
     action = (params.get("action") or "").lower().strip()
@@ -343,6 +515,10 @@ def execute_system_control_tool(params: dict) -> str:
             return _do_screen_off()
         if action == "kill_process":
             return _do_kill_process(target, confirmed)
+        if action == "flush_dns":
+            return _do_flush_dns(confirmed)
+        if action == "restart_service":
+            return _do_restart_service(target, confirmed)
         return f"Unknown action '{action}'."
     except Exception as exc:  # noqa: BLE001 — defensive last-resort net
         print(f"[system_control] {action} raised: {exc}", file=sys.stderr)
