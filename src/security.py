@@ -43,7 +43,6 @@ become log lines, never raise through the watcher's thread boundary.
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 import threading
@@ -245,9 +244,9 @@ class SecurityWatcher:
         # so the deterrent path can save them without a re-grab (which
         # would capture the moment AFTER the 15s timeout, missing the
         # actual triggering view). Local YOLO path encodes from numpy
-        # at entry; external camera paths (Ring) supply pre-encoded bytes
-        # directly. Either way, one in-memory copy lives until the
-        # challenge resolves.
+        # at entry; external camera integrations supply pre-encoded
+        # bytes directly. Either way, one in-memory copy lives until
+        # the challenge resolves.
         self._challenge_evidence_bytes: bytes = b""
 
         # Lazy-loaded YOLO. Held across activate/deactivate cycles so the
@@ -385,7 +384,7 @@ class SecurityWatcher:
             self._challenge_active = False
             self._locked = False
             self._cooldown_until = time.monotonic() + _CHALLENGE_COOLDOWN_SECONDS
-            self._challenge_evidence_frame = None  # don't need it anymore
+            self._challenge_evidence_bytes = b""  # no longer needed
 
         if was_locked:
             print("[security] LOCKED state cleared by passphrase — back to ARMED+cooldown",
@@ -439,7 +438,7 @@ class SecurityWatcher:
         # resolved by user authority. Same for LOCKED clear.
         with self._challenge_lock:
             self._challenge_active = False
-            self._challenge_evidence_frame = None
+            self._challenge_evidence_bytes = b""
             was_locked = self._locked
             self._locked = False
         self._safe_call(self._on_armed_changed, False, label="on_armed_changed(False)")
@@ -540,34 +539,30 @@ class SecurityWatcher:
     def trigger_external_motion(
         self, source: str, jpeg_bytes: bytes | None = None,
     ) -> None:
-        """Public entry for an external camera (e.g. Ring) that detected
+        """Public entry for an external camera integration that detected
         motion. Feeds into the same challenge/deterrent state machine as
         local YOLO detection. Honors armed-state, cooldown, and the "one
         challenge at a time" rule — the watcher decides whether to act.
 
         Callers can pass jpeg_bytes=None and follow up with
-        update_challenge_evidence() once a late-arriving snapshot finishes
-        downloading — useful for Ring where snapshot fetch can take 3-9s
-        but we want the challenge prompt to fire immediately."""
+        update_challenge_evidence() once a late-arriving snapshot
+        finishes downloading — useful when the camera's snapshot API
+        is slow but we want the challenge prompt to fire immediately."""
         if not self._armed.is_set():
             return
         self._enter_challenge(jpeg_bytes or b"", source=source, now=time.monotonic())
 
     def verify_person(self, jpeg_bytes: bytes) -> bool | None:
         """Decode JPEG bytes and run the same person-detection filter as
-        the local Logi watcher (class==person + conf>=0.5 + bbox height
-        >=30% of frame). Returns True if person confirmed, False if the
-        image is clear-of-people (pet / pet / nothing), None if we
-        couldn't make a determination (cv2 missing, decode failure,
-        model unavailable, empty bytes).
+        the local Logi watcher (class==person + conf>=threshold + bbox
+        height >=30% of frame). Returns True if a person is confirmed,
+        False if the image is clear of people (pet / pet / nothing), or
+        None if we couldn't make a determination (cv2 missing, decode
+        failure, model unavailable, empty bytes).
 
         Callers should treat None as "unknown" and decide whether to
         fail open (fire alert) or fail closed (skip) based on context.
-        Ring's _fire_alert fails OPEN — better to challenge an
-        unverifiable event than miss a real intruder.
-
-        Lazy-loads YOLO if not already loaded (so a Ring-armed-only
-        session can use this before the Logi watcher does)."""
+        Lazy-loads YOLO if not already in memory."""
         if not jpeg_bytes:
             return None
         try:
@@ -630,11 +625,11 @@ class SecurityWatcher:
 
         with self._challenge_lock:
             if self._challenge_active:
-                # Already in a challenge — second camera firing on the same
-                # person (Logi + Ring co-firing the same walk-through is the
-                # common case). Log so it's visible which camera won the
-                # race; otherwise the user only sees one source name and
-                # wonders if the other camera fired at all.
+                # Already in a challenge — a second source firing on the
+                # same person (e.g. an external camera + local YOLO both
+                # seeing the same walk-through). Log so the suppression
+                # is visible; otherwise the user only sees one source
+                # name and wonders if the other one fired at all.
                 print(f"[security] motion ({source}) suppressed — challenge "
                       f"already active from prior source", file=sys.stderr)
                 return
@@ -717,14 +712,13 @@ class SecurityWatcher:
             print("[security] no JPEG bytes to save (snapshot was empty)",
                   file=sys.stderr)
 
-        # Discord notification on a daemon thread so a slow POST doesn't delay
-        # the spoken deterrent or the LOCKED transition. ALWAYS fire if the
-        # webhook is configured — send_discord_alert handles empty image_bytes
-        # gracefully (sends text-only). Skipping Discord because Ring's
-        # snapshot fetch returned empty bytes (which happens occasionally on
-        # back-to-back motion events) means the user loses the most valuable
-        # part of the security system: the phone push. Better to ship the
-        # alert without an image than to skip it.
+        # Discord notification on a daemon thread so a slow POST doesn't
+        # delay the spoken deterrent or the LOCKED transition. ALWAYS
+        # fire if the webhook is configured — send_discord_alert handles
+        # empty image_bytes gracefully (sends a text-only message).
+        # Skipping the push because the snapshot was empty would mean
+        # losing the most valuable part of the alert system: the phone
+        # ping. Better to ship a text-only alert than to skip.
         if self._discord_webhook_url:
             self._send_discord_alert_async(jpeg_bytes, saved_path)
 
