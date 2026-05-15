@@ -59,13 +59,16 @@ SYSTEM_CONTROL_TOOL = {
         "Control THIS Windows PC with a fixed allowlist of safe actions: "
         "open an app, lock the workstation, set or mute system volume, "
         "turn off the display, kill a running process, flush the DNS "
-        "resolver cache, or restart a Windows service. "
+        "resolver cache, restart a Windows service, or cycle the DHCP "
+        "lease (release + renew). "
         "IMPORTANT for the mutating actions (kill_process, flush_dns, "
-        "restart_service): you MUST first ask the user to confirm in "
-        "plain language ('Confirm: flush the DNS cache?' / 'Confirm: "
-        "restart the Spooler service?'), wait for their explicit yes, "
-        "THEN call this tool with confirmed=true. flush_dns and "
-        "restart_service additionally require Jarvis to be running as "
+        "restart_service, dhcp_cycle): you MUST first ask the user to "
+        "confirm in plain language ('Confirm: flush the DNS cache?' / "
+        "'Confirm: restart the Spooler service?' / 'Confirm: release "
+        "and renew the DHCP lease? This briefly drops network "
+        "connectivity.'), wait for their explicit yes, THEN call this "
+        "tool with confirmed=true. flush_dns, restart_service, and "
+        "dhcp_cycle additionally require Jarvis to be running as "
         "Administrator — the tool returns a clear error if not, which "
         "you should relay to the user. Other actions (open_app, lock, "
         "volume, screen_off) are low-impact and can run without explicit "
@@ -80,7 +83,7 @@ SYSTEM_CONTROL_TOOL = {
                     "open_app", "lock_workstation",
                     "volume_set", "volume_mute", "volume_unmute",
                     "screen_off", "kill_process",
-                    "flush_dns", "restart_service",
+                    "flush_dns", "restart_service", "dhcp_cycle",
                 ],
             },
             "target": {
@@ -105,10 +108,11 @@ SYSTEM_CONTROL_TOOL = {
             "confirmed": {
                 "type": "boolean",
                 "description": (
-                    "Required true for kill_process, flush_dns, and "
-                    "restart_service — only set this AFTER the user has "
-                    "explicitly confirmed in conversation. The tool rejects "
-                    "those actions without it. Ignored for other actions."
+                    "Required true for kill_process, flush_dns, "
+                    "restart_service, and dhcp_cycle — only set this "
+                    "AFTER the user has explicitly confirmed in "
+                    "conversation. The tool rejects those actions "
+                    "without it. Ignored for other actions."
                 ),
             },
         },
@@ -399,6 +403,104 @@ def _do_flush_dns(confirmed: bool) -> str:
     return "DNS resolver cache flushed."
 
 
+def _do_dhcp_cycle(confirmed: bool) -> str:
+    """Release + renew all DHCP-managed adapters in sequence. Requires
+    confirmed=true AND admin.
+
+    Why one combined verb rather than separate `dhcp_release` and
+    `dhcp_renew`: in practice you almost never want one without the
+    other. Release without renew leaves the host offline; renew without
+    release first won't dislodge a stuck lease. The combined cycle IS
+    the SRE move — splitting it adds two tool calls' worth of friction
+    for no real diagnostic gain.
+
+    Failure handling is deliberately ordered: if release fails, we DO
+    NOT proceed to renew. Renewing on top of an uncertain network state
+    risks compounding the breakage. We surface the release error and
+    let the user decide.
+
+    Timeouts: 30s per subprocess. Typical release is <1s, typical renew
+    is 1-5s, but a slow / unreachable DHCP server can legitimately push
+    renew toward Windows's own internal 60s ceiling. 30s catches the
+    "DHCP server is down" case before the user gets bored of waiting,
+    while still allowing a normal-ish slow renew to complete.
+    """
+    if not confirmed:
+        return (
+            "dhcp_cycle requires explicit user confirmation. Warn the "
+            "user this will briefly drop network connectivity on all "
+            "DHCP-managed adapters, then ask them to confirm. Once "
+            "they agree, call this tool again with confirmed=true."
+        )
+    if not _IS_ADMIN:
+        return (
+            "Cycling the DHCP lease requires Jarvis to be running as "
+            "Administrator, sir. Restart Jarvis from an elevated "
+            "prompt and try again."
+        )
+
+    # --- Phase 1: release -------------------------------------------------
+    started = time.monotonic()
+    try:
+        rel = subprocess.run(
+            ["ipconfig.exe", "/release"],
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[system_control] dhcp_cycle release timed out after 30s",
+              file=sys.stderr)
+        return "ipconfig /release timed out after 30 seconds — network state uncertain."
+    except (OSError, FileNotFoundError) as exc:
+        print(f"[system_control] dhcp_cycle release spawn failed: {exc}",
+              file=sys.stderr)
+        return f"Could not run ipconfig /release: {exc}"
+
+    rel_elapsed = time.monotonic() - started
+    rel_rc = rel.returncode
+    print(
+        f"[system_control] dhcp_cycle release exit={rel_rc} in {rel_elapsed:.2f}s",
+        file=sys.stderr,
+    )
+    if rel_rc != 0:
+        msg = (rel.stderr or rel.stdout or "no output").strip()
+        return f"ipconfig /release failed (exit {rel_rc}). {msg}"
+
+    # --- Phase 2: renew ---------------------------------------------------
+    started = time.monotonic()
+    try:
+        ren = subprocess.run(
+            ["ipconfig.exe", "/renew"],
+            capture_output=True, text=True, timeout=30, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[system_control] dhcp_cycle renew timed out after 30s",
+              file=sys.stderr)
+        # Release already succeeded — the network is in "no lease" state
+        # right now. Surface that explicitly so the user / Claude knows
+        # to retry rather than assume connectivity is back.
+        return (
+            "Released DHCP lease successfully, but ipconfig /renew "
+            "timed out after 30 seconds. The host has no active lease "
+            "right now — try again, or run /renew manually."
+        )
+    except (OSError, FileNotFoundError) as exc:
+        print(f"[system_control] dhcp_cycle renew spawn failed: {exc}",
+              file=sys.stderr)
+        return f"Released lease, but renew spawn failed: {exc}"
+
+    ren_elapsed = time.monotonic() - started
+    ren_rc = ren.returncode
+    print(
+        f"[system_control] dhcp_cycle renew exit={ren_rc} in {ren_elapsed:.2f}s",
+        file=sys.stderr,
+    )
+    if ren_rc != 0:
+        msg = (ren.stderr or ren.stdout or "no output").strip()
+        return f"Released DHCP lease, but renew failed (exit {ren_rc}). {msg}"
+
+    return "DHCP lease cycled — released and renewed on all adapters."
+
+
 # Service-name validator. Windows service names are alphanumeric plus a
 # handful of separators in practice (Spooler, PlexService, WSearch,
 # Themes, RpcSs, w3svc, MSSQL$SQLEXPRESS — that $ is the only common
@@ -516,6 +618,8 @@ def execute_system_control_tool(params: dict) -> str:
             return _do_flush_dns(confirmed)
         if action == "restart_service":
             return _do_restart_service(target, confirmed)
+        if action == "dhcp_cycle":
+            return _do_dhcp_cycle(confirmed)
         return f"Unknown action '{action}'."
     except Exception as exc:  # noqa: BLE001 — defensive last-resort net
         print(f"[system_control] {action} raised: {exc}", file=sys.stderr)
