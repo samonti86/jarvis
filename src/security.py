@@ -540,10 +540,29 @@ class SecurityWatcher:
         """Public entry for an external camera (e.g. Ring) that detected
         motion. Feeds into the same challenge/deterrent state machine as
         local YOLO detection. Honors armed-state, cooldown, and the "one
-        challenge at a time" rule — the watcher decides whether to act."""
+        challenge at a time" rule — the watcher decides whether to act.
+
+        Callers can pass jpeg_bytes=None and follow up with
+        update_challenge_evidence() once a late-arriving snapshot finishes
+        downloading — useful for Ring where snapshot fetch can take 3-9s
+        but we want the challenge prompt to fire immediately."""
         if not self._armed.is_set():
             return
         self._enter_challenge(jpeg_bytes or b"", source=source, now=time.monotonic())
+
+    def update_challenge_evidence(self, jpeg_bytes: bytes) -> None:
+        """Attach late-arriving evidence bytes to an active challenge.
+        Used by RingWatcher when its parallel snapshot fetch completes
+        AFTER the challenge prompt has already started playing. Silent
+        no-op if no challenge is active, evidence is already set, or
+        bytes are empty — first writer wins."""
+        if not jpeg_bytes:
+            return
+        with self._challenge_lock:
+            if self._challenge_active and not self._challenge_evidence_bytes:
+                self._challenge_evidence_bytes = jpeg_bytes
+                print(f"[security] late evidence attached: {len(jpeg_bytes)} bytes",
+                      file=sys.stderr)
 
     def _enter_challenge(self, jpeg_bytes: bytes, source: str, now: float) -> None:
         """Shared challenge-entry path used by local YOLO and external

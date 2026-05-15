@@ -253,36 +253,48 @@ class RingWatcher:
             await self._fire_alert(cam, event)
 
     async def _fire_alert(self, cam, event: dict) -> None:
-        """Fetch snapshot for an event and call into SecurityWatcher.
-        Snapshot is best-effort — empty bytes is acceptable, the
-        deterrent path still fires (and sends Discord text-only) with
-        no image attached."""
+        """Fire the challenge IMMEDIATELY and fetch the snapshot in
+        parallel. Ring's async_get_snapshot requests a fresh capture and
+        polls for ~3-9s waiting for the camera to deliver — if we awaited
+        that before entering the challenge, the prompt would start 3-9s
+        late and the user's response window shrinks. Better: announce
+        first, attach evidence via update_challenge_evidence() if the
+        snapshot arrives before the deterrent fires."""
         print(f"[ring] motion event id={event['id']} at {event.get('created_at')}",
               file=sys.stderr)
-        snap_bytes: bytes = b""
         try:
-            result = await cam.async_get_snapshot()
-            # async_get_snapshot can return None (Ring API doesn't always
-            # have a fresh snapshot ready, especially on back-to-back
-            # events). Treat the same as empty bytes — deterrent + Discord
-            # still fire, just without an attached image.
-            if result:
-                snap_bytes = result
-                print(f"[ring] snapshot fetched: {len(snap_bytes)} bytes",
-                      file=sys.stderr)
-            else:
-                print("[ring] snapshot returned empty (Ring API had no "
-                      "fresh frame) — proceeding without image",
-                      file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ring] snapshot fetch failed: {exc} — proceeding without",
-                  file=sys.stderr)
-        try:
-            self._security.trigger_external_motion(
-                source="ring", jpeg_bytes=snap_bytes or None,
-            )
+            self._security.trigger_external_motion(source="ring", jpeg_bytes=None)
         except Exception as exc:  # noqa: BLE001
             print(f"[ring] trigger_external_motion raised: {exc}", file=sys.stderr)
+            return
+
+        # Fetch snapshot in the background. asyncio.create_task() lets the
+        # poll loop continue while this awaits Ring's slow snapshot pipeline.
+        asyncio.create_task(self._fetch_and_attach(cam, event["id"]))
+
+    async def _fetch_and_attach(self, cam, event_id: int) -> None:
+        """Background coroutine: request a fresh snapshot for the event,
+        attach to the active challenge if it arrives in time. retries=8
+        gives Ring 8s of grace to capture+deliver (default is 3s which
+        was failing for the user on back-to-back events). Latency is
+        invisible to the user because the challenge already fired."""
+        try:
+            snap = await cam.async_get_snapshot(retries=8, delay=1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ring] snapshot fetch failed for event {event_id}: {exc}",
+                  file=sys.stderr)
+            return
+        if not snap:
+            print(f"[ring] snapshot timed out for event {event_id} "
+                  f"(8s window) — deterrent will fire without image",
+                  file=sys.stderr)
+            return
+        print(f"[ring] snapshot fetched: {len(snap)} bytes for event {event_id}",
+              file=sys.stderr)
+        try:
+            self._security.update_challenge_evidence(snap)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ring] update_challenge_evidence raised: {exc}", file=sys.stderr)
 
     # ---------------------------------------------------------------------
     # Helpers.
