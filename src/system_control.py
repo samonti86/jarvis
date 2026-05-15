@@ -1,6 +1,6 @@
 """System control tool — allowlisted Windows actions.
 
-Seven actions, each individually scoped:
+Ten actions, each individually scoped:
 
   open_app          launch an app from a small allowlist
   lock_workstation  lock the screen (Win+L equivalent)
@@ -8,26 +8,49 @@ Seven actions, each individually scoped:
   volume_mute       mute system master
   volume_unmute     unmute system master
   screen_off        power off the display(s)
-  kill_process      terminate a named process — requires confirmed=true
+  kill_process      terminate a named process — requires confirmed=true (M23)
+  flush_dns         flush the DNS resolver cache — requires confirmed=true
+                    AND admin (M40)
+  restart_service   restart a Windows service by name — requires
+                    confirmed=true AND admin AND a service name matching
+                    ^[A-Za-z0-9._-]{1,128}$ (M40)
+  dhcp_cycle        release + renew DHCP lease on all adapters — requires
+                    confirmed=true AND admin (M42)
 
-Security posture (matches the M23 design discussion):
+Security posture (M23 + M40 + M42 — the same shape applies to every
+mutating verb added in the future):
 
 - No arbitrary command exec. Every action is a fixed, named operation.
 - No arbitrary app launch. open_app resolves names against `_APP_ALIASES`;
   unknown names return an error, not a Popen of attacker-controlled text.
-- kill_process requires `confirmed=true` enforced HERE (not in the system
-  prompt). On the first call without it, the tool returns a "needs
-  confirmation" string Claude paraphrases to the user; only after the user
-  agrees does Claude call again with `confirmed=true`. Server-side gating
-  means a misbehaving prompt or a hallucinated tool call can't bypass it.
-- pycaw / ctypes failures all become readable error strings — never raise
-  through to the agentic loop.
+- Confirmation contract enforced HERE, not in the system prompt. Every
+  mutating verb checks `confirmed=true` before any subprocess fires. On
+  the first call without it, the tool returns a "needs confirmation"
+  string Claude paraphrases to the user; only after the user agrees does
+  Claude call again with `confirmed=true`. Server-side gating means a
+  misbehaving prompt or a hallucinated tool call can't bypass it.
+- Elevation gate enforced HERE for actions that require it (flush_dns,
+  restart_service, dhcp_cycle). `_IS_ADMIN` is cached at import via
+  `autostart.is_admin()`; the gate fails fast with a "needs admin"
+  message rather than discovering Access Denied from subprocess output.
+  Aligns with the "Jarvis stays Jarvis, not Ultron" least-privilege
+  principle — see the feedback memory of the same name.
+- Per-verb input validation where the verb takes free-form input.
+  restart_service's service-name regex is the only one currently;
+  kill_process accepts any process name (psutil filters by exact match).
+  Validation IS the security boundary — same principle as pc_shell.
+- No shell composition. Every subprocess goes through
+  `subprocess.run([list, of, args])` with `shell=False`. No f-strings
+  into shell commands, no os.system(), no Popen(string, shell=True).
+- Bounded. Per-action timeouts (20s flush_dns, 30s restart_service,
+  30s+30s dhcp_cycle). Timeouts surface as readable strings, not hangs.
+- Defensive. pycaw / ctypes / subprocess failures all become readable
+  error strings — never raise through to the agentic loop.
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
 import re
 import subprocess
 import sys

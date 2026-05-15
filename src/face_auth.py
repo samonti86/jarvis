@@ -151,7 +151,7 @@ def enroll_from_frames(
     rejected_multiface = 0
     rejected_noface = 0
 
-    for i, frame in enumerate(frames):
+    for frame in frames:
         # cv2 returns BGR; face_recognition (and dlib) want RGB. The
         # reverse-slice would be a zero-copy view, but dlib 20.0.1 segfaults
         # when handed a negative-stride array at 1080p (HOG iterates the

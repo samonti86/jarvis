@@ -109,12 +109,22 @@ def _write_shortcut(
         f"$Shortcut.Save()\n"
     )
 
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # 10s is generous for what should complete in <1s (WScript.Shell COM is
+    # fast). Bounded so a hypothetical COM hang can't block the tray-click
+    # thread forever; matches the timeout posture of every other subprocess
+    # call in this codebase.
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"shortcut creation at {target_path} timed out after 10s"
+        ) from exc
     if result.returncode != 0:
         stderr = (result.stderr or "").strip() or "(no stderr)"
         raise RuntimeError(f"shortcut creation failed at {target_path}: {stderr}")

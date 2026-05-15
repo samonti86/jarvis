@@ -317,13 +317,6 @@ class JarvisUI:
             self._on_reset()
 
     @property
-    def relaunch_requested(self) -> bool:
-        """True if the user clicked any 'Restart Jarvis' variant. main()
-        reads this after the worker has joined to decide whether to spawn
-        a fresh instance. Use `relaunch_mode` for the specific variant."""
-        return self._relaunch_mode is not None
-
-    @property
     def relaunch_mode(self) -> str | None:
         """M41: which restart variant was requested. None = no restart,
         'normal' = standard `autostart.relaunch()`, 'elevated' = UAC-prompt
