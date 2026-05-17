@@ -43,6 +43,8 @@ become log lines, never raise through the watcher's thread boundary.
 
 from __future__ import annotations
 
+import gc
+import os
 import re
 import sys
 import threading
@@ -151,6 +153,30 @@ _CHALLENGE_COOLDOWN_SECONDS = 60.0
 # first save. Lives under %LOCALAPPDATA% so it follows the existing memory
 # directory convention (jarvis.log, sessions/, summaries.jsonl).
 _EVIDENCE_SUBDIR = "security/events"
+
+# psutil RSS watchdog — the structural backstop (M44). Post-mortem: an
+# ultralytics-in-a-loop leak in the armed watcher consumed ~30 GB over ~50
+# min while the user was away, exhausting a ~10 GB machine and forcing a
+# hard reboot (Windows Resource-Exhaustion-Detector named pythonw.exe). The
+# leak itself is now fixed (del results + gc.collect() below), but a
+# self-monitoring guard means ANY future in-process leak — this thread or
+# another — degrades to a logged auto-disarm instead of taking the whole
+# machine down. This is the CLAUDE.md "never crash the listening loop /
+# degrade gracefully" rule enforced at the *process* level, where it failed.
+#
+# 1500 MB sits comfortably above realistic baseline (torch CPU + YOLO +
+# openWakeWord ORT + Tk ≈ 0.5–1 GB; STT is offloaded off-box per M36) and
+# far below this machine's 9.9 GB physical / 15.4 GB commit limit. Override
+# via JARVIS_MEMORY_WATCHDOG_MB; a value <= 0 disables the watchdog.
+def _watchdog_limit_mb() -> int:
+    raw = os.getenv("JARVIS_MEMORY_WATCHDOG_MB", "").strip()
+    try:
+        return int(raw) if raw else 1500
+    except ValueError:
+        return 1500
+
+
+_MEMORY_WATCHDOG_MB = _watchdog_limit_mb()
 
 
 # --- Public API ------------------------------------------------------------
@@ -534,6 +560,21 @@ class SecurityWatcher:
 
         print("[security] watcher loop started", file=sys.stderr)
 
+        # M44 watchdog: resolve a psutil handle on this process once. Lazy +
+        # defensive — psutil is a declared dep, but if it's somehow missing
+        # the watcher must still run (just without the memory guard), per the
+        # module's "never let a support feature break the watcher" contract.
+        proc = None
+        try:
+            import psutil  # noqa: PLC0415 — light dep, lazy per convention
+
+            proc = psutil.Process()
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[security] psutil unavailable — memory watchdog disabled: {exc}",
+                file=sys.stderr,
+            )
+
         try:
             while not self._stop.is_set() and self._armed.is_set():
                 # Grace period: don't fire detections in the first N seconds
@@ -548,6 +589,13 @@ class SecurityWatcher:
                 # grab, so a deterrent fires promptly even if the camera is
                 # briefly busy. Holds the lock briefly to read state.
                 self._check_challenge_timeout()
+
+                # M44: memory watchdog. Process-wide RSS guard — catches a
+                # leak in THIS thread or any other while we're armed (the
+                # exact unattended scenario that took the machine down). On
+                # trip it logs, announces, and auto-disarms, then we exit.
+                if self._check_memory_watchdog(proc):
+                    return
 
                 frame = self._grab_frame()
                 if frame is None:
@@ -591,6 +639,14 @@ class SecurityWatcher:
                             file=sys.stderr,
                         )
                         self._person_present = False
+
+                # M44: break ultralytics' per-call reference cycle over the
+                # Results objects (each holds .orig_img). _detect_person's
+                # `del results` drops the acyclic refs; only the cyclic GC
+                # reclaims the rest. Negligible at the 2 s poll cadence —
+                # gc of a small young generation is sub-millisecond, and this
+                # is what actually stopped the ~30 GB unattended growth.
+                gc.collect()
 
                 # Sleep till the next poll, but wake instantly on _stop so
                 # disarming feels responsive.
@@ -990,44 +1046,93 @@ class SecurityWatcher:
         frame_h = float(frame.shape[0]) if hasattr(frame, "shape") else 0.0
         min_bbox_h = frame_h * _MIN_PERSON_HEIGHT_RATIO
 
-        for r in results:
-            # r.boxes is the detected objects. Each box has .cls (class
-            # index), .conf (confidence), and .xyxy ([x1,y1,x2,y2]).
-            # Iterate looking for any qualifying person; short-circuit on
-            # the first match.
-            boxes = getattr(r, "boxes", None)
-            if boxes is None:
-                continue
-            for box in boxes:
-                try:
-                    cls = int(box.cls)
-                    conf = float(box.conf)
-                except (TypeError, ValueError, AttributeError):
+        # try/finally so `del results` runs on EVERY exit (the early
+        # short-circuit `return True` included). Each Results object retains
+        # .orig_img — the full frame — so dropping our reference here, paired
+        # with the loop-level gc.collect() in _watch_loop, is the fix for the
+        # M44 leak: ultralytics' predictor holds a reference cycle over these,
+        # and at 0.5 Hz unattended it grew ~tens of MB/tick until the machine
+        # OOM'd. del alone reclaims the acyclic part; gc.collect() breaks the
+        # cycle.
+        try:
+            for r in results:
+                # r.boxes is the detected objects. Each box has .cls (class
+                # index), .conf (confidence), and .xyxy ([x1,y1,x2,y2]).
+                # Iterate looking for any qualifying person; short-circuit on
+                # the first match.
+                boxes = getattr(r, "boxes", None)
+                if boxes is None:
                     continue
-                if cls != _YOLO_PERSON_CLASS or conf < _YOLO_CONFIDENCE:
-                    continue
-                # Size filter: extract bbox height. xyxy is [x1, y1, x2, y2]
-                # in pixels. Defensive — log + skip if shape unexpected.
-                try:
-                    coords = box.xyxy[0].tolist()
-                    bbox_h = float(coords[3]) - float(coords[1])
-                except (AttributeError, IndexError, ValueError, TypeError):
-                    continue
-                if bbox_h < min_bbox_h:
-                    # Looks like a person to YOLO but is too small for a
-                    # human-scale detection — almost certainly a pet or a
-                    # picture-frame face. Log so we can audit false-rejects
-                    # later if needed.
-                    print(
-                        f"[security] rejected: person@{conf:.2f} but bbox "
-                        f"height {bbox_h:.0f}px < {min_bbox_h:.0f}px "
-                        f"(< {_MIN_PERSON_HEIGHT_RATIO:.0%} of frame {frame_h:.0f}px) "
-                        f"— likely a pet",
-                        file=sys.stderr,
-                    )
-                    continue
-                return True
-        return False
+                for box in boxes:
+                    try:
+                        cls = int(box.cls)
+                        conf = float(box.conf)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if cls != _YOLO_PERSON_CLASS or conf < _YOLO_CONFIDENCE:
+                        continue
+                    # Size filter: extract bbox height. xyxy is
+                    # [x1, y1, x2, y2] in pixels. Defensive — log + skip if
+                    # shape unexpected.
+                    try:
+                        coords = box.xyxy[0].tolist()
+                        bbox_h = float(coords[3]) - float(coords[1])
+                    except (AttributeError, IndexError, ValueError, TypeError):
+                        continue
+                    if bbox_h < min_bbox_h:
+                        # Looks like a person to YOLO but is too small for a
+                        # human-scale detection — almost certainly a pet or a
+                        # picture-frame face. Log so we can audit
+                        # false-rejects later if needed.
+                        print(
+                            f"[security] rejected: person@{conf:.2f} but bbox "
+                            f"height {bbox_h:.0f}px < {min_bbox_h:.0f}px "
+                            f"(< {_MIN_PERSON_HEIGHT_RATIO:.0%} of frame "
+                            f"{frame_h:.0f}px) — likely a pet",
+                            file=sys.stderr,
+                        )
+                        continue
+                    return True
+            return False
+        finally:
+            del results
+
+    def _check_memory_watchdog(self, proc) -> bool:
+        """Process-wide RSS guard (M44). Returns True — and fires a log line,
+        a spoken notice, and an auto-disarm — if total process memory has
+        crossed the configured limit. Returns False otherwise.
+
+        Defensive on every axis: a None proc (psutil missing), a disabled
+        limit (<= 0), or a psutil read error all return False quietly. The
+        watchdog must never be the thing that breaks the watcher — its whole
+        job is to make a leak SAFER, not to add a new failure mode."""
+        if proc is None or _MEMORY_WATCHDOG_MB <= 0:
+            return False
+        try:
+            rss_mb = proc.memory_info().rss / (1024 * 1024)
+        except Exception as exc:  # noqa: BLE001 — psutil raises if proc gone
+            print(f"[security] memory watchdog read failed: {exc}",
+                  file=sys.stderr)
+            return False
+        if rss_mb < _MEMORY_WATCHDOG_MB:
+            return False
+
+        print(
+            f"[security] MEMORY WATCHDOG TRIPPED: process RSS {rss_mb:.0f} MB "
+            f">= {_MEMORY_WATCHDOG_MB} MB limit — auto-disarming security as a "
+            f"precaution (probable memory leak; see docs/MILESTONES.md M44)",
+            file=sys.stderr,
+        )
+        # Announce before disarming so the user gets the spoken heads-up even
+        # though the UI indicator flips immediately via _auto_disarm.
+        self._safe_call(
+            self._announce,
+            "Sir, I'm consuming an unusual amount of memory. "
+            "I'm standing down as a precaution.",
+            label="memory watchdog announce",
+        )
+        self._auto_disarm()
+        return True
 
     def _auto_disarm(self) -> None:
         """Internal: clear armed state + notify UI without an extra spoken
