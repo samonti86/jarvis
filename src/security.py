@@ -154,29 +154,66 @@ _CHALLENGE_COOLDOWN_SECONDS = 60.0
 # directory convention (jarvis.log, sessions/, summaries.jsonl).
 _EVIDENCE_SUBDIR = "security/events"
 
-# psutil RSS watchdog — the structural backstop (M44). Post-mortem: an
-# ultralytics-in-a-loop leak in the armed watcher consumed ~30 GB over ~50
-# min while the user was away, exhausting a ~10 GB machine and forcing a
-# hard reboot (Windows Resource-Exhaustion-Detector named pythonw.exe). The
-# leak itself is now fixed (del results + gc.collect() below), but a
-# self-monitoring guard means ANY future in-process leak — this thread or
-# another — degrades to a logged auto-disarm instead of taking the whole
-# machine down. This is the CLAUDE.md "never crash the listening loop /
-# degrade gracefully" rule enforced at the *process* level, where it failed.
+# psutil memory watchdog — the structural backstop (M44). Post-mortem: an
+# ultralytics-in-a-loop leak in the armed watcher consumed ~30 GB while the
+# user was away, exhausting a ~10 GB machine and forcing a hard reboot
+# (Windows Resource-Exhaustion-Detector named pythonw.exe). A self-monitoring
+# guard means ANY in-process leak — this thread or another — degrades to a
+# logged auto-disarm instead of taking the whole machine down. This is the
+# CLAUDE.md "never crash the listening loop / degrade gracefully" rule
+# enforced at the *process* level, where it originally failed.
 #
-# 1500 MB sits comfortably above realistic baseline (torch CPU + YOLO +
-# openWakeWord ORT + Tk ≈ 0.5–1 GB; STT is offloaded off-box per M36) and
-# far below this machine's 9.9 GB physical / 15.4 GB commit limit. Override
-# via JARVIS_MEMORY_WATCHDOG_MB; a value <= 0 disables the watchdog.
+# M44.2 post-mortem (2026-05-17) — THE METRIC WAS WRONG. The first real
+# armed soak under an actual leak: commit hit 37 GB (Event 2004), the machine
+# locked up, and the guard NEVER TRIPPED. Root cause: it watched RSS (the
+# Windows *working set* — resident physical pages). The leak grows COMMIT /
+# private bytes; under memory pressure Windows aggressively *trims the working
+# set*, so RSS stayed below the limit while private bytes ran to 37 GB. RSS is
+# the one number Windows actively suppresses during exactly this failure — an
+# RSS guard is precisely backwards for it (it even false-tripped on the
+# harmless 1501 MB cold-start working-set spike in M44.1 while staying silent
+# on the lethal 37 GB commit growth). Fix: watch (a) this process's private
+# bytes — the number that actually grew — AND (b) system-wide available
+# memory. (b) is the robust, leak-source-agnostic backstop: it trips no matter
+# where the memory went or which metric it shows up in, and is what actually
+# prevents the lockup. With (b) as the real net, the per-process threshold no
+# longer has to be calibrated precisely (defusing the M44.1 calibration trap).
+#
+# JARVIS_MEMORY_WATCHDOG_MB  — process private-bytes ceiling (default 3500;
+#   armed baseline ≈1.5–2 GB private: torch CPU + YOLO + dlib/face_recognition
+#   + openWakeWord ORT + Tk; STT offloaded off-box per M36). <= 0 disables
+#   THIS check only.
+# JARVIS_MEMORY_MIN_AVAIL_MB — system-available-memory floor (default 512).
+#   IMPORTANT: the PROCESS check above is the load-bearing guard — the M44.2
+#   leak was *this process's own* private bytes (→37 GB), so the 3500 MB
+#   ceiling alone would have tripped within minutes, far before danger. This
+#   system floor is a SECONDARY net for leaks the process check can't see
+#   (e.g. an MCP child). It is deliberately conservative because this machine
+#   is memory-tight: measured ~1.2 GB system-available while *unarmed*
+#   (2026-05-17), and arming loads ~1.5 GB of ML stack — a 1 GB floor would
+#   M44.1-false-trip on every arm. 512 MB is a guessed-low placeholder, NOT a
+#   calibrated value: applying the M44.1 lesson (loose first, calibrate from a
+#   real soak measurement, never trust a guessed fail-safe constant). On a
+#   roomier box raise it. <= 0 disables THIS check only.
+# Set BOTH <= 0 to fully disable the watchdog.
 def _watchdog_limit_mb() -> int:
     raw = os.getenv("JARVIS_MEMORY_WATCHDOG_MB", "").strip()
     try:
-        return int(raw) if raw else 1500
+        return int(raw) if raw else 3500
     except ValueError:
-        return 1500
+        return 3500
+
+
+def _watchdog_min_avail_mb() -> int:
+    raw = os.getenv("JARVIS_MEMORY_MIN_AVAIL_MB", "").strip()
+    try:
+        return int(raw) if raw else 512
+    except ValueError:
+        return 512
 
 
 _MEMORY_WATCHDOG_MB = _watchdog_limit_mb()
+_MEMORY_MIN_AVAIL_MB = _watchdog_min_avail_mb()
 
 
 # --- Public API ------------------------------------------------------------
@@ -1098,29 +1135,64 @@ class SecurityWatcher:
             del results
 
     def _check_memory_watchdog(self, proc) -> bool:
-        """Process-wide RSS guard (M44). Returns True — and fires a log line,
-        a spoken notice, and an auto-disarm — if total process memory has
-        crossed the configured limit. Returns False otherwise.
+        """Process + system memory guard (M44 / M44.2). Returns True — and
+        fires a log line, a spoken notice, and an auto-disarm — if EITHER
+        (a) this process's private/commit bytes cross
+        JARVIS_MEMORY_WATCHDOG_MB, or (b) system-wide available memory falls
+        below JARVIS_MEMORY_MIN_AVAIL_MB. Returns False otherwise.
 
-        Defensive on every axis: a None proc (psutil missing), a disabled
-        limit (<= 0), or a psutil read error all return False quietly. The
-        watchdog must never be the thing that breaks the watcher — its whole
-        job is to make a leak SAFER, not to add a new failure mode."""
-        if proc is None or _MEMORY_WATCHDOG_MB <= 0:
+        M44.2: was RSS-based; RSS is the working set, which Windows trims
+        under pressure, so the real commit/private-bytes leak (37 GB) never
+        tripped it. Now watches private bytes (the metric that actually grew)
+        plus, as the leak-source-agnostic net, system available memory — that
+        second check is what truly prevents the lockup, regardless of which
+        metric or process the next leak shows up in.
+
+        Defensive on every axis: a None proc (psutil missing), both limits
+        disabled (<= 0), or a psutil read error all return False quietly. The
+        guard must never be the thing that breaks the watcher — its whole job
+        is to make a leak SAFER, not to add a new failure mode."""
+        if proc is None:
             return False
+        if _MEMORY_WATCHDOG_MB <= 0 and _MEMORY_MIN_AVAIL_MB <= 0:
+            return False
+
+        proc_mb = None
+        avail_mb = None
         try:
-            rss_mb = proc.memory_info().rss / (1024 * 1024)
+            import psutil  # noqa: PLC0415 — light dep, lazy per convention
+
+            if _MEMORY_WATCHDOG_MB > 0:
+                mem = proc.memory_info()
+                # .private == Windows Private Bytes (≈ per-process commit —
+                # the M44 leak metric). Fall back to rss if absent (non-
+                # Windows dev box) so this degrades instead of crashing.
+                raw = getattr(mem, "private", None)
+                if raw is None:
+                    raw = mem.rss
+                proc_mb = raw / (1024 * 1024)
+            if _MEMORY_MIN_AVAIL_MB > 0:
+                avail_mb = psutil.virtual_memory().available / (1024 * 1024)
         except Exception as exc:  # noqa: BLE001 — psutil raises if proc gone
             print(f"[security] memory watchdog read failed: {exc}",
                   file=sys.stderr)
             return False
-        if rss_mb < _MEMORY_WATCHDOG_MB:
+
+        proc_trip = proc_mb is not None and proc_mb >= _MEMORY_WATCHDOG_MB
+        avail_trip = avail_mb is not None and avail_mb <= _MEMORY_MIN_AVAIL_MB
+        if not proc_trip and not avail_trip:
             return False
 
+        reason = (
+            f"process private {proc_mb:.0f} MB >= {_MEMORY_WATCHDOG_MB} MB"
+            if proc_trip else
+            f"system available {avail_mb:.0f} MB <= "
+            f"{_MEMORY_MIN_AVAIL_MB} MB floor"
+        )
         print(
-            f"[security] MEMORY WATCHDOG TRIPPED: process RSS {rss_mb:.0f} MB "
-            f">= {_MEMORY_WATCHDOG_MB} MB limit — auto-disarming security as a "
-            f"precaution (probable memory leak; see docs/MILESTONES.md M44)",
+            f"[security] MEMORY WATCHDOG TRIPPED: {reason} — auto-disarming "
+            f"security as a precaution (probable memory leak; see "
+            f"docs/MILESTONES.md M44/M44.2)",
             file=sys.stderr,
         )
         # Announce before disarming so the user gets the spoken heads-up even
