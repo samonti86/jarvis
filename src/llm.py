@@ -51,6 +51,7 @@ from src.file_reader import READ_LOCAL_FILE_TOOL, execute_read_local_file
 from src.games import GAMES_TOOL, execute_games_tool
 from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
+from src.news import NEWS_TOOL, execute_news_tool
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
 from src.plex_actions import PLEX_ACTION_TOOL, execute_plex_action
 from src.plex_laptop import (
@@ -153,9 +154,11 @@ Live information (you have six tools — pick the right one):
    the user names a particular site or document ("check ESPN for Giants news", "what
    does IGN say about Super Mario", "summarize this PDF at <url>"). You may chain
    web_search → web_fetch when you need to find a URL first, then read it in depth.
-6. web_search — for general info-finding when no specific source is named: news,
-   market prices, recent releases, "who is the current X", anything that changes
-   over time.
+6. web_search — for general info-finding when no specific source is named:
+   market prices, recent releases, "who is the current X", digging into one
+   specific story, anything that changes over time. For general news
+   headlines ("what's the news/tech news today") prefer get_news (below) —
+   use web_search for news only to go deeper on a specific story.
 
 Local PC control (you have five tools — pick the right one):
 7. pc_diagnostics — read-only LIVE telemetry on THIS Windows PC: CPU, RAM, disk,
@@ -237,6 +240,16 @@ Personal knowledge (your private store — one tool):
     you to remember permanently). See the "Personal knowledge base" routing
     rules above: for any question about THEIR environment or recorded
     decisions, this comes before web_search, memory, or training.
+
+Current news (one tool):
+15. get_news — current headlines by topic from curated reputable RSS feeds
+    (categories: top, world, tech, business, science). ALWAYS prefer this
+    over web_search for general "what's the news / what's the latest <topic>
+    news / what's happening today" questions — it returns fresh structured
+    headlines and is faster and more reliable than scraping. The optional
+    `topic` only filters those current feeds (not a web-wide search); to dig
+    into one specific story or a niche topic the feeds won't carry, use
+    web_search (then web_fetch for a named outlet).
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -487,6 +500,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
+    "get_news":                     _ClientTool(execute_news_tool, "news"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
@@ -594,7 +608,7 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
-        KNOWLEDGE_SEARCH_TOOL,
+        NEWS_TOOL, KNOWLEDGE_SEARCH_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

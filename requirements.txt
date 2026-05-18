@@ -45,6 +45,13 @@ pycaw>=20240210
 # remote system-health queries against the Plex laptop using ed25519 key auth.
 paramiko>=3.4
 
+# News headlines (M47) — get_news tool. feedparser is small, pure-Python
+# (no transitive deps), and robust across RSS 2.0 / Atom / RDF + malformed
+# real-world feeds; it never raises (sets a bozo flag), matching Jarvis's
+# fail-soft contract. Feed bytes are fetched via the shared src/http_util.py
+# (first new consumer of the M43 extraction); feedparser only parses them.
+feedparser>=6.0
+
 # Camera vision (M29) — grab a still frame from the USB webcam for the
 # camera_snapshot tool, which hands the image to Claude (multimodal) to
 # describe. headless = no GUI/Qt bits we don't need. cv2.VideoCapture also
