@@ -17,8 +17,12 @@ Design notes:
   for instant snapshots, but that lights the camera's in-use LED the whole
   time Jarvis runs and blocks other apps (video calls) — wrong for a privacy-
   sensitive feature. Open, grab, release.
-- **CAP_DSHOW backend.** On Windows the Media Foundation backend (CAP_MSMF,
-  the cv2 default) fails to open the C920e here; DirectShow opens it cleanly.
+- **CAP_DSHOW backend.** DirectShow opens the C920e cleanly. (Stale-comment
+  correction, M44.3 2026-05-17: this previously claimed CAP_MSMF "fails to
+  open the C920e here" — measured false, MSMF opens it 0/80 fail. But MSMF
+  still leaks ~3 MB/min under a per-tick open/release loop, so DSHOW stays
+  the choice; the real per-tick-open leak fix is a persistent capture, see
+  security.py:_grab_frame / M44.3.)
 - **Warm-up frames.** USB webcams return a dark/stale first frame while auto-
   exposure settles — read a few and keep the last.
 - **Lazy cv2 import.** opencv-python-headless is a ~60 MB dep; importing it

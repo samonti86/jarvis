@@ -261,6 +261,12 @@ class SecurityWatcher:
         # the UI just doesn't show a LOCKED indicator (functionality intact).
         self._on_locked_changed = on_locked_changed
         self._camera_index = camera_index
+        # M44.3: persistent capture handle for the armed-watcher lifetime.
+        # Opened lazily on the first grab, reused every poll, released when
+        # the watcher loop exits (disarm / stop / watchdog trip). Sole owner
+        # is the single watcher thread (_grab_frame's only caller), so no
+        # lock is needed. See _grab_frame / _watch_loop's finally.
+        self._cap = None
         # M35: empty passphrase = skip CHALLENGE state entirely. Detection
         # just announces movement (M34 behavior). Lets the user opt out of
         # the challenge step without removing security mode entirely.
@@ -690,6 +696,10 @@ class SecurityWatcher:
                 if self._stop.wait(_POLL_SECONDS):
                     return
         finally:
+            # M44.3: free the persistent capture the instant the watcher
+            # stops (disarm / stop / watchdog trip / model-load fail).
+            # Scopes the held camera strictly to armed lifetime.
+            self._release_cap()
             print("[security] watcher loop exited", file=sys.stderr)
 
     def _handle_person_first_seen(self, frame, now: float) -> None:
@@ -1022,38 +1032,72 @@ class SecurityWatcher:
         )
         return True
 
+    def _release_cap(self) -> None:
+        """Release + drop the persistent capture (M44.3). Idempotent.
+        Called on a read failure (self-heal: next poll re-opens) and from
+        _watch_loop's finally, so the camera is freed the instant the
+        watcher stops — keeping the persistent capture strictly scoped to
+        the armed-watcher lifetime (camera fully free whenever NOT armed)."""
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
     def _grab_frame(self):
-        """Open camera → warmup → grab → release. Returns numpy frame or
-        None on any failure. Mirrors cameras.py's pattern but with shorter
-        warmup + smaller resolution since YOLO doesn't need full quality."""
+        """M44.3: persistent-capture grab. Opens self._cap ONCE (DSHOW —
+        the backend documented to reliably open the C920e; MSMF's stale-
+        comment claim aside, it still leaked ~3 MB/min per the repro), then
+        reuses it every poll. The old open/release-every-tick was the M44.3
+        native leak: ~160 MB per cycle / ~37 GB per soak, proven by
+        scripts/leak_repro.py (persistent+DSHOW measured dead-flat over 400
+        reads; per-tick DSHOW hit a 2.2 GB cap in 10). Released in
+        _watch_loop's finally when the watcher exits, so the camera is fully
+        free whenever security is NOT armed — camera_snapshot / face
+        enrollment are unaffected (only contend if invoked WHILE armed,
+        where existing code already degrades gracefully). Returns a numpy
+        frame or None; any read failure drops the capture so the next poll
+        transparently re-opens (self-healing)."""
         try:
             import cv2  # type: ignore
         except ImportError:
             return None
 
-        cap = None
         try:
-            cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                return None
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, _CAPTURE_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _CAPTURE_HEIGHT)
+            if self._cap is None:
+                cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    return None
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, _CAPTURE_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _CAPTURE_HEIGHT)
+                self._cap = cap
+                # USB cams emit dark/stale frames until auto-exposure
+                # settles — discard a few, but ONCE per open, not every
+                # poll (per-poll warmup became wasted work + an extra
+                # discarded frame the moment the capture went persistent).
+                reads = _WARMUP_FRAMES
+            else:
+                reads = 1  # already warm — a single fresh read
 
             frame = None
-            for _ in range(_WARMUP_FRAMES):
-                ok, f = cap.read()
+            for _ in range(reads):
+                ok, f = self._cap.read()
                 if ok and f is not None:
                     frame = f
+            if frame is None:
+                # Read failed on an open capture — camera glitched /
+                # unplugged. Drop it so the next poll re-opens cleanly.
+                self._release_cap()
             return frame
         except Exception as exc:  # noqa: BLE001
             print(f"[security] frame grab failed: {exc}", file=sys.stderr)
+            self._release_cap()
             return None
-        finally:
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
 
     def _detect_person(self, frame) -> bool:
         """Run YOLO inference, return True if any high-confidence person
