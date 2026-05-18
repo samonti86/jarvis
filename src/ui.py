@@ -67,6 +67,9 @@ class JarvisUI:
         # face_auth / cameras / announce are available in main.py) so the
         # tray menu can render before the dependency graph is complete.
         self._on_enroll_face: Callable[[], None] | None = None
+        # M45: knowledge-reindex trigger. Wired post-construction (after the
+        # announce path exists in main.py), same lifecycle as _on_enroll_face.
+        self._on_reindex_knowledge: Callable[[], None] | None = None
         # When non-None, main() should respawn Jarvis after the listen loop
         # has joined + the active session is sealed. The tray's "Restart
         # Jarvis" click flips this to "normal"; M41's "Restart Jarvis
@@ -229,6 +232,18 @@ class JarvisUI:
         if self._on_enroll_face is not None:
             self._on_enroll_face()
 
+    def set_on_reindex_knowledge(self, callback: Callable[[], None]) -> None:
+        """Wire the tray's 'Reindex knowledge' callback (M45). main.py calls
+        this after the announce path is available — same as enroll-face."""
+        self._on_reindex_knowledge = callback
+
+    def _handle_reindex_knowledge(self) -> None:
+        """Tray callback. Runs on pystray's thread; the reindex itself plus
+        the spoken result run off-thread (the trigger in main.py is
+        non-blocking), so this never stalls the menu."""
+        if self._on_reindex_knowledge is not None:
+            self._on_reindex_knowledge()
+
     def _handle_toggle_security(self) -> None:
         """Tray callback: flip armed state via the wired SecurityWatcher.
         Same code path as the voice intent parser — watcher is idempotent."""
@@ -285,6 +300,7 @@ class JarvisUI:
             security_enabled=self._security_is_armed_or_false,
             on_security_toggle=self._handle_toggle_security,
             on_enroll_face=self._handle_enroll_face,
+            on_reindex_knowledge=self._handle_reindex_knowledge,
             on_restart=self._handle_restart,
             on_restart_elevated=self._handle_restart_elevated,
             on_create_shortcut=self._handle_create_shortcut,

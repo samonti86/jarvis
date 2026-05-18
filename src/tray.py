@@ -64,6 +64,7 @@ class JarvisTray:
         security_enabled: Callable[[], bool] | None = None,
         on_security_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
+        on_reindex_knowledge: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
         on_restart_elevated: Callable[[], None] | None = None,
         on_create_shortcut: Callable[[], None] | None = None,
@@ -88,6 +89,7 @@ class JarvisTray:
         self._security_enabled = security_enabled
         self._on_security_toggle = on_security_toggle
         self._on_enroll_face = on_enroll_face
+        self._on_reindex_knowledge = on_reindex_knowledge
         self._on_restart = on_restart
         self._on_restart_elevated = on_restart_elevated
         self._on_create_shortcut = on_create_shortcut
@@ -146,6 +148,15 @@ class JarvisTray:
             # "Jarvis, enroll my face" via main.py's listen_loop.
             menu_items.append(pystray.MenuItem(
                 "Enroll my face", self._handle_enroll_face,
+            ))
+        if on_reindex_knowledge is not None:
+            # M45: rebuild the FTS5 knowledge index from the corpus folder.
+            # Same voice-first flow as enrollment (Jarvis announces the
+            # result) and the same callback the "Jarvis, update your
+            # knowledge" voice intent fires. Use it after editing files in
+            # the knowledge folder by hand.
+            menu_items.append(pystray.MenuItem(
+                "Reindex knowledge", self._handle_reindex_knowledge,
             ))
         if autostart_enabled is not None and on_autostart_toggle is not None:
             # Pystray re-evaluates `checked` each time the menu opens, so the
@@ -222,6 +233,10 @@ class JarvisTray:
     def _handle_enroll_face(self) -> None:
         if self._on_enroll_face is not None:
             self._on_enroll_face()
+
+    def _handle_reindex_knowledge(self) -> None:
+        if self._on_reindex_knowledge is not None:
+            self._on_reindex_knowledge()
 
     def _handle_restart(self) -> None:
         if self._on_restart is not None:

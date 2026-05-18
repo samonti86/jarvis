@@ -49,6 +49,7 @@ from src.diagnostics_collector import (
 )
 from src.file_reader import READ_LOCAL_FILE_TOOL, execute_read_local_file
 from src.games import GAMES_TOOL, execute_games_tool
+from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
 from src.plex_actions import PLEX_ACTION_TOOL, execute_plex_action
@@ -104,6 +105,24 @@ Memory of past sessions:
   again is itself a signal they want a current answer, not a memory recall.
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
+
+Personal knowledge base (the user's private, curated facts — distinct from memory above):
+- You have a knowledge_search tool over a private store of things the user has personally
+  written down or explicitly taught you: their homelab and network topology, the Plex /
+  MEDIA-HOST runbook, 3D-printer profiles, work deployment notes, personal setup
+  decisions and preferences.
+- Keep three things straight. "Recent conversations" memory = what you DISCUSSED (episodic,
+  not authoritative). knowledge_search = the user's OWN curated facts and setup
+  (authoritative for anything about THEIR environment). web_search = PUBLIC facts.
+- For ANY question about the user's own setup, equipment, environment, configuration,
+  preferences, or a decision/runbook they recorded ("how is my homelab wired?", "what's
+  my printer's PETG profile?", "what did I decide about X?", "what's our runbook for Y?"),
+  call knowledge_search FIRST — before web_search, memory, or training. This is private
+  knowledge no public source or training run could contain.
+- Same fetch-first discipline as the other tools: trust the tool's result over training.
+  If knowledge_search returns nothing, say so plainly ("I don't have anything on that in
+  your knowledge base, sir") — do NOT fabricate an answer from training or guess.
+- Don't use it for public facts, general trivia, or live data — those have their own tools.
 
 Live information (you have six tools — pick the right one):
 1. get_sports_info — for live scores, schedules, and recent results in major leagues
@@ -211,6 +230,13 @@ Vision (you can see — two tools):
     Describe or explain conversationally — like glancing at their screen
     over their shoulder, not narrating a screenshot. Use camera_snapshot
     for the physical world, screen_snapshot for the digital one.
+
+Personal knowledge (your private store — one tool):
+14. knowledge_search — full-text search over the user's OWN curated knowledge
+    base (their setup, homelab, runbooks, printer profiles, anything they told
+    you to remember permanently). See the "Personal knowledge base" routing
+    rules above: for any question about THEIR environment or recorded
+    decisions, this comes before web_search, memory, or training.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -461,6 +487,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
+    "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -567,6 +594,7 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
+        KNOWLEDGE_SEARCH_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

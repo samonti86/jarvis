@@ -169,6 +169,8 @@ def listen_loop(
     plex_laptop_client: PlexLaptopClient | None = None,
     security_watcher: "SecurityWatcher | None" = None,
     on_enroll_face: "Callable[[], None] | None" = None,
+    on_knowledge_reindex: "Callable[[], None] | None" = None,
+    on_knowledge_remember: "Callable[[str], None] | None" = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -430,6 +432,26 @@ def listen_loop(
                     ui.set_state(State.IDLE)
                     continue
 
+            # M45: typed knowledge-base intents — same dispatch as the voice
+            # path (remember-permanently before reindex; both before Claude).
+            if not attachments and (
+                on_knowledge_remember is not None or on_knowledge_reindex is not None
+            ):
+                from src import knowledge as _kb  # noqa: PLC0415
+                _fact = (_kb.extract_remember_fact(text)
+                         if on_knowledge_remember is not None else None)
+                if _fact is not None:
+                    ui.add_user_text(text, "en")
+                    on_knowledge_remember(_fact)
+                    ui.set_state(State.IDLE)
+                    continue
+                if (on_knowledge_reindex is not None
+                        and _kb.matches_reindex_intent(text)):
+                    ui.add_user_text(text, "en")
+                    on_knowledge_reindex()
+                    ui.set_state(State.IDLE)
+                    continue
+
             ui.set_state(State.THINKING)
             try:
                 # Hardcoded 'en' for now — Claude still replies in the input's
@@ -528,6 +550,28 @@ def listen_loop(
                     if matches_enroll_intent(transcript.text):
                         ui.add_user_text(transcript.text, transcript.language)
                         on_enroll_face()
+                        ui.set_state(State.IDLE)
+                        continue
+
+                # M45: knowledge-base voice intents. AFTER face-enroll (a
+                # challenge/enroll utterance must win first), BEFORE Claude
+                # (so the LLM writes/refreshes the corpus instead of
+                # answering from training). "remember ... permanently" is
+                # tested before "update ... knowledge": it's the more
+                # specific intent (requires an explicit permanence word).
+                if on_knowledge_remember is not None or on_knowledge_reindex is not None:
+                    from src import knowledge as _kb  # noqa: PLC0415
+                    _fact = (_kb.extract_remember_fact(transcript.text)
+                             if on_knowledge_remember is not None else None)
+                    if _fact is not None:
+                        ui.add_user_text(transcript.text, transcript.language)
+                        on_knowledge_remember(_fact)
+                        ui.set_state(State.IDLE)
+                        continue
+                    if (on_knowledge_reindex is not None
+                            and _kb.matches_reindex_intent(transcript.text)):
+                        ui.add_user_text(transcript.text, transcript.language)
+                        on_knowledge_reindex()
                         ui.set_state(State.IDLE)
                         continue
 
@@ -772,6 +816,40 @@ def main() -> None:
         )
 
     ui.set_on_enroll_face(_trigger_face_enrollment)
+
+    # M45: knowledge-base triggers. Shared by the tray ("Reindex knowledge")
+    # AND the voice intents ("Jarvis, update your knowledge" / "remember this
+    # permanently: ..."). Non-blocking: the reindex / file-write is pure
+    # disk+sqlite I/O and runs on a throwaway daemon thread, but the spoken
+    # result MUST go through _announce (the WASAPI constraint — proactive
+    # speech only via the Announcer thread, never speak_streaming from a
+    # fresh thread). See project_wasapi_thread_audio_owner memory.
+    def _trigger_knowledge_reindex() -> None:
+        from src import knowledge as _knowledge  # noqa: PLC0415 — lazy
+
+        def _work() -> None:
+            try:
+                result = _knowledge.reindex()
+                _announce(result.message)
+            except Exception as exc:  # defensive — never strand the trigger
+                print(f"[knowledge] reindex trigger failed: {exc}", file=sys.stderr)
+                _announce("I couldn't update my knowledge, sir.")
+
+        threading.Thread(target=_work, daemon=True, name="kb-reindex").start()
+
+    def _trigger_knowledge_remember(fact: str) -> None:
+        from src import knowledge as _knowledge  # noqa: PLC0415 — lazy
+
+        def _work() -> None:
+            try:
+                _announce(_knowledge.remember_fact(fact))
+            except Exception as exc:
+                print(f"[knowledge] remember trigger failed: {exc}", file=sys.stderr)
+                _announce("I couldn't save that, sir.")
+
+        threading.Thread(target=_work, daemon=True, name="kb-remember").start()
+
+    ui.set_on_reindex_knowledge(_trigger_knowledge_reindex)
     # Wire the tray's Security-mode toggle to the watcher. Tray was already
     # constructed inside ui.run()'s worker thread, but the toggle's `checked`
     # callback re-evaluates each menu open, so this late wiring is fine.
@@ -784,7 +862,11 @@ def main() -> None:
     worker = threading.Thread(
         target=listen_loop,
         args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
-        kwargs={"on_enroll_face": _trigger_face_enrollment},
+        kwargs={
+            "on_enroll_face": _trigger_face_enrollment,
+            "on_knowledge_reindex": _trigger_knowledge_reindex,
+            "on_knowledge_remember": _trigger_knowledge_remember,
+        },
         daemon=True,
     )
     worker.start()
