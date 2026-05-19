@@ -265,6 +265,42 @@ def verify_frame(
     return matched
 
 
+def warm() -> None:
+    """Pay the ENTIRE first-call cost of the face stack up front — import,
+    HOG detector, AND the 68-point shape predictor + ResNet encoder — so
+    none of it faults in lazily on the latency-critical CHALLENGE path.
+
+    Why not just a blank verify_frame: on a blank frame `face_locations`
+    finds nothing, so `face_encodings` (the encoder JIT — the heavy part)
+    never runs. At a real challenge a real face IS present, so that cold
+    encoder burst lands on the "identify yourself" prompt (diagnosed
+    2026-05-19 from jarvis.log: input overflow at the prompt even after
+    the import was warmed). We close that hole by handing `face_encodings`
+    an EXPLICIT synthetic box: with a known location dlib runs the pose
+    predictor + ResNet on that region regardless of content — exercising
+    the exact code path verify_frame hits on a real face, no real face
+    required.
+
+    Never raises (mirrors verify_frame's defensive contract); a warm-up
+    failure just means the cost falls back to lazy, never a crash."""
+    if not _ensure_imported():
+        return
+    try:
+        # Content is irrelevant — we only need the models to execute once.
+        # np.zeros is C-contiguous, sidestepping the dlib negative-stride
+        # crash (see verify_frame / enroll_from_frames notes).
+        rgb = np.zeros((80, 80, 3), dtype=np.uint8)
+        _fr.face_locations(rgb, model="hog")  # HOG detector first-call
+        # Explicit (top, right, bottom, left) box → forces the pose
+        # predictor + ResNet encoder JIT without needing a detected face.
+        _fr.face_encodings(rgb, known_face_locations=[(8, 72, 72, 8)])
+    except Exception as exc:  # noqa: BLE001 — warm-up must never raise
+        print(
+            f"[face_auth] warm-up incomplete: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 # --- Enrollment voice flow -------------------------------------------------
 # Both the tray "Enroll my face" callback and the voice intent share the
 # same orchestration. Voice-first design: a tk popup with a countdown adds

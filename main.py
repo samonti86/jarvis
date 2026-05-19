@@ -707,6 +707,13 @@ def main() -> None:
         queue.Queue(maxsize=16)
     )
     announce_stop = threading.Event()
+    # Set WHILE a proactive announce is actually playing. The SecurityWatcher
+    # reads this to defer its heavy vision bursts (camera grab, YOLO + the
+    # per-tick gc.collect, face encode) so they never overlap speech — the
+    # cooperative speech gate that fixes the armed-only TTS stutter
+    # (diagnosed 2026-05-19: any GIL/CPU burst overlapping the Python-fed
+    # TTS path underruns the audio buffer). Owned by the Announcer thread.
+    announce_speaking = threading.Event()
 
     def _announcer_loop() -> None:
         """Dedicated proactive-speech thread (see comment above for why).
@@ -722,6 +729,11 @@ def main() -> None:
             text, on_done = item
             print(f"[announce] {text}")
             ui.add_system_text(f"🚨 {text}")
+            # Bracket actual playback so the watcher's cooperative gate
+            # (security._is_announcing) defers heavy bursts for exactly the
+            # window speech is on the wire. Cleared in finally so a TTS
+            # failure can't leave the watcher permanently throttled.
+            announce_speaking.set()
             try:
                 speak_streaming(
                     iter([text]),
@@ -732,6 +744,7 @@ def main() -> None:
             except Exception as exc:
                 print(f"[announce] TTS failed: {exc}", file=sys.stderr)
             finally:
+                announce_speaking.clear()
                 ui.set_state(State.IDLE)
                 if on_done is not None:
                     try:
@@ -800,6 +813,10 @@ def main() -> None:
         # mid-session takes effect without a restart.
         face_encoding_path=default_base_dir() / "security" / "face_encoding.npy",
         face_match_threshold=cfg.face_match_threshold,
+        # Cooperative speech gate (2026-05-19): the watcher defers heavy
+        # vision work for any tick this is set, so a YOLO/encode/warm burst
+        # can't starve the Python-fed TTS path and stutter an announce.
+        speaking_event=announce_speaking,
     )
 
     # M39: face-enrollment trigger. Shared by the tray menu "Enroll my face"

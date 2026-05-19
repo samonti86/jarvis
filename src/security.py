@@ -216,6 +216,32 @@ _MEMORY_WATCHDOG_MB = _watchdog_limit_mb()
 _MEMORY_MIN_AVAIL_MB = _watchdog_min_avail_mb()
 
 
+# JARVIS_YOLO_THREADS — cap on torch's intra-op thread pool for the armed
+# watcher's YOLOv8n inference. Default 1.
+#
+# Why this exists: torch defaults its intra-op pool to ALL physical cores.
+# On this 4-core box a single 0.5 Hz inference then pins every core for
+# ~200-400 ms; when that burst overlaps a TTS phrase it starves the
+# Python-fed audio threads, producing the *armed-only* speech stutter
+# (diagnosed 2026-05-18 from the input-overflow log signature — output
+# underrun is the same starvation, just uninstrumented). YOLOv8n on one
+# frame every 2 s has an enormous latency budget: 1 thread is ~0.5-1 s/
+# inference, still far inside the 2 s poll, and leaves 3 cores free so the
+# real-time audio thread never starves. Inference speed is irrelevant at
+# 0.5 Hz; free cores are not. Raise toward core-count only if inference
+# latency ever becomes the actual constraint (it is not at this cadence).
+# <= 0 → leave torch's default (uncapped) — for debugging/parity only.
+def _yolo_threads() -> int:
+    raw = os.getenv("JARVIS_YOLO_THREADS", "").strip()
+    try:
+        return int(raw) if raw else 1
+    except ValueError:
+        return 1
+
+
+_YOLO_THREADS = _yolo_threads()
+
+
 # --- Public API ------------------------------------------------------------
 # AnnounceFn signature: (text, on_done=None) → None. Caller-supplied;
 # main.py wraps speak_streaming so we get UI state coordination + the
@@ -254,6 +280,7 @@ class SecurityWatcher:
         smtp_to: str = "",
         face_encoding_path: Path | None = None,
         face_match_threshold: float = 0.5,
+        speaking_event: "threading.Event | None" = None,
     ) -> None:
         self._announce = announce
         self._on_armed_changed = on_armed_changed
@@ -294,6 +321,15 @@ class SecurityWatcher:
         self._face_encoding_path = face_encoding_path
         self._face_match_threshold = face_match_threshold
         self._enrolled_face = None  # numpy (128,) array, set on activate()
+        # Cooperative speech gate (2026-05-19). Set by the Announcer thread
+        # WHILE a proactive announce is playing. The watcher defers its
+        # heavy vision bursts (camera grab, YOLO + per-tick gc.collect,
+        # face encode, the cold-start warm) whenever this is set, so those
+        # GIL/CPU bursts never overlap the Python-fed TTS path and stutter
+        # the announce. None → gate disabled (degrades to pre-fix behaviour;
+        # never breaks the watcher). Generalises the M44 "cooperative yield
+        # while armed" follow-on; subsumes the A/B/C point-fixes.
+        self._speaking_event = speaking_event
 
         # Coordination primitives. _armed is the public state; _stop fires
         # when we need the watcher thread to wind down (overlaps with
@@ -516,6 +552,72 @@ class SecurityWatcher:
             return self._mark_authenticated("face")
         return False
 
+    def _is_announcing(self) -> bool:
+        """True while a proactive announce is on the wire. The cooperative
+        speech gate: heavy vision work must not overlap this (it starves
+        the Python-fed TTS path → audio stutter). None event → always
+        False, i.e. gate disabled, never breaks the watcher."""
+        return self._speaking_event is not None and self._speaking_event.is_set()
+
+    def _wait_for_quiet(self, timeout: float) -> bool:
+        """Block until no proactive announce is playing, or `timeout`
+        elapses, or _stop fires. Returns True if it should abort (stop
+        requested). Bounded so a dropped/never-cleared announce can't
+        deadlock the watcher — the gate degrades to 'proceed anyway',
+        never to a hang."""
+        deadline = time.monotonic() + timeout
+        while self._is_announcing() and time.monotonic() < deadline:
+            if self._stop.wait(0.2):
+                return True
+        return False
+
+    def _warm_face_auth(self) -> None:
+        """Pay the ENTIRE face-recognition/dlib cold-start cost once at
+        watcher start, in silence — not lazily on the CHALLENGE path.
+
+        Two costs, both GIL-holding bursts that stutter a Python-fed TTS
+        announce if they overlap it (diagnosed 2026-05-19 from jarvis.log):
+          1. `import face_recognition` — builds dlib's detector + 68-pt
+             shape predictor + ResNet and loads their model blobs.
+          2. the first real `face_encodings` — the encoder JIT, which a
+             blank-frame warm never triggered (no face → no encode), so
+             it used to fault in on the first real challenge face.
+        face_auth.warm() now pays BOTH (it forces the encoder via an
+        explicit synthetic box). And we run it only once the Announcer is
+        quiet, so the ~2 s burst doesn't overlap the "Standing watch"
+        confirmation either — the relocation bug the cooperative gate and
+        this wait exist to prevent. There's ample time: a person must walk
+        into frame before any challenge, and the 30 s arm-grace covers it.
+
+        No-op when face auth isn't enrolled (nothing to warm, and the
+        ~100 MB import would be pure waste). Defensive: any failure logs
+        and falls back to lazy behaviour — never blocks the watcher."""
+        if self._enrolled_face is None:
+            return
+        # Don't let the warm burst overlap the arm-confirmation announce.
+        # Settle briefly first so the Announcer has actually picked the
+        # queued item up and set the flag (it races our YOLO-load head
+        # start), then wait for it to finish.
+        if self._stop.wait(0.3):
+            return
+        if self._wait_for_quiet(timeout=20.0):
+            return  # stop requested while waiting — abort cleanly
+        t0 = time.monotonic()
+        try:
+            from src import face_auth  # noqa: PLC0415
+
+            face_auth.warm()
+        except Exception as exc:  # noqa: BLE001 — warm-up must never block arming
+            print(
+                f"[security] face auth warm-up skipped: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"[security] face auth warmed in {time.monotonic() - t0:.1f}s",
+            file=sys.stderr,
+        )
+
     def activate(self) -> None:
         """Idempotent: arming an already-armed system is a no-op (no second
         announcement, no second thread spawned)."""
@@ -545,7 +647,10 @@ class SecurityWatcher:
         # confirmation immediately. The 5s grace window starts now; by the
         # time the watcher's first inference fires, the user has had time
         # to step away from the camera.
-        self._safe_call(self._announce, "Security mode active, sir. I am standing watch.",
+        # Terse by design (2026-05-19): the project persona spec is "short,
+        # understated J.A.R.V.I.S." — and a shorter announce is also a
+        # smaller collision surface for the cooperative speech gate.
+        self._safe_call(self._announce, "Standing watch, sir.",
                         label="announce on activate")
 
         if self._thread is None or not self._thread.is_alive():
@@ -603,6 +708,13 @@ class SecurityWatcher:
 
         print("[security] watcher loop started", file=sys.stderr)
 
+        # Option C (2026-05-19): warm the face-recognition/dlib stack now,
+        # on this thread, during the harmless "standing watch" window —
+        # NOT lazily on the first CHALLENGE, where the heavy import stutters
+        # the time-critical "identify yourself" prompt. No-op when face auth
+        # isn't enrolled. See _warm_face_auth for the full diagnosis.
+        self._warm_face_auth()
+
         # M44 watchdog: resolve a psutil handle on this process once. Lazy +
         # defensive — psutil is a declared dep, but if it's somehow missing
         # the watcher must still run (just without the memory guard), per the
@@ -639,6 +751,25 @@ class SecurityWatcher:
                 # trip it logs, announces, and auto-disarms, then we exit.
                 if self._check_memory_watchdog(proc):
                     return
+
+                # Cooperative speech gate (2026-05-19). Never run a heavy
+                # vision burst — camera grab, YOLO + per-tick gc.collect,
+                # face encode — while a proactive announce is playing: the
+                # watcher thread and the Python-fed TTS path share the GIL
+                # + CPU, so an overlapping burst underruns the audio buffer
+                # and stutters the announce (the armed-only stutter). The
+                # cheap timeout + memory checks above stay live (safety);
+                # only the heavy block below is deferred. Safe to skip
+                # detection for the ~1-3 s an announce plays: the 30 s
+                # arm-grace covers it, the challenge timer only starts
+                # AFTER its prompt, and nobody authenticates in the few
+                # seconds Jarvis is talking. This is the architectural fix
+                # that subsumes the A/B/C point-fixes and the M44
+                # "cooperative yield" follow-on.
+                if self._is_announcing():
+                    if self._stop.wait(0.3):
+                        return
+                    continue
 
                 frame = self._grab_frame()
                 if frame is None:
@@ -827,8 +958,12 @@ class SecurityWatcher:
                   file=sys.stderr)
 
         try:
+            # Terse: drop the "within 15 seconds" recitation — the deterrent
+            # timer still runs; reciting the number adds nothing the user or
+            # an intruder needs, and the shorter prompt is a smaller speech-
+            # gate collision surface. Persona spec: short, understated.
             self._announce(
-                "Please identify yourself within the next 15 seconds, sir.",
+                "Identify yourself, sir.",
                 on_done=_start_challenge_timer,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1026,8 +1161,29 @@ class SecurityWatcher:
                 self._auto_disarm()
             return False
 
+        # Cap torch's intra-op pool so a 0.5 Hz inference can't pin all
+        # cores and starve the real-time audio threads (the armed-only TTS
+        # stutter). Lazy import for the same reason ultralytics is: torch is
+        # already in-process by here (YOLO pulled it), so this is cheap.
+        # set_num_threads is process-global, but YOLO is the only torch
+        # consumer (STT is ctranslate2/GPU-offloaded), so global == scoped
+        # in practice. <= 0 leaves torch's default (debug/parity escape).
+        threads_note = "uncapped"
+        if _YOLO_THREADS >= 1:
+            try:
+                import torch  # type: ignore  # noqa: PLC0415
+
+                torch.set_num_threads(_YOLO_THREADS)
+                threads_note = f"{_YOLO_THREADS} torch thread(s)"
+            except Exception as exc:  # noqa: BLE001 — never block arming on this
+                print(
+                    f"[security] could not cap torch threads: {exc}",
+                    file=sys.stderr,
+                )
+
         print(
-            f"[security] YOLO loaded in {time.monotonic() - t0:.1f}s",
+            f"[security] YOLO loaded in {time.monotonic() - t0:.1f}s "
+            f"({threads_note})",
             file=sys.stderr,
         )
         return True
