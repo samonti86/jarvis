@@ -82,6 +82,8 @@ PWA_HTML = r"""<!DOCTYPE html>
   #setup h2 { margin:0 0 4px; font-weight:600; }
   #setup p { margin:0; color:var(--dim); font-size:14px; }
   .hidden { display:none !important; }
+  #spk { background:#1c2735; }
+  #spk.on { background:#15281b; border-color:#225133; color:#7ee2a8; }
 </style>
 </head>
 <body>
@@ -97,11 +99,18 @@ PWA_HTML = r"""<!DOCTYPE html>
     <button id="disarm" class="ctl">Disarm</button>
   </div>
   <div class="row">
+    <button id="spk" class="ctl" aria-pressed="false">🔇 Speak replies: off</button>
+  </div>
+  <div class="row">
+    <button id="prb" class="ctl" style="display:none">▶︎ Tap to hear reply</button>
+  </div>
+  <div class="row">
     <input id="txt" type="text" autocomplete="off" autocapitalize="sentences"
            placeholder="Message Jarvis…" enterkeyhint="send">
     <button id="send">Send</button>
   </div>
 </footer>
+<audio id="ae" playsinline></audio>
 
 <div id="setup">
   <h2>Connect to Jarvis</h2>
@@ -117,6 +126,60 @@ PWA_HTML = r"""<!DOCTYPE html>
   const $ = id => document.getElementById(id);
   const log = $("log"), pill = $("pill"), armedEl = $("armed");
   let ws = null, retry = 0, token = localStorage.getItem("jarvisToken") || "";
+
+  // M48.2b — opt-in "Speak replies" (default OFF; phone-text stays silent
+  // unless you turn this on; audio is unicast to THIS phone, never the PC).
+  let speakOn = localStorage.getItem("jarvisSpeak") === "1";
+  const ae = document.getElementById("ae");
+  let _ctx = null, lastClip = null;
+  function logerr(where, e) {
+    line("sys", "audio " + where + " ✗ " +
+      (e && e.name ? e.name + ": " + (e.message || "") : e));
+  }
+  // M48.2b iOS audio — evidence-driven (real-device test 2026-05-19): the
+  // reply MP3 plays on iOS Edge via <audio> AFTER the full LLM round-trip
+  // (confirmed by ear). The earlier silent-clip keepalive was net-negative
+  // — the embedded WAV threw NotSupportedError (iOS <audio> rejects it) and
+  // the ended→re-prime replayed the MP3 on loop (a lock-screen media
+  // session that wouldn't stop). BOTH removed. Keep only a FILE-FREE
+  // AudioContext resume on the gesture (cannot NotSupportedError; harmless
+  // warm-up). The reply plays via <audio> in playReply(); a guaranteed
+  // manual ▶︎ tap (fresh gesture) is the fallback if a given auto-play is
+  // ever refused. No silent clip, no loop, no perpetual media session.
+  function primeAudio() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { if (!_ctx) _ctx = new AC();
+        if (_ctx.state === "suspended") _ctx.resume(); }
+    } catch (e) { /* file-free warm-up only; never blocks sending */ }
+  }
+  function playReply(b64, mime) {
+    lastClip = { b64, mime: mime || "audio/mpeg" };
+    $("prb").style.display = "none";
+    try {
+      ae.loop = false; ae.pause();  // hard stop anything prior; play ONCE
+      ae.src = "data:" + lastClip.mime + ";base64," + b64;
+      const p = ae.play();
+      if (p) p.then(() => {}).catch(e => onPlayBlocked(e));
+    } catch (e) { onPlayBlocked(e); }
+  }
+  function onPlayBlocked(e) {
+    // NotAllowedError is EXPECTED on iOS http-LAN (deferred autoplay is
+    // refused). Don't spam the scary platform string every reply — show a
+    // concise, actionable line + the guaranteed manual button. Surface the
+    // raw error only for genuinely unexpected failures.
+    if (e && e.name === "NotAllowedError")
+      line("sys", "🔊 Reply ready — tap ▶︎ below to hear it.");
+    else
+      logerr("play", e);
+    $("prb").style.display = "block";
+  }
+  function setSpk() {
+    const b = $("spk");
+    b.textContent = speakOn ? "🔊 Speak replies: ON" : "🔇 Speak replies: off";
+    b.classList.toggle("on", speakOn);
+    b.setAttribute("aria-pressed", speakOn ? "true" : "false");
+  }
 
   function line(cls, text) {
     const d = document.createElement("div");
@@ -135,21 +198,61 @@ PWA_HTML = r"""<!DOCTYPE html>
     armedEl.classList.toggle("on", !!on);
   }
 
+  // dial(): the single re-entrant entry point. Everything that wants a
+  // connection calls dial(), never connect() directly. The guard skips a
+  // redial only when a socket is OPEN, or is CONNECTING *with the watchdog
+  // still arming it*. A CONNECTING socket with no live watchdog is a frozen
+  // zombie — iOS leaves a post-resume handshake stuck at readyState 0
+  // FOREVER, firing neither onopen nor onclose; the old guard
+  // (`readyState===0` ⇒ skip) then wedged the console on "connecting…"
+  // permanently (the reopen-won't-reconnect bug — connection-stuck-in-
+  // CONNECTING never triggers the onclose-driven retry). The watchdog is
+  // what makes a stuck handshake recoverable instead of terminal.
+  let connWD = null;             // per-attempt connect watchdog
+  const CONN_TIMEOUT_MS = 6000;  // iOS post-resume handshakes hang silently
+  function clearWD() { if (connWD) { clearTimeout(connWD); connWD = null; } }
+
+  function dial() {
+    if (ws && ws.readyState === 1) return;            // already OPEN
+    if (ws && ws.readyState === 0 && connWD) return;  // watched connect in flight
+    connect();
+  }
+
   function connect() {
     if (!token) { $("setup").classList.add("show"); return; }
+    clearWD();
+    // Tear down any stale socket first (bfcache restore leaves a dead one
+    // whose handlers must not fire mid-redial).
+    try { if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); } }
+    catch (e) { /* already dead */ }
     $("setup").classList.remove("show");
     setPill("connecting…");
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => ws.send(JSON.stringify({ type:"auth", token }));
-    ws.onmessage = ev => {
+    const sock = new WebSocket(`${proto}://${location.host}/ws`);
+    ws = sock;
+    // Watchdog: if THIS socket hasn't reached OPEN within the timeout, the
+    // handshake is wedged (the classic iOS post-resume hang). Force-close
+    // it — that fires onclose → the backoff retry — and clears the
+    // in-flight flag so dial() is free to try again instead of skipping
+    // forever. Captures `sock` so a late timer can't kill a newer socket.
+    connWD = setTimeout(() => {
+      connWD = null;
+      if (sock.readyState !== 1) {
+        line("sys", "connection timed out — retrying");
+        try { sock.close(); } catch (e) {}
+      }
+    }, CONN_TIMEOUT_MS);
+    sock.onopen = () => sock.send(JSON.stringify({ type:"auth", token }));
+    sock.onmessage = ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       switch (m.type) {
-        case "auth_ok": retry = 0; setPill("connected", "#15803d"); break;
+        case "auth_ok": clearWD(); retry = 0;
+          setPill("connected", "#15803d"); break;
         case "auth_fail":
+          clearWD();
           localStorage.removeItem("jarvisToken"); token = "";
           $("err").textContent = "Token rejected. Try again.";
-          $("setup").classList.add("show"); ws.close(); break;
+          $("setup").classList.add("show"); sock.close(); break;
         case "snapshot":
           setArmed(m.armed);
           setPill(m.state || "connected",
@@ -159,21 +262,29 @@ PWA_HTML = r"""<!DOCTYPE html>
         case "user":   line("you", m.text); break;
         case "jarvis": line("jar", m.text); break;
         case "system": line("sys", m.text); break;
+        case "speak":  // M48.2b: unicast reply audio for THIS phone
+          playReply(m.b64, m.mime);
+          break;
       }
     };
-    ws.onclose = () => {
-      setPill("reconnecting…", "#b45309");
+    sock.onclose = () => {
+      clearWD();
+      setPill("reconnecting… (tap)", "#b45309");
       retry = Math.min(retry + 1, 6);
-      setTimeout(connect, 400 * retry);   // capped backoff
+      setTimeout(dial, 400 * retry);   // guarded; capped backoff
     };
-    ws.onerror = () => { try { ws.close(); } catch {} };
+    sock.onerror = () => { try { sock.close(); } catch (e) {} };
   }
 
   const live = () => ws && ws.readyState === 1;
   function sendText() {
     const t = $("txt").value.trim();
     if (!t || !live()) return;
-    ws.send(JSON.stringify({ type:"text", content:t }));
+    // Inside the Send tap/Enter gesture: start the silent keepalive so the
+    // <audio> element stays user-activated until the (possibly many-seconds-
+    // later) reply arrives and we hot-swap its src.
+    if (speakOn) primeAudio();
+    ws.send(JSON.stringify({ type:"text", content:t, speak: speakOn }));
     $("txt").value = "";
   }
   function control(action) {
@@ -182,20 +293,66 @@ PWA_HTML = r"""<!DOCTYPE html>
 
   $("send").onclick = sendText;
   $("txt").addEventListener("keydown", e => { if (e.key === "Enter") sendText(); });
+  // Toggle is itself a user gesture — unlock audio when turning it ON so a
+  // reply can play even if the first send happens fast.
+  $("spk").onclick = () => {
+    speakOn = !speakOn;
+    localStorage.setItem("jarvisSpeak", speakOn ? "1" : "0");
+    if (speakOn) primeAudio();
+    setSpk();
+  };
+  // Manual fallback: a fresh tap is guaranteed user-activation, so this
+  // always works even if iOS refused the deferred auto-play.
+  $("prb").onclick = () => {
+    if (lastClip) {
+      ae.loop = false;
+      ae.src = "data:" + lastClip.mime + ";base64," + lastClip.b64;
+      ae.play().catch(e => logerr("manual", e));
+    }
+    $("prb").style.display = "none";
+  };
+  // (No ended→re-prime: that re-played the reply MP3 on loop. Each new
+  //  Send is its own gesture and re-primes; a reply plays exactly once.)
+  setSpk();  // reflect persisted state at load
   $("arm").onclick = () => control("arm");
   $("disarm").onclick = () => control("disarm");
+  // The status pill is a GUARANTEED manual reconnect: a tap is a fresh user
+  // gesture (iOS is far more permissive about WS creation inside one than in
+  // throttled background JS), so even if every automatic redial is refused,
+  // one tap always recovers. This is the reconnect analog of the ▶︎ button —
+  // ship the reliable manual path now; HTTPS/Tailscale makes the automatic
+  // path robust later (same strategic call as the audio one-tap).
+  pill.style.cursor = "pointer";
+  pill.title = "Tap to reconnect";
+  pill.addEventListener("click", () => {
+    if (ws && ws.readyState === 1) return;   // already connected
+    retry = 0; clearWD();
+    try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
+    ws = null; connect();
+  });
   $("save").onclick = () => {
     const v = $("tok").value.trim();
     if (!v) return;
     token = v; localStorage.setItem("jarvisToken", v);
     $("err").textContent = ""; connect();
   };
-  // Mobile Safari suspends the socket when backgrounded — re-dial on return.
+  // iOS suspends the socket when backgrounded — re-dial on return.
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && !live()) connect();
+    if (!document.hidden) dial();
   });
+  // bfcache: closing+reopening the browser RESTORES a frozen page with a
+  // DEAD ws. visibilitychange does NOT fire for that — pageshow does, with
+  // e.persisted === true. Without this, the only recovery was clearing
+  // cache (forcing a fresh load). Hard-reset the stale socket + re-dial.
+  window.addEventListener("pageshow", e => {
+    if (e.persisted) {
+      try { if (ws) { ws.onclose = null; ws.close(); } } catch (x) {}
+      ws = null; retry = 0; dial();
+    }
+  });
+  window.addEventListener("online", dial);   // network came back
 
-  connect();
+  dial();
 })();
 </script>
 </body>

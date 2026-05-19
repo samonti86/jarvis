@@ -203,11 +203,15 @@ def listen_loop(
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
     # process_question. attachments is list[tuple[str, dict]] (filename + block).
-    # M48.2: item is (text, attachments, origin). origin ∈ {"console",
-    # "phone_text"} — the text path uses it to gate TTS per-turn (phone_text
-    # → text-only). Voice path calls process_question directly (not via this
-    # queue), so it's unaffected and still speaks.
-    text_queue: queue.Queue[tuple[str, list[tuple[str, dict]], str]] = queue.Queue()
+    # M48.2/M48.2b: item is (text, attachments, origin, reply_audio).
+    # origin ∈ {"console","phone_text"} gates per-turn TTS on the PC.
+    # reply_audio: None (console — PC behaviour) or a conn-bound sink
+    # (phone with "Speak replies" on) — its presence routes this reply's
+    # audio to THAT phone instead of the PC. Voice path calls
+    # process_question directly (not via this queue), unaffected.
+    text_queue: queue.Queue[
+        tuple[str, list[tuple[str, dict]], str, "Callable[[bytes], None] | None"]
+    ] = queue.Queue()
 
     def seal_and_refresh() -> None:
         """Seal the active session (if any) and reload summaries for the next one."""
@@ -222,6 +226,7 @@ def listen_loop(
         language: str,
         attachments: list[dict] | None = None,
         origin: str = "voice",
+        reply_audio: "Callable[[bytes], None] | None" = None,
     ) -> None:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
@@ -365,8 +370,15 @@ def listen_loop(
             # path to keep correct.
             silent = muted or not speak
 
+            # M48.2b: reply_audio set ⇒ this turn's reply audio goes to the
+            # ORIGINATING PHONE, never the PC. The PC therefore drains
+            # silently for it (like the mute path), and the synth-to-phone
+            # below is mute-INDEPENDENT (the locked rule: the remote user
+            # must hear the answer they asked for, regardless of PC mute).
+            pc_silent = silent or reply_audio is not None
+
             try:
-                if silent:
+                if pc_silent:
                     # Drain the LLM stream silently. response_chunks gets
                     # populated inside llm_stream via the print + append, so
                     # the rest of the function (full_response assembly,
@@ -398,12 +410,16 @@ def listen_loop(
                     if language == "es"
                     else "Apologies, a technical hiccup. Could you try that again?"
                 )
-                if not silent:
+                if not pc_silent:
                     ui.set_state(State.SPEAKING)
                     try:
                         speak(apology, language=language)
                     except Exception as apology_exc:
                         print(f"[main] apology TTS also failed: {apology_exc}")
+                # Phone-audio turns: the apology TEXT still reaches the phone
+                # via the fan-out below; we deliberately don't synth audio on
+                # the error path (extra failure surface for little gain — the
+                # text is enough to convey the hiccup).
                 ui.add_jarvis_text(apology)
                 return
             print()
@@ -421,6 +437,26 @@ def listen_loop(
             memory.record_turn(text, full_response, language)
 
             ui.add_jarvis_text(full_response)
+
+            # M48.2b: speak the reply to the phone that asked (UNICAST,
+            # mute-independent). Whole-reply-at-completion v1 — matches the
+            # at-completion text parity; streamed audio is a documented
+            # deferrable. Same edge-tts voice as the PC (VOICE_BY_LANG).
+            # Defensive: the text already reached the phone via the fan-out
+            # above, so a synth/transport hiccup must NEVER break the turn.
+            if reply_audio is not None:
+                try:
+                    import asyncio  # noqa: PLC0415 — lazy per main.py convention
+                    from src.text_to_speech import (  # noqa: PLC0415
+                        DEFAULT_VOICE, VOICE_BY_LANG, _fetch_mp3,
+                    )
+
+                    voice = VOICE_BY_LANG.get(language, DEFAULT_VOICE)
+                    mp3 = asyncio.run(_fetch_mp3(full_response, voice))
+                    reply_audio(mp3)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[main] phone reply audio failed: {exc}",
+                          file=sys.stderr)
             print()
 
     def text_input_loop() -> None:
@@ -433,7 +469,7 @@ def listen_loop(
                 continue
             if ui.shutdown.is_set():
                 break
-            text, attachments, origin = item
+            text, attachments, origin, reply_audio = item
             blocks = [block for _, block in attachments] if attachments else []
             print(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
@@ -501,6 +537,7 @@ def listen_loop(
                 # from it. Console-typed = "console" → unchanged behaviour.
                 process_question(
                     text, "en", attachments=blocks, origin=origin,
+                    reply_audio=reply_audio,
                 )
             finally:
                 ui.set_state(State.IDLE)
@@ -510,7 +547,9 @@ def listen_loop(
     # an LLM stream + TTS playback is in progress. Lambda repackages the
     # (text, attachments) args into a single queue item.
     ui.set_on_text_submit(
-        lambda text, attachments: text_queue.put((text, attachments, "console"))
+        lambda text, attachments: text_queue.put(
+            (text, attachments, "console", None)  # console → no phone audio sink
+        )
     )
 
     # M48.1: now that text_queue exists, wire the remote console's converse
@@ -518,8 +557,14 @@ def listen_loop(
     # text — exactly the design intent). on_control was already wired in
     # main() where SecurityWatcher is in scope.
     if remote_server is not None:
+        # M48.2b: the server passes a per-turn reply_audio sink bound to the
+        # originating phone conn (or None if its "Speak replies" toggle is
+        # off). reply_audio's presence IS the routing decision downstream:
+        # non-None ⇒ this reply's audio goes to THAT phone, not the PC.
         remote_server.set_on_text(
-            lambda t: text_queue.put((t, [], "phone_text"))
+            lambda t, reply_audio: text_queue.put(
+                (t, [], "phone_text", reply_audio)
+            )
         )
 
     text_thread = threading.Thread(target=text_input_loop, daemon=True)

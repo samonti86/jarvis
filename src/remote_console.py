@@ -29,6 +29,7 @@ server thread just means "no remote console", never a crashed Jarvis.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import sys
@@ -75,7 +76,12 @@ class RemoteConsoleServer:
         # that's up (mirrors main.py's on_enroll_face / on_knowledge_*
         # late-injection pattern). Safe stubs until then: an early phone
         # message is just dropped with a log, never an exception.
-        self._on_text = on_text or (lambda t: _log(f"text dropped (not wired yet): {t!r}"))
+        # M48.2b: on_text now takes (text, reply_audio). reply_audio is a
+        # thread-safe closure bound to THIS conn that unicasts a synthesized
+        # mp3 back as {type:"speak"} — or None when the phone didn't ask for
+        # audio (the "Speak replies" toggle off). Its presence/absence IS
+        # the routing decision downstream ("audio → this phone, not the PC").
+        self._on_text = on_text or (lambda t, ra: _log(f"text dropped (not wired yet): {t!r}"))
         self._on_control = on_control or (lambda a: {"armed": self._snapshot.get("armed", False)})
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -85,7 +91,9 @@ class RemoteConsoleServer:
         # sees the correct state instead of a blank console.
         self._snapshot: dict = {"state": "idle", "armed": False}
 
-    def set_on_text(self, fn: Callable[[str], None]) -> None:
+    def set_on_text(
+        self, fn: "Callable[[str, Callable[[bytes], None] | None], None]"
+    ) -> None:
         self._on_text = fn
 
     def set_on_control(self, fn: Callable[[str], dict]) -> None:
@@ -228,8 +236,21 @@ class RemoteConsoleServer:
                 # origin) appears exactly once via the JarvisUI.add_user_text
                 # fan-out — the single source of truth. Echoing here too
                 # would double phone-typed lines.
+                #
+                # M48.2b: the phone's "Speak replies" toggle rides per-message
+                # ({"speak": true}) — stateless, no session-state desync. If
+                # on, hand process_question a sink BOUND TO THIS conn so the
+                # spoken reply is UNICAST back to the phone that asked (never
+                # broadcast — only this device should hear it; the text
+                # transcript keeps its fan-out). If off, pass None → today's
+                # silent-phone-text behaviour, unchanged.
+                want_audio = bool(msg.get("speak"))
+                reply_audio = (
+                    (lambda mp3: self._send_audio(conn, mp3))
+                    if want_audio else None
+                )
                 try:
-                    self._on_text(content)
+                    self._on_text(content, reply_audio)
                 except Exception as exc:  # noqa: BLE001
                     _log(f"on_text raised: {exc}")
             return
@@ -281,6 +302,28 @@ class RemoteConsoleServer:
             await conn.send(data)
         except Exception:  # noqa: BLE001 — client gone; handler cleans up
             self._clients.discard(conn)
+
+    def _send_audio(self, conn: ServerConnection, mp3: bytes) -> None:
+        """M48.2b — UNICAST a synthesized reply clip to one phone (the one
+        that asked). Thread-safe: process_question runs on the listen_loop
+        thread; marshal onto the server's loop exactly like broadcast().
+        Not a broadcast — only the originating device should hear it (the
+        text transcript fan-out is separate). Dropped if the loop is gone
+        or the clip is empty (defensive — never break the turn)."""
+        loop = self._loop
+        if loop is None or not mp3:
+            return
+        payload = json.dumps({
+            "type": "speak",
+            "mime": "audio/mpeg",
+            "b64": base64.b64encode(mp3).decode("ascii"),
+        })
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._send_one(conn, payload))
+            )
+        except RuntimeError:
+            pass  # loop closed during shutdown — nothing to do
 
     @staticmethod
     async def _safe_send(conn: ServerConnection, payload: dict) -> None:
