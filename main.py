@@ -221,7 +221,7 @@ def listen_loop(
         text: str,
         language: str,
         attachments: list[dict] | None = None,
-        speak: bool = True,
+        origin: str = "voice",
     ) -> None:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
@@ -230,14 +230,19 @@ def listen_loop(
         setting THINKING before calling; SPEAKING is set automatically when
         TTS audio starts.
 
-        `speak` (M48.2): per-turn audio gate, independent of the global mute
-        toggle. Default True = behave as before (PC voice + PC console text
-        speak on the PC, subject to mute). The phone-TEXT path passes
-        speak=False so a message typed from the phone is answered in text
-        ONLY — never spoken aloud on the PC to an empty room (the routing
-        rule: the reply follows the request's origin/modality). Phone-VOICE
-        (M48.3) will instead redirect the audio sink to the phone; this
-        slice is just the silent-phone-text half.
+        `origin` (M48.2/M48.2a): where the turn came from — the single
+        honest signal two separate per-turn concerns derive from:
+          - "voice"      : PC wake word     → speaks (subject to mute), full tools
+          - "console"    : PC typed         → speaks (subject to mute), full tools
+          - "phone_text" : phone typed      → text-only, RESTRICTED tools
+          - "phone_voice": phone PTT (M48.3)→ audio→phone, RESTRICTED tools
+        `speak` and `restricted` are derived below — they are NOT the same
+        axis (phone_voice will speak yet still be restricted), which is why
+        the prior single `speak` bool was replaced by `origin`. The phone
+        gets a deliberately reduced tool surface (no system_control /
+        pc_shell / collector / plex_action; no file/screen/camera) —
+        enforced server-side in stream_response, NOT prompt-only
+        ([[feedback-jarvis-least-privilege]], [[feedback-diag-vs-action-split]]).
 
         When attachments is non-empty, the user message becomes a list of
         content blocks (attachments first, then a text block) instead of a
@@ -245,6 +250,14 @@ def listen_loop(
         Q&A about an attached document works naturally until reset/trim.
         """
         nonlocal session_language, session_started_at, last_turn_time
+
+        # M48.2/M48.2a — the two per-turn concerns, derived from one origin.
+        # speak: phone-text is text-only (M48.2); everything else speaks
+        # (subject to mute). restricted: any phone origin gets the reduced
+        # tool surface (M48.2a) — phone_voice (M48.3) will speak AND be
+        # restricted, which is why these are separate axes off `origin`.
+        speak = origin != "phone_text"
+        restricted = origin in ("phone_text", "phone_voice")
 
         with processing_lock:
             # Apply any pending reset/idle boundary BEFORE this turn — so the
@@ -334,6 +347,7 @@ def listen_loop(
                     on_complete=on_telemetry,
                     on_image_captured=on_image_captured,
                     engineer_mode=engineer,
+                    restricted=restricted,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
@@ -480,12 +494,13 @@ def listen_loop(
                 # language thanks to the system prompt, but TTS picks the
                 # English voice. Add language detection here if it becomes a
                 # real Spanish-typed-input use case.
-                # M48.2: phone-typed turns are answered in text only — never
-                # spoken on the PC (the routing rule). Console-typed keeps
-                # its existing behaviour (speaks unless globally muted).
+                # M48.2/M48.2a: pass the queue's origin straight through —
+                # process_question derives BOTH the text-only gate
+                # (phone_text doesn't speak on the PC) AND the restricted
+                # tool surface (phone origins lose system/shell/file/etc.)
+                # from it. Console-typed = "console" → unchanged behaviour.
                 process_question(
-                    text, "en", attachments=blocks,
-                    speak=(origin != "phone_text"),
+                    text, "en", attachments=blocks, origin=origin,
                 )
             finally:
                 ui.set_state(State.IDLE)

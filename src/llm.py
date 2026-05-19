@@ -365,6 +365,27 @@ Actions (destructive, all confirmation-gated):
   have a tool you don't."""
 
 
+# M48.2a — appended only for a RESTRICTED (phone/web remote) session. The
+# server-side tool filter is the real boundary (a phone turn never even
+# receives the blocked tools); this addendum just keeps Claude from
+# *promising* a tool it no longer has, so it degrades gracefully instead
+# of "I'll run a diagnostic…" then silently failing. Defense in depth, not
+# the enforcement itself ([[feedback-diag-vs-action-split]]).
+_REMOTE_RESTRICTED_ADDENDUM = """
+
+Remote session (limited capability):
+- You are answering from the user's phone / web console, not the PC.
+- For safety this session CANNOT run system control, the investigative
+  shell, the deep diagnostics collector, Plex admin actions, local file
+  reads, or screen/camera capture — those tools are simply not available
+  here (this is enforced, not advisory).
+- If asked for one, say plainly it's not available from the remote console
+  and offer what you CAN do: answer and look things up, check live
+  read-only PC/Plex health, search the user's knowledge base, and they can
+  arm/disarm security with the console's own buttons. Don't pretend, don't
+  apologize at length — just redirect."""
+
+
 # Anthropic's server-side web search tool. Server-side = Anthropic runs it,
 # we just declare it. The "_20260209" version includes dynamic filtering.
 # Supported on Sonnet 4.6, Opus 4.6, Opus 4.7.
@@ -443,6 +464,7 @@ def build_system_prompt(
     plex_available: bool = False,
     plex_laptop_available: bool = False,
     engineer_mode: bool = False,
+    remote_restricted: bool = False,
 ) -> str:
     """Compose the system prompt with the current date and optional memory.
 
@@ -469,6 +491,11 @@ def build_system_prompt(
         base += _PLEX_LAPTOP_PROMPT_ADDENDUM
     if engineer_mode:
         base += _ENGINEER_PROMPT_ADDENDUM
+    if remote_restricted:
+        # Stable per session-origin (a turn is restricted or not for its
+        # whole life), so it stays in the cacheable prefix like the other
+        # addenda — no prompt-cache churn.
+        base += _REMOTE_RESTRICTED_ADDENDUM
     if not summaries:
         return base
     memory_block = format_summaries_for_prompt(summaries)
@@ -511,6 +538,25 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "screen_snapshot":              _ClientTool(execute_screen_snapshot, "screen"),
 }
 
+# M48.2a — the per-session capability boundary. A RESTRICTED session
+# (phone/web remote, keyed off the turn `origin` in main.py) gets every
+# tool EXCEPT these. Two classes, both per the locked spec:
+#   BLOCK (mutating / dangerous): can change the PC or Plex.
+#   EXCLUDE (read-only but sensitive on a loseable phone): can read PC
+#     files or open the screen/webcam remotely.
+# Single source of truth — applied at BOTH gates (the tool-list filter in
+# stream_response AND the _execute_client_tool dispatch), so it is
+# enforced server-side, never prompt-only ([[feedback-diag-vs-action-split]],
+# [[feedback-jarvis-least-privilege]]). Match is by tool NAME, so it also
+# covers plex_action (in _PLEX_LAPTOP_DISPATCH) and any future name.
+_RESTRICTED_DENY: frozenset[str] = frozenset({
+    # BLOCK — mutating / dangerous
+    "system_control", "pc_shell", "run_pc_diagnostics_collector", "plex_action",
+    # EXCLUDE — read-only but sensitive from a remote
+    "read_local_file", "screen_snapshot", "camera_snapshot",
+})
+
+
 # Server-side tools — Anthropic runs these; we only declare them (in
 # stream_response's `tools` list) and record that they fired. Ordered:
 # defines telemetry order. Each name doubles as its own stderr label.
@@ -534,10 +580,25 @@ def _execute_client_tool(
     tool_input: dict,
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
+    restricted: bool = False,
 ) -> str | list[dict]:
     """Dispatch a client-side tool call. Returns text (or, for camera_snapshot,
     a list of content blocks) for Claude to consume. Errors become readable
-    strings — never raises."""
+    strings — never raises.
+
+    `restricted` (M48.2a): second gate of the capability boundary. The
+    tool-list filter in stream_response already prevents a restricted
+    session from being OFFERED a denied tool; this refuses to EXECUTE one
+    even if a denied name reaches here anyway (model quirk, prompt
+    injection from the phone, a future code path). Server-side, not
+    prompt-only — the [[feedback-diag-vs-action-split]] rule."""
+    if restricted and name in _RESTRICTED_DENY:
+        print(f"[llm] restricted session denied tool '{name}'", file=sys.stderr)
+        return (
+            f"The '{name}' tool isn't available from the remote console "
+            f"(safety: this session can't run system, shell, file, or "
+            f"screen/camera tools)."
+        )
     try:
         client_tool = _CLIENT_TOOLS.get(name)
         if client_tool is not None:
@@ -564,6 +625,7 @@ def stream_response(
     on_complete: Callable[[TelemetryRecord], None] | None = None,
     on_image_captured: Callable[[bytes, str, str], None] | None = None,
     engineer_mode: bool = False,
+    restricted: bool = False,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -597,6 +659,7 @@ def stream_response(
         plex_available=plex_client is not None,
         plex_laptop_available=plex_laptop_client is not None,
         engineer_mode=engineer_mode,
+        remote_restricted=restricted,
     )
     system_param = [
         {
@@ -622,6 +685,14 @@ def stream_response(
         ])
     if plex_client is not None:
         tools.extend(plex_client.tools)
+
+    # M48.2a — the capability boundary's PRIMARY gate: a restricted
+    # (phone/web remote) turn is never even OFFERED a denied tool. Filter
+    # by schema name AFTER all extends so it covers built-ins, the SSH
+    # family (plex_action), and dynamic Plex MCP names uniformly. The
+    # _execute_client_tool deny-check is the defense-in-depth second gate.
+    if restricted:
+        tools = [t for t in tools if t.get("name") not in _RESTRICTED_DENY]
 
     # Mutable working copy — we append assistant + tool_result turns as the
     # agentic loop runs. The caller's `messages` list is left untouched.
@@ -717,6 +788,7 @@ def stream_response(
                 block.input or {},
                 plex_client=plex_client,
                 plex_laptop_client=plex_laptop_client,
+                restricted=restricted,
             )
             # Vision tools (camera_snapshot, screen_snapshot) return a list
             # containing an image block + a caption text block. If a UI hook
