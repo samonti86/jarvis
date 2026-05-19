@@ -36,6 +36,9 @@ class Config:
     smtp_password: str         # M38 — for Gmail: a 16-char App Password, NOT the account password
     smtp_to: str               # M38 — recipient address (comma-separated allowed). Blank disables email path.
     face_match_threshold: float  # M39 — max Euclidean distance for a face match. 0.5 = security-grade strict; 0.6 = face_recognition's permissive default.
+    remote_token: str          # M48 — shared secret the phone PWA must present on WS connect. BLANK = remote console DISABLED (safe default: the server only starts when a token is set).
+    remote_port: int           # M48 — TCP port the LAN remote-console server listens on.
+    remote_bind: str           # M48 — interface to bind. "0.0.0.0" = all (LAN-reachable; the token + a LAN-only firewall rule are the controls). Never port-forward this.
 
 
 def load() -> Config:
@@ -68,4 +71,12 @@ def load() -> Config:
         smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
         smtp_to=os.getenv("SMTP_TO", "").strip(),
         face_match_threshold=float(os.getenv("JARVIS_FACE_MATCH_THRESHOLD", "0.5")),
+        # M48 remote console (LAN). Token blank → feature OFF (the server is
+        # never started). This is the safe default: the remote surface — which
+        # can arm/disarm security — only exists once you've deliberately set a
+        # secret. Bind 0.0.0.0 so it's LAN-reachable; the token + a LAN-scoped
+        # Windows Firewall rule are the security controls. Do NOT port-forward.
+        remote_token=os.getenv("JARVIS_REMOTE_TOKEN", "").strip(),
+        remote_port=int(os.getenv("JARVIS_REMOTE_PORT", "8765")),
+        remote_bind=os.getenv("JARVIS_REMOTE_BIND", "0.0.0.0").strip(),
     )

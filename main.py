@@ -171,6 +171,7 @@ def listen_loop(
     on_enroll_face: "Callable[[], None] | None" = None,
     on_knowledge_reindex: "Callable[[], None] | None" = None,
     on_knowledge_remember: "Callable[[str], None] | None" = None,
+    remote_server: object | None = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -202,7 +203,11 @@ def listen_loop(
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
     # process_question. attachments is list[tuple[str, dict]] (filename + block).
-    text_queue: queue.Queue[tuple[str, list[tuple[str, dict]]]] = queue.Queue()
+    # M48.2: item is (text, attachments, origin). origin ∈ {"console",
+    # "phone_text"} — the text path uses it to gate TTS per-turn (phone_text
+    # → text-only). Voice path calls process_question directly (not via this
+    # queue), so it's unaffected and still speaks.
+    text_queue: queue.Queue[tuple[str, list[tuple[str, dict]], str]] = queue.Queue()
 
     def seal_and_refresh() -> None:
         """Seal the active session (if any) and reload summaries for the next one."""
@@ -216,6 +221,7 @@ def listen_loop(
         text: str,
         language: str,
         attachments: list[dict] | None = None,
+        speak: bool = True,
     ) -> None:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
@@ -223,6 +229,15 @@ def listen_loop(
         (after typed Enter, optional attachments). Caller is responsible for
         setting THINKING before calling; SPEAKING is set automatically when
         TTS audio starts.
+
+        `speak` (M48.2): per-turn audio gate, independent of the global mute
+        toggle. Default True = behave as before (PC voice + PC console text
+        speak on the PC, subject to mute). The phone-TEXT path passes
+        speak=False so a message typed from the phone is answered in text
+        ONLY — never spoken aloud on the PC to an empty room (the routing
+        rule: the reply follows the request's origin/modality). Phone-VOICE
+        (M48.3) will instead redirect the audio sink to the phone; this
+        slice is just the silent-phone-text half.
 
         When attachments is non-empty, the user message becomes a list of
         content blocks (attachments first, then a text block) instead of a
@@ -330,8 +345,14 @@ def listen_loop(
             # already visible in the console regardless.
             muted = ui.is_muted()
 
+            # M48.2: phone-text turns are text-only by origin (speak=False),
+            # independent of the global mute toggle. Folded into the same
+            # silent-drain path mute already uses — one branch, no new code
+            # path to keep correct.
+            silent = muted or not speak
+
             try:
-                if muted:
+                if silent:
                     # Drain the LLM stream silently. response_chunks gets
                     # populated inside llm_stream via the print + append, so
                     # the rest of the function (full_response assembly,
@@ -355,14 +376,15 @@ def listen_loop(
                 # A path (no streaming pipeline that could fail again). Wrap
                 # in defensive try/except so the apology itself can't break
                 # the loop. Add to transcript too so the console reflects it.
-                # When muted, skip TTS but still surface the apology text in
-                # the console — visual feedback that something went wrong.
+                # When silent (muted OR phone-text origin), skip the spoken
+                # apology but still surface its text — the phone/console sees
+                # the hiccup, the PC stays quiet to its empty room.
                 apology = (
                     "Disculpe, tuve un problema técnico. ¿Podría intentarlo de nuevo?"
                     if language == "es"
                     else "Apologies, a technical hiccup. Could you try that again?"
                 )
-                if not muted:
+                if not silent:
                     ui.set_state(State.SPEAKING)
                     try:
                         speak(apology, language=language)
@@ -397,7 +419,7 @@ def listen_loop(
                 continue
             if ui.shutdown.is_set():
                 break
-            text, attachments = item
+            text, attachments, origin = item
             blocks = [block for _, block in attachments] if attachments else []
             print(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
@@ -458,7 +480,13 @@ def listen_loop(
                 # language thanks to the system prompt, but TTS picks the
                 # English voice. Add language detection here if it becomes a
                 # real Spanish-typed-input use case.
-                process_question(text, "en", attachments=blocks)
+                # M48.2: phone-typed turns are answered in text only — never
+                # spoken on the PC (the routing rule). Console-typed keeps
+                # its existing behaviour (speaks unless globally muted).
+                process_question(
+                    text, "en", attachments=blocks,
+                    speak=(origin != "phone_text"),
+                )
             finally:
                 ui.set_state(State.IDLE)
 
@@ -467,8 +495,17 @@ def listen_loop(
     # an LLM stream + TTS playback is in progress. Lambda repackages the
     # (text, attachments) args into a single queue item.
     ui.set_on_text_submit(
-        lambda text, attachments: text_queue.put((text, attachments))
+        lambda text, attachments: text_queue.put((text, attachments, "console"))
     )
+
+    # M48.1: now that text_queue exists, wire the remote console's converse
+    # path to the SAME seam (the brain can't tell phone text from console
+    # text — exactly the design intent). on_control was already wired in
+    # main() where SecurityWatcher is in scope.
+    if remote_server is not None:
+        remote_server.set_on_text(
+            lambda t: text_queue.put((t, [], "phone_text"))
+        )
 
     text_thread = threading.Thread(target=text_input_loop, daemon=True)
     text_thread.start()
@@ -876,6 +913,51 @@ def main() -> None:
         is_armed=security_watcher.is_armed,
     )
 
+    # M48.1: LAN remote console. Gated on the token — blank ⇒ the server is
+    # NEVER constructed (a surface that can disarm security must not exist
+    # unless deliberately configured with a secret;
+    # [[feedback-jarvis-least-privilege]]). on_control is wired here
+    # (SecurityWatcher is in scope); on_text is wired later in listen_loop
+    # once the text_queue exists (the on_enroll_face / on_knowledge_*
+    # late-injection pattern). Optional + defensive: a failure to start
+    # logs and continues — never blocks the assistant.
+    remote_server = None
+    if cfg.remote_token:
+
+        def _remote_control(action: str) -> dict:
+            try:
+                if action == "arm":
+                    security_watcher.activate()
+                elif action == "disarm":
+                    security_watcher.deactivate()
+                # "status" is read-only — just report below.
+            except Exception as exc:  # noqa: BLE001 — never break on a remote ask
+                print(f"[remote] control {action!r} failed: {exc}", file=sys.stderr)
+            return {"armed": bool(security_watcher.is_armed())}
+
+        try:
+            # Import is INSIDE the try: a missing `websockets` (or any
+            # import error in remote_console/remote_pwa) must degrade to
+            # "no remote console", never an unhandled ImportError that
+            # breaks startup — the project's optional-component contract.
+            from src.remote_console import RemoteConsoleServer  # noqa: PLC0415
+
+            remote_server = RemoteConsoleServer(
+                token=cfg.remote_token,
+                host=cfg.remote_bind,
+                port=cfg.remote_port,
+                on_control=_remote_control,
+            )
+            ui.set_remote(remote_server)
+            remote_server.start()
+        except Exception as exc:  # noqa: BLE001 — optional; must not block startup
+            print(f"[remote] failed to start (continuing without it): {exc}",
+                  file=sys.stderr)
+            remote_server = None
+    else:
+        print("[remote] JARVIS_REMOTE_TOKEN unset — remote console disabled",
+              file=sys.stderr)
+
     worker = threading.Thread(
         target=listen_loop,
         args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
@@ -883,6 +965,7 @@ def main() -> None:
             "on_enroll_face": _trigger_face_enrollment,
             "on_knowledge_reindex": _trigger_knowledge_reindex,
             "on_knowledge_remember": _trigger_knowledge_remember,
+            "remote_server": remote_server,
         },
         daemon=True,
     )

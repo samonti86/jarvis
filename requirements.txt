@@ -52,6 +52,13 @@ paramiko>=3.4
 # (first new consumer of the M43 extraction); feedparser only parses them.
 feedparser>=6.0
 
+# Remote console (M48) — LAN-only phone/web console. Pure-Python, no heavy
+# transitive deps; runs its own asyncio loop in a daemon thread (the app is
+# threaded). stdlib has no WS server, so a dep is genuinely required (the
+# M47 dep-asymmetry principle); `websockets` is the minimal robust choice
+# over aiohttp/FastAPI, and serves the one-page PWA from its HTTP handler.
+websockets>=13.0
+
 # Camera vision (M29) — grab a still frame from the USB webcam for the
 # camera_snapshot tool, which hands the image to Claude (multimodal) to
 # describe. headless = no GUI/Qt bits we don't need. cv2.VideoCapture also

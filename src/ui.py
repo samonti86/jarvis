@@ -22,6 +22,7 @@ Lifecycle:
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Callable
@@ -70,6 +71,9 @@ class JarvisUI:
         # M45: knowledge-reindex trigger. Wired post-construction (after the
         # announce path exists in main.py), same lifecycle as _on_enroll_face.
         self._on_reindex_knowledge: Callable[[], None] | None = None
+        # M48: optional LAN remote-console server, registered via set_remote
+        # only when JARVIS_REMOTE_TOKEN is configured. Third fan-out sink.
+        self._remote: object | None = None
         # When non-None, main() should respawn Jarvis after the listen loop
         # has joined + the active session is sealed. The tray's "Restart
         # Jarvis" click flips this to "normal"; M41's "Restart Jarvis
@@ -95,20 +99,43 @@ class JarvisUI:
     # State + transcript API — thread-safe; called from listen_loop worker.
     # ------------------------------------------------------------------
 
+    def set_remote(self, remote: object) -> None:
+        """M48: register the LAN remote-console server as a THIRD fan-out
+        sink (alongside console + tray). Duck-typed — needs update_state /
+        update_armed / push_line. None = no remote (feature off). Wired by
+        main.py only when JARVIS_REMOTE_TOKEN is set."""
+        self._remote = remote
+
+    def _remote_call(self, method: str, *args: object) -> None:
+        """Fan a facade event to the remote, if any. Defensive by
+        contract: a remote/network hiccup must NEVER break the console or
+        the listen loop (same posture as every optional subsystem)."""
+        r = self._remote
+        if r is None:
+            return
+        try:
+            getattr(r, method)(*args)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[remote] fan-out {method} failed: {exc}", file=sys.stderr)
+
     def set_state(self, state: State) -> None:
         self.console.set_state(state)
         t = self._tray
         if t is not None:
             t.set_state(state)
+        self._remote_call("update_state", getattr(state, "value", str(state)))
 
     def add_user_text(self, text: str, language: str = "en") -> None:
         self.console.add_user_text(text, language)
+        self._remote_call("push_line", "user", text)
 
     def add_jarvis_text(self, text: str) -> None:
         self.console.add_jarvis_text(text)
+        self._remote_call("push_line", "jarvis", text)
 
     def add_system_text(self, text: str) -> None:
         self.console.add_system_text(text)
+        self._remote_call("push_line", "system", text)
 
     def set_amplitude(self, level: float) -> None:
         """Thread-safe pass-through to the console's waveform visualizer.
@@ -201,6 +228,9 @@ class JarvisUI:
         """Thread-safe pass-through to the console's armed indicator.
         Called from SecurityWatcher's on_armed_changed callback."""
         self.console.set_armed(on)
+        # Fan to the phone so its ARMED badge tracks arming from ANY source
+        # (phone control, tray toggle, or voice "activate security").
+        self._remote_call("update_armed", bool(on))
 
     def set_locked_indicator(self, on: bool) -> None:
         """Thread-safe pass-through to the console's locked indicator
