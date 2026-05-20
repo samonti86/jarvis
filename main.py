@@ -203,14 +203,24 @@ def listen_loop(
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
     # process_question. attachments is list[tuple[str, dict]] (filename + block).
-    # M48.2/M48.2b: item is (text, attachments, origin, reply_audio).
-    # origin ∈ {"console","phone_text"} gates per-turn TTS on the PC.
-    # reply_audio: None (console — PC behaviour) or a conn-bound sink
-    # (phone with "Speak replies" on) — its presence routes this reply's
-    # audio to THAT phone instead of the PC. Voice path calls
-    # process_question directly (not via this queue), unaffected.
+    # M48.2/M48.2b/M48.3: item is (text, attachments, origin, reply_audio, lang).
+    # origin ∈ {"console","phone_text","phone_voice"} — derives PC-TTS gating
+    # (phone_text/phone_voice don't speak on the PC) AND restricted tool
+    # surface (phone origins lose system/shell/file/etc.).
+    # reply_audio: None (console — PC behaviour) or a conn-bound sink (phone)
+    # — its presence routes this reply's audio to THAT phone instead of PC.
+    # lang: M48.3 — whisper-detected ISO-639-1 for phone_voice (so Spanish-
+    # spoken into the phone gets a Spanish reply + a Spanish voice); "en"
+    # for typed inputs where we have no detection. Voice path on the PC
+    # mic calls process_question directly (not via this queue), unaffected.
     text_queue: queue.Queue[
-        tuple[str, list[tuple[str, dict]], str, "Callable[[bytes], None] | None"]
+        tuple[
+            str,
+            list[tuple[str, dict]],
+            str,
+            "Callable[[bytes], None] | None",
+            str,
+        ]
     ] = queue.Queue()
 
     def seal_and_refresh() -> None:
@@ -469,7 +479,7 @@ def listen_loop(
                 continue
             if ui.shutdown.is_set():
                 break
-            text, attachments, origin, reply_audio = item
+            text, attachments, origin, reply_audio, lang = item
             blocks = [block for _, block in attachments] if attachments else []
             print(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
@@ -485,7 +495,7 @@ def listen_loop(
             if security_watcher is not None and not attachments:
                 try:
                     if security_watcher.handle_transcript(text):
-                        ui.add_user_text(text, "en")
+                        ui.add_user_text(text, lang)
                         ui.set_state(State.IDLE)
                         continue
                 except Exception as exc:
@@ -499,7 +509,7 @@ def listen_loop(
             if not attachments and on_enroll_face is not None:
                 from src.face_auth import matches_enroll_intent  # noqa: PLC0415
                 if matches_enroll_intent(text):
-                    ui.add_user_text(text, "en")
+                    ui.add_user_text(text, lang)
                     on_enroll_face()
                     ui.set_state(State.IDLE)
                     continue
@@ -513,30 +523,31 @@ def listen_loop(
                 _fact = (_kb.extract_remember_fact(text)
                          if on_knowledge_remember is not None else None)
                 if _fact is not None:
-                    ui.add_user_text(text, "en")
+                    ui.add_user_text(text, lang)
                     on_knowledge_remember(_fact)
                     ui.set_state(State.IDLE)
                     continue
                 if (on_knowledge_reindex is not None
                         and _kb.matches_reindex_intent(text)):
-                    ui.add_user_text(text, "en")
+                    ui.add_user_text(text, lang)
                     on_knowledge_reindex()
                     ui.set_state(State.IDLE)
                     continue
 
             ui.set_state(State.THINKING)
             try:
-                # Hardcoded 'en' for now — Claude still replies in the input's
-                # language thanks to the system prompt, but TTS picks the
-                # English voice. Add language detection here if it becomes a
-                # real Spanish-typed-input use case.
-                # M48.2/M48.2a: pass the queue's origin straight through —
-                # process_question derives BOTH the text-only gate
-                # (phone_text doesn't speak on the PC) AND the restricted
-                # tool surface (phone origins lose system/shell/file/etc.)
-                # from it. Console-typed = "console" → unchanged behaviour.
+                # M48.2/M48.2a: origin passed straight through — process_question
+                # derives BOTH the text-only gate (phone_text doesn't speak on
+                # the PC) AND the restricted tool surface (phone origins lose
+                # system/shell/file/etc.) from it.
+                # M48.3: language is "en" for typed input (no detection
+                # available) but the whisper-detected ISO code for
+                # phone_voice — so "¿qué hora es?" spoken into the phone
+                # gets a Spanish reply with a Spanish voice. Claude still
+                # follows the input's language via the system prompt; the
+                # `language` arg drives TTS voice selection downstream.
                 process_question(
-                    text, "en", attachments=blocks, origin=origin,
+                    text, lang, attachments=blocks, origin=origin,
                     reply_audio=reply_audio,
                 )
             finally:
@@ -548,7 +559,7 @@ def listen_loop(
     # (text, attachments) args into a single queue item.
     ui.set_on_text_submit(
         lambda text, attachments: text_queue.put(
-            (text, attachments, "console", None)  # console → no phone audio sink
+            (text, attachments, "console", None, "en")  # console → no phone audio sink; lang "en" (no detection on typed)
         )
     )
 
@@ -563,9 +574,55 @@ def listen_loop(
         # non-None ⇒ this reply's audio goes to THAT phone, not the PC.
         remote_server.set_on_text(
             lambda t, reply_audio: text_queue.put(
-                (t, [], "phone_text", reply_audio)
+                (t, [], "phone_text", reply_audio, "en")  # phone typed → "en" (no detection on typed)
             )
         )
+
+        # M48.3 — phone push-to-talk. The phone records a blob (mp4 on
+        # Safari, webm on others) and ships it base64-over-WS. The server
+        # decodes the b64 and hands us (blob, mime, reply_audio); we must
+        # transcribe off the WS thread (whisper can take seconds, must
+        # never block the server loop) and then push the resulting text
+        # onto the SAME text_queue the brain already drains — origin
+        # "phone_voice" so the routing matrix flags it restricted (tool
+        # boundary) AND silent on PC (reply_audio sinks the audio to the
+        # phone instead). reply_audio is ALWAYS set for audio messages
+        # (voice-in always returns voice-out — the locked M48.3 UX
+        # decision; the "Speak replies" toggle continues to gate phone-
+        # text only).
+        def _on_phone_audio(blob: bytes, mime: str, reply_audio) -> None:
+            def _worker() -> None:
+                try:
+                    from src.speech_to_text import transcribe_blob  # noqa: PLC0415
+                    t = transcribe_blob(
+                        blob, mime,
+                        cfg.whisper_model, cfg.stt_server_url, cfg.stt_backend,
+                    )
+                    text = (t.text or "").strip()
+                    if not text:
+                        ui.add_system_text(
+                            "(no speech detected in phone audio)"
+                        )
+                        return
+                    # Whisper-detected language flows through to TTS voice
+                    # selection — phone Spanish gets a Spanish voice reply.
+                    lang = (t.language or "en").strip() or "en"
+                    text_queue.put(
+                        (text, [], "phone_voice", reply_audio, lang)
+                    )
+                except Exception as exc:  # noqa: BLE001 — never crash the WS loop's caller
+                    print(
+                        f"[phone-voice] transcription failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    ui.add_system_text(
+                        f"phone audio error: {type(exc).__name__}"
+                    )
+            threading.Thread(
+                target=_worker, name="PhoneAudioSTT", daemon=True
+            ).start()
+        remote_server.set_on_audio(_on_phone_audio)
 
     text_thread = threading.Thread(target=text_input_loop, daemon=True)
     text_thread.start()

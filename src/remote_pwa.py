@@ -69,7 +69,12 @@ PWA_HTML = r"""<!DOCTYPE html>
   input,button { font:inherit; border-radius:10px; border:1px solid var(--line);
     background:#0f141b; color:var(--tx); padding:12px 13px; }
   #txt { flex:1; min-width:0; }
-  button { background:#1c2735; cursor:pointer; }
+  /* M48.3: iOS long-press on a button = text-selection / context callout
+     (the spike's locked finding); touch-action manipulation also kills the
+     300ms double-tap-zoom delay. Applied globally — every button benefits. */
+  button { background:#1c2735; cursor:pointer;
+    -webkit-user-select:none; -webkit-touch-callout:none;
+    touch-action:manipulation; user-select:none; }
   button:active { opacity:.7; }
   #send { background:var(--accent); border-color:var(--accent); color:#fff;
     font-weight:600; }
@@ -84,6 +89,11 @@ PWA_HTML = r"""<!DOCTYPE html>
   .hidden { display:none !important; }
   #spk { background:#1c2735; }
   #spk.on { background:#15281b; border-color:#225133; color:#7ee2a8; }
+  /* M48.3 — mic in two visual states. Idle = neutral; recording = the
+     disarm-button red palette ("this is hot, tap to stop" — the same visual
+     vocabulary used for active danger elsewhere in the UI). */
+  #mic { background:#1c2735; }
+  #mic.on { background:#2a1717; border-color:#5a2a2a; color:#f0a3a3; }
 </style>
 </head>
 <body>
@@ -103,6 +113,9 @@ PWA_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="row">
     <button id="prb" class="ctl" style="display:none">▶︎ Tap to hear reply</button>
+  </div>
+  <div class="row">
+    <button id="mic" class="ctl" aria-pressed="false">🎤 Tap to talk</button>
   </div>
   <div class="row">
     <input id="txt" type="text" autocomplete="off" autocapitalize="sentences"
@@ -179,6 +192,231 @@ PWA_HTML = r"""<!DOCTYPE html>
     b.textContent = speakOn ? "🔊 Speak replies: ON" : "🔇 Speak replies: off";
     b.classList.toggle("on", speakOn);
     b.setAttribute("aria-pressed", speakOn ? "true" : "false");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // M48.3 — push-to-talk (tap-toggle, NOT press-and-hold; the spike's
+  // locked finding: iOS long-press on a button = selection/callout).
+  // The MediaRecorder API is the right capture path on iOS once the page
+  // is on secure context (M48.2c) — getUserMedia is now allowed and we
+  // get whatever codec Safari supports (audio/mp4 in practice). The blob
+  // ships base64-over-WS to reuse the existing auth boundary; voice-in
+  // ALWAYS gets voice-out (the toggle continues to gate text only).
+  // ─────────────────────────────────────────────────────────────────────
+  let recState = "idle";          // "idle" | "recording" | "uploading"
+  let mediaStream = null;
+  let mediaRecorder = null;
+  let recChunks = [];
+  let recCapTimer = null;
+  let micTranscribeTimer = null;  // safety reset if no transcript arrives
+  const REC_CAP_MS = 60000;       // 60s hard cap (longer = two prompts)
+  const MIC_TRANSCRIBE_TIMEOUT_MS = 30000;  // generous; mic returns to idle if no transcript by then
+
+  // M48.3 — gesture-time `<audio>` element unlock. The server serves a
+  // ~200ms silent MP3 at /silence.mp3 (generated once at startup via PyAV;
+  // the bytes are cacheable + immutable, so the browser fetches once then
+  // reuses forever). Playing it on the SAME <audio> element during the
+  // mic-start tap user-activates the element, which lets the eventual reply
+  // MP3 (which arrives OUTSIDE any gesture) play without iOS refusing it
+  // with NotAllowedError. This was the gap that broke voice-in→voice-out
+  // auto-play on the Safari TAB path (the home-screen PWA's lifecycle
+  // is more permissive — engine ≠ app-shell, the M48.2b refinement).
+  // iOS rejects synthetic WAV data URLs (NotSupportedError, M48.2b lesson)
+  // but accepts MP3 — so MP3 is the right mime. Fires ONCE per mic-start;
+  // no `ended`→re-prime loop (the M48.2b regression we explicitly avoided).
+  // If /silence.mp3 404s (PyAV MP3 encoder absent server-side), play()
+  // rejects and the existing ▶︎ fallback fires — zero regression.
+  function unlockAudioElement() {
+    try {
+      ae.loop = false; ae.pause();
+      ae.src = "/silence.mp3";
+      const p = ae.play();
+      if (p) p.catch(() => {});  // refusal is non-fatal; fall back to ▶︎ later
+    } catch (e) { /* never block recording on an audio-unlock hiccup */ }
+  }
+
+  function setMicUI(state) {
+    const b = $("mic");
+    if (state === "recording") {
+      b.textContent = "🔴 Recording — tap to stop";
+      b.classList.add("on");
+      b.setAttribute("aria-pressed", "true");
+    } else if (state === "uploading") {
+      b.textContent = "⏳ Transcribing…";
+      b.classList.remove("on");
+      b.setAttribute("aria-pressed", "false");
+    } else {
+      b.textContent = "🎤 Tap to talk";
+      b.classList.remove("on");
+      b.setAttribute("aria-pressed", "false");
+    }
+  }
+
+  function blobToBase64(blob) {
+    // FileReader is the only cross-iOS-version reliable path; the newer
+    // blob.arrayBuffer().then(buf => btoa(...)) chokes on long blobs with
+    // a stack-overflow on the spread, and TextDecoder mangles binary.
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onloadend = () => {
+        const dataUrl = String(fr.result || "");
+        const i = dataUrl.indexOf(",");
+        resolve(i >= 0 ? dataUrl.slice(i + 1) : "");
+      };
+      fr.onerror = () => reject(fr.error || new Error("FileReader failed"));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  function stopTracks() {
+    if (mediaStream) {
+      try { mediaStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+      mediaStream = null;
+    }
+  }
+
+  async function startRecording() {
+    if (recState !== "idle") return;
+    if (!ws || ws.readyState !== 1) {
+      line("sys", "mic: not connected — tap status pill to reconnect");
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      line("sys", "mic: this browser can't capture audio (need HTTPS / secure context)");
+      return;
+    }
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      // NotAllowedError on first use = "user denied permission" or the iOS
+      // gesture rules misfired; SecurityError happens on insecure origins
+      // (but M48.2c HTTPS means we shouldn't hit that). Either way, a calm
+      // line, not a stack trace.
+      line("sys", "mic: " + (e && e.name ? e.name : "permission denied"));
+      return;
+    }
+    // Pick the first mimeType the browser admits to supporting. Safari =
+    // audio/mp4; others usually offer audio/webm;codecs=opus.
+    let mt = "";
+    if (window.MediaRecorder) {
+      for (const c of ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"]) {
+        if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) {
+          mt = c; break;
+        }
+      }
+    } else {
+      stopTracks();
+      line("sys", "mic: MediaRecorder not available on this browser");
+      return;
+    }
+    try {
+      mediaRecorder = mt
+        ? new MediaRecorder(mediaStream, { mimeType: mt })
+        : new MediaRecorder(mediaStream);
+    } catch (e) {
+      stopTracks();
+      line("sys", "mic init failed: " + (e && e.name ? e.name : e));
+      return;
+    }
+    recChunks = [];
+    mediaRecorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) recChunks.push(ev.data);
+    };
+    mediaRecorder.onstop = onRecordingStop;
+    mediaRecorder.onerror = (ev) => logerr("recorder", ev && ev.error);
+    try {
+      mediaRecorder.start();
+    } catch (e) {
+      stopTracks();
+      line("sys", "mic start failed: " + (e && e.name ? e.name : e));
+      return;
+    }
+    recState = "recording";
+    setMicUI("recording");
+    // M48.3 — INSIDE THE GESTURE: warm AudioContext AND user-activate the
+    // <audio> element by playing a 200ms silent MP3. iOS requires the
+    // element to have a successful gesture-time play() once before it can
+    // play() from a deferred (reply-arrived-N-seconds-later) context. With
+    // this, voice-in → voice-out auto-plays as designed; without it, every
+    // first voice turn would fall back to the ▶︎ button (Safari tab is
+    // materially stricter than the home-screen PWA — engine ≠ app-shell).
+    primeAudio();
+    unlockAudioElement();
+    // Hard cap: stop on our terms before Safari decides the tab has been
+    // recording "too long" and silently kills the stream.
+    recCapTimer = setTimeout(() => {
+      line("sys", "mic: 60s cap reached — stopping");
+      stopRecording();
+    }, REC_CAP_MS);
+  }
+
+  function stopRecording() {
+    if (recState !== "recording") return;
+    if (recCapTimer) { clearTimeout(recCapTimer); recCapTimer = null; }
+    try { mediaRecorder.stop(); } catch (e) { /* fires onstop or onerror */ }
+  }
+
+  async function onRecordingStop() {
+    stopTracks();
+    recState = "uploading";
+    setMicUI("uploading");
+    const mime = (mediaRecorder && mediaRecorder.mimeType) || "audio/mp4";
+    const blob = new Blob(recChunks, { type: mime });
+    recChunks = [];
+    let sent = false;
+    try {
+      if (!blob || blob.size === 0) {
+        line("sys", "mic: empty recording");
+        return;
+      }
+      const b64 = await blobToBase64(blob);
+      if (!ws || ws.readyState !== 1) {
+        line("sys", "mic: disconnected before upload");
+        return;
+      }
+      ws.send(JSON.stringify({ type: "audio", mime: mime, b64: b64 }));
+      sent = true;
+    } catch (e) {
+      logerr("upload", e);
+    } finally {
+      if (!sent) {
+        // Upload never reached the server — drop straight back to idle so
+        // the user can retry without staring at a stuck "Transcribing…".
+        recState = "idle";
+        setMicUI("idle");
+      } else {
+        // Stay in "uploading" / ⏳ Transcribing… until the server fans the
+        // transcribed `user` line (or a `system` line on no-speech) back
+        // to us — THAT's the right moment to flip to idle (Jarvis received
+        // it, working on it). M36 GPU offload makes this very fast; on local
+        // CPU it can be several seconds. Either way the user sees a real
+        // "in flight" signal instead of an instant flip-back. Safety net:
+        // if no transcript by MIC_TRANSCRIBE_TIMEOUT_MS, reset anyway.
+        if (micTranscribeTimer) clearTimeout(micTranscribeTimer);
+        micTranscribeTimer = setTimeout(() => {
+          micTranscribeTimer = null;
+          if (recState === "uploading") {
+            line("sys", "mic: no transcript after " +
+                 (MIC_TRANSCRIBE_TIMEOUT_MS / 1000) + "s — resetting");
+            recState = "idle";
+            setMicUI("idle");
+          }
+        }, MIC_TRANSCRIBE_TIMEOUT_MS);
+      }
+    }
+  }
+
+  // Called from ws.onmessage when a "user" or "system" line arrives — that's
+  // our signal that the server has finished processing the just-uploaded
+  // phone-voice clip (transcription happened, either yielding text or
+  // "(no speech detected)"). Either way, return the mic to idle.
+  function clearMicTranscribingState() {
+    if (recState !== "uploading") return;
+    if (micTranscribeTimer) {
+      clearTimeout(micTranscribeTimer); micTranscribeTimer = null;
+    }
+    recState = "idle";
+    setMicUI("idle");
   }
 
   function line(cls, text) {
@@ -259,9 +497,15 @@ PWA_HTML = r"""<!DOCTYPE html>
                   STATE_COLOR[m.state] ?? "#15803d"); break;
         case "state": setPill(m.state, STATE_COLOR[m.state] ?? ""); break;
         case "armed": setArmed(m.armed); break;
-        case "user":   line("you", m.text); break;
+        case "user":
+          line("you", m.text);
+          clearMicTranscribingState();  // M48.3 — transcript arrived
+          break;
         case "jarvis": line("jar", m.text); break;
-        case "system": line("sys", m.text); break;
+        case "system":
+          line("sys", m.text);
+          clearMicTranscribingState();  // M48.3 — e.g. "(no speech detected)"
+          break;
         case "speak":  // M48.2b: unicast reply audio for THIS phone
           playReply(m.b64, m.mime);
           break;
@@ -316,6 +560,14 @@ PWA_HTML = r"""<!DOCTYPE html>
   setSpk();  // reflect persisted state at load
   $("arm").onclick = () => control("arm");
   $("disarm").onclick = () => control("disarm");
+  // M48.3 — push-to-talk: TAP-TOGGLE, not press-and-hold (iOS long-press
+  // = selection/callout, which would fight the user). Each tap flips the
+  // state machine; uploading is a transient state (no input accepted).
+  $("mic").onclick = () => {
+    if (recState === "idle") startRecording();
+    else if (recState === "recording") stopRecording();
+    // recState === "uploading" → ignore taps until the round-trip completes
+  };
   // The status pill is a GUARANTEED manual reconnect: a tap is a fresh user
   // gesture (iOS is far more permissive about WS creation inside one than in
   // throttled background JS), so even if every automatic redial is refused,

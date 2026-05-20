@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import io
 import json
 import ssl
 import sys
@@ -49,6 +50,44 @@ _WS_PATH = "/ws"
 
 def _log(msg: str) -> None:
     print(f"[remote] {msg}", file=sys.stderr)
+
+
+def _build_silence_mp3() -> bytes | None:
+    """M48.3 — ~200ms of silent MP3, generated once at server load via PyAV
+    (already a `faster-whisper` transitive dep; no new requirement). Served
+    from the new `/silence.mp3` route so the PWA can user-activate its
+    `<audio>` element on the mic-start tap gesture, which is what unlocks
+    iOS Safari TAB's stricter deferred-play rules (the installed home-screen
+    PWA's lifecycle is more permissive, but the Safari tab path needs this).
+    Returns None if MP3 encoding isn't available in this build of PyAV — the
+    server still works fine, the PWA just falls back to the existing ▶︎
+    button per the M48.2b accepted UX (no regression). The bytes are tiny
+    (~1.2 KB) and the browser caches them after the first fetch."""
+    try:
+        import av  # noqa: PLC0415 — local import, never block startup
+        import numpy as np  # noqa: PLC0415
+        buf = io.BytesIO()
+        container = av.open(buf, mode="w", format="mp3")
+        try:
+            stream = container.add_stream("libmp3lame", rate=22050)
+            stream.layout = "mono"
+            samples = np.zeros((1, int(0.2 * 22050)), dtype=np.int16)
+            frame = av.AudioFrame.from_ndarray(samples, format="s16", layout="mono")
+            frame.rate = 22050
+            for pkt in stream.encode(frame):
+                container.mux(pkt)
+            for pkt in stream.encode(None):
+                container.mux(pkt)
+        finally:
+            container.close()
+        return buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 — MP3 encoder absent on this build
+        _log(f"silence.mp3 generation skipped ({type(exc).__name__}: {exc}) — "
+             f"the PWA will fall back to the ▶︎ button on first voice turn")
+        return None
+
+
+_SILENCE_MP3: bytes | None = _build_silence_mp3()
 
 
 class RemoteConsoleServer:
@@ -90,6 +129,15 @@ class RemoteConsoleServer:
         # audio (the "Speak replies" toggle off). Its presence/absence IS
         # the routing decision downstream ("audio → this phone, not the PC").
         self._on_text = on_text or (lambda t, ra: _log(f"text dropped (not wired yet): {t!r}"))
+        # M48.3 — same late-injection pattern as on_text. on_audio takes
+        # (blob_bytes, mime, reply_audio); the listen_loop wires it in once
+        # text_queue exists. Until then a phone-voice frame just gets logged
+        # and dropped — never an exception.
+        self._on_audio: Callable[[bytes, str, Callable[[bytes], None] | None], None] = (
+            lambda b, m, ra: _log(
+                f"audio dropped (not wired yet): {len(b)}B {m!r}"
+            )
+        )
         self._on_control = on_control or (lambda a: {"armed": self._snapshot.get("armed", False)})
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -103,6 +151,14 @@ class RemoteConsoleServer:
         self, fn: "Callable[[str, Callable[[bytes], None] | None], None]"
     ) -> None:
         self._on_text = fn
+
+    def set_on_audio(
+        self,
+        fn: "Callable[[bytes, str, Callable[[bytes], None] | None], None]",
+    ) -> None:
+        """M48.3 — wire the phone push-to-talk callback. The listen_loop
+        calls this once `text_queue` exists (same lifecycle as `set_on_text`)."""
+        self._on_audio = fn
 
     def set_on_control(self, fn: Callable[[str], dict]) -> None:
         self._on_control = fn
@@ -193,6 +249,24 @@ class RemoteConsoleServer:
             return self._http(200, "text/html; charset=utf-8", PWA_HTML)
         if path == "/manifest.json":
             return self._http(200, "application/manifest+json", PWA_MANIFEST)
+        if path == "/silence.mp3":
+            # M48.3 — gesture-time `<audio>` element unlock. Returns the
+            # pre-generated 200ms silent MP3 (built once at server load via
+            # PyAV) or 404 if encoding wasn't available. The 404 case is
+            # graceful: the PWA's play() rejects and falls back to ▶︎,
+            # same as today's M48.2b accepted UX.
+            if _SILENCE_MP3 is None:
+                return self._http(
+                    404, "text/plain; charset=utf-8",
+                    "silence.mp3 not available (PyAV MP3 encoder absent)",
+                    404,
+                )
+            return self._http_bytes(
+                200, "audio/mpeg", _SILENCE_MP3,
+                # Cacheable — the bytes never change for the server's lifetime,
+                # and the PWA wants the browser to keep them.
+                cache="public, max-age=86400, immutable",
+            )
         if path == "/healthz":
             return self._http(200, "text/plain; charset=utf-8", "ok")
         return self._http(404, "text/plain; charset=utf-8", "not found", 404)
@@ -208,6 +282,23 @@ class RemoteConsoleServer:
                 "Content-Length": str(len(data)),
                 # PWA is a single inert page; no caching keeps iterate-fast.
                 "Cache-Control": "no-store",
+            }
+        )
+        return Response(status, "OK" if status == 200 else "ERROR", headers, data)
+
+    @staticmethod
+    def _http_bytes(
+        status: int, ctype: str, data: bytes,
+        cache: str = "no-store",
+    ) -> Response:
+        """M48.3 — binary response helper (vs `_http` which expects str body).
+        Used for /silence.mp3; cacheable by default since the bytes never
+        change for the lifetime of the server process."""
+        headers = Headers(
+            {
+                "Content-Type": ctype,
+                "Content-Length": str(len(data)),
+                "Cache-Control": cache,
             }
         )
         return Response(status, "OK" if status == 200 else "ERROR", headers, data)
@@ -296,6 +387,36 @@ class RemoteConsoleServer:
                     self._on_text(content, reply_audio)
                 except Exception as exc:  # noqa: BLE001
                     _log(f"on_text raised: {exc}")
+            return
+
+        if mtype == "audio":
+            # M48.3 — phone push-to-talk inbound. {mime, b64} where b64 is
+            # the base64-encoded MediaRecorder Blob (audio/mp4 on Safari,
+            # audio/webm on others — we don't trust the mime, PyAV auto-
+            # detects from bytes; the field is logged only for diagnostics).
+            #
+            # Locked UX (set with the user during M48.3 scoping):
+            # **voice-in always returns voice-out** — reply_audio is set
+            # unconditionally for audio messages, ignoring the "Speak
+            # replies" toggle (which continues to gate phone-TEXT only).
+            # Simplest mental model: "if I pressed the mic, I want to hear
+            # the answer." Less coupling, fewer surprises.
+            mime = str(msg.get("mime", "audio/mp4"))
+            b64 = str(msg.get("b64", ""))
+            if not b64:
+                return
+            try:
+                blob = base64.b64decode(b64, validate=False)
+            except Exception:  # noqa: BLE001 — malformed input is dropped
+                _log("audio decode failed (bad base64)")
+                return
+            if not blob:
+                return
+            reply_audio = lambda mp3: self._send_audio(conn, mp3)
+            try:
+                self._on_audio(blob, mime, reply_audio)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"on_audio raised: {exc}")
             return
 
         if mtype == "control":

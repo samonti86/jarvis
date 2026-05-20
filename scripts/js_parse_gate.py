@@ -132,7 +132,10 @@ def main() -> int:
         return 1
 
     # Regression-specific structural assertions. Each maps to a real bug
-    # this project actually hit, or a M48.2b invariant we must not lose.
+    # this project actually hit, or an invariant a future edit must not
+    # lose. Update this list whenever the PWA grows another non-obvious
+    # contract (this gate IS the institutionalized "presence ≠ valid"
+    # discipline; better to over-pin than to ship a SyntaxError-dead PWA).
     checks = [
         (script.count("function dial(") == 1, "exactly one function dial("),
         (script.count("function connect(") == 1, "exactly one function connect("),
@@ -147,11 +150,46 @@ def main() -> int:
          "status pill is tap-to-reconnect (guaranteed manual recovery)"),
         ('e.persisted' in script, "bfcache pageshow/persisted handler kept"),
         ('window.addEventListener("online"' in script, "online→dial kept"),
-        ("SILENT" not in script and "ae.loop = true" not in script
-         and "ae.loop=true" not in script,
-         "no stale silent-WAV keepalive / no audio loop (removed)"),
+        # Anti-regression for the specific M48.2b bugs (NOT broad "SILENT"
+        # which legitimately appears in M48.3's SILENT_MP3 unlock constant):
+        # WAV-mime keepalive (iOS NotSupportedError) and ended→re-prime
+        # loop (the reply that wouldn't stop). Match the precise patterns.
+        ("audio/wav;base64" not in script
+         and "audio/x-wav" not in script
+         and "ae.loop = true" not in script
+         and "ae.loop=true" not in script
+         and 'ae.addEventListener("ended"' not in script
+         and "ae.onended" not in script,
+         "no silent-WAV keepalive / no ended→re-prime loop (M48.2b regressions)"),
         (re.search(r"dial\(\);\s*\}\)\(\);\s*$", script.strip()) is not None,
          "bootstrap ends with dial();  (single entry point)"),
+        # M48.3 — push-to-talk state machine invariants
+        (script.count("function startRecording(") == 1,
+         "one function startRecording( (push-to-talk capture entry)"),
+        (script.count("function stopRecording(") == 1,
+         "one function stopRecording("),
+        (script.count("function onRecordingStop(") == 1,
+         "one function onRecordingStop( (the upload-on-stop branch)"),
+        (script.count("function blobToBase64(") == 1,
+         "one function blobToBase64( (FileReader path — only reliable on iOS)"),
+        (script.count("function setMicUI(") == 1,
+         "one function setMicUI( (state→DOM)"),
+        ("MediaRecorder" in script and "getUserMedia" in script,
+         "MediaRecorder + getUserMedia referenced (the capture API)"),
+        ('"audio"' in script and "type: \"audio\"" in script,
+         "outbound {type:\"audio\"} message (the wire contract w/ server)"),
+        ("REC_CAP_MS" in script and "60000" in script,
+         "60s recording cap present (never trust the browser to stop)"),
+        ('"/silence.mp3"' in script,
+         "/silence.mp3 server-route reference (iOS <audio> gesture unlock)"),
+        (script.count("function unlockAudioElement(") == 1,
+         "one function unlockAudioElement( (gesture-time element activation)"),
+        ("unlockAudioElement()" in script,
+         "unlockAudioElement() called inside the mic-start gesture"),
+        (script.count("function clearMicTranscribingState(") == 1,
+         "one function clearMicTranscribingState( (mic ↔ transcript handoff)"),
+        ("clearMicTranscribingState()" in script,
+         "clearMicTranscribingState() called on user/system message"),
     ]
     bad = [why for ok, why in checks if not ok]
     if bad:
@@ -161,8 +199,10 @@ def main() -> int:
         return 1
 
     print("JS GATE PASS: balanced; 1x dial/connect/setSpk/playReply; "
+          "1x startRecording/stopRecording/onRecordingStop/blobToBase64/setMicUI; "
           "connWD watchdog + clearWD; tap-to-reconnect pill; "
-          "bfcache+online kept; no audio-loop; bootstrap=dial();")
+          "MediaRecorder+getUserMedia wired; {type:audio} contract; "
+          "60s rec cap; bfcache+online kept; no audio-loop; bootstrap=dial();")
     return 0
 
 

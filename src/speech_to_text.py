@@ -311,3 +311,92 @@ def _encode_wav(audio_i16: np.ndarray, sample_rate: int = 16000) -> bytes:
         wav.setframerate(sample_rate)
         wav.writeframes(audio_i16.tobytes())
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# M48.3 — phone push-to-talk shim
+# ---------------------------------------------------------------------------
+#
+# The phone's MediaRecorder produces a compressed container (Safari emits
+# audio/mp4 with AAC; Chrome/Android emit audio/webm with Opus). The existing
+# STT dispatch expects int16 mono 16 kHz numpy. PyAV — already a faster-
+# whisper transitive dep (faster-whisper uses `av` for its own decode) — does
+# the container/codec → PCM lift. Once we have the int16 array, the existing
+# `_dispatch_transcription` takes over so M36 GPU offload still applies for
+# phone voice (no parallel STT pipeline; one path, two sources).
+
+
+def _as_list(x):
+    """PyAV's `AudioResampler.resample(frame)` returns a single Frame on
+    older releases and `list[Frame]` on newer ones; this normalises so the
+    decode loop is version-agnostic."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+
+def _decode_audio_blob(blob: bytes) -> np.ndarray:
+    """Decode an arbitrary container (mp4/webm/etc.) → int16 mono PCM @ 16 kHz.
+
+    Container is auto-detected by PyAV from the bytes; we don't trust the
+    client-supplied MIME (a phone could lie or the browser pick a codec
+    we didn't expect). Empty / undecodable input ⇒ zero-length array
+    (caller treats as "no speech captured" and drops the turn).
+    """
+    import av  # noqa: PLC0415 — keep the import local; surfaces clearly if absent
+
+    container = av.open(io.BytesIO(blob))
+    try:
+        try:
+            stream = next(s for s in container.streams if s.type == "audio")
+        except StopIteration:
+            return np.zeros(0, dtype=np.int16)
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        chunks: list[np.ndarray] = []
+        for frame in container.decode(stream):
+            for rf in _as_list(resampler.resample(frame)):
+                if rf is not None:
+                    chunks.append(rf.to_ndarray().flatten())
+        # Flush whatever the resampler had buffered.
+        for rf in _as_list(resampler.resample(None)):
+            if rf is not None:
+                chunks.append(rf.to_ndarray().flatten())
+        if not chunks:
+            return np.zeros(0, dtype=np.int16)
+        return np.concatenate(chunks).astype(np.int16, copy=False)
+    finally:
+        container.close()
+
+
+def transcribe_blob(
+    blob: bytes,
+    mime: str,
+    model_name: str,
+    server_url: str,
+    backend: str,
+) -> Transcript:
+    """Public M48.3 entry point: a phone-recorded audio blob → Transcript.
+
+    Decodes the container to int16 mono 16 kHz then routes through the
+    existing `_dispatch_transcription` so the GPU offload (M36) still
+    applies for phone voice for free. Any decode failure (corrupt blob,
+    unsupported codec, missing audio stream) returns an empty Transcript
+    so the caller's empty-string check drops the turn — never strand the
+    user with a stack trace from an inscrutable network glitch.
+    """
+    if not blob:
+        return Transcript(text="", language="")
+    try:
+        audio_i16 = _decode_audio_blob(blob)
+    except Exception as exc:  # noqa: BLE001 — decode failures must not crash STT
+        print(
+            f"[stt] phone-audio decode failed (mime={mime!r}): "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return Transcript(text="", language="")
+    if audio_i16.size == 0:
+        return Transcript(text="", language="")
+    return _dispatch_transcription(audio_i16, model_name, server_url, backend)
