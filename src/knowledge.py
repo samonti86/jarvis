@@ -21,12 +21,17 @@ inverted index, or that a package manager has with a lockfile vs. node_modules:
 one is authored and backed up, the other is regenerated on demand. `reindex()`
 is the regenerate step.
 
-Why FTS5 and not embeddings (yet): `sqlite3` (with FTS5) ships in CPython's
-stdlib on Windows — zero new heavy deps, fully local, privacy-aligned. v1
-proves the entire ingest -> tool -> "update" UX loop on keyword search before
-any embedding infra. A local-embeddings hybrid layer is a deliberate
-conditional follow-on (M46), only if keyword recall proves the real limiter
-in daily use — same iterate-on-real-usage discipline as M22/M42.
+Retrieval is HYBRID (M46): FTS5 keyword search + local-embedding vector
+search, merged by Reciprocal Rank Fusion. M45 shipped keyword-only — `sqlite3`
+with FTS5 is stdlib, zero heavy deps — and proved the whole ingest -> tool ->
+"update" UX loop. M46 added the semantic half once a measured probe showed
+keyword recall was the real limiter: paraphrased queries ('microphone' for
+'mic', 'home theater' for 'Plex') that an inverted index structurally cannot
+match. The embedding model runs LOCALLY (sentence-transformers,
+all-MiniLM-L6-v2) — the private corpus never leaves the machine; API
+embeddings would violate privacy-by-design. If sentence-transformers is
+absent the vector half is simply skipped and search degrades cleanly to the
+M45 keyword-only behaviour — M46 never breaks M45.
 
 This is SEMANTIC/DECLARATIVE memory ("curated facts/docs"), kept strictly
 distinct from the M6/M10 EPISODIC conversational memory ("what we discussed").
@@ -78,7 +83,9 @@ KNOWLEDGE_SEARCH_TOOL = {
                     "What to look up, in natural words — the user's question "
                     "or its key terms (e.g. 'plex laptop service name', "
                     "'3d printer petg temperature', 'home network vlan "
-                    "layout'). Keyword-matched against the corpus."
+                    "layout'). Matched by hybrid keyword + semantic search, "
+                    "so natural paraphrases work — you need not echo the "
+                    "corpus's exact wording."
                 ),
             },
             "limit": {
@@ -118,7 +125,20 @@ _CHUNK_CHAR_CAP = 1200
 # tmdb._MAX_RESULTS).
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 10
-_SNIPPET_TOKENS = 40  # FTS5 snippet() window, in tokens, per hit
+
+# --- M46 hybrid semantic search --------------------------------------------
+# Local embedding model: all-MiniLM-L6-v2 — 384-dim, ~80 MB, CPU-fast on the
+# Ryzen. Local by REQUIREMENT, not convenience: an API embedding endpoint
+# would ship the private corpus to a third party, violating privacy-by-design.
+_EMBED_MODEL = "all-MiniLM-L6-v2"
+# Per-retriever candidate depth fed into the rank fusion — well above
+# _MAX_LIMIT so fusion has real material to merge.
+_CANDIDATES = 25
+# Reciprocal Rank Fusion constant — 60 is the canonical default; it damps the
+# weight of any single list's top ranks so neither retriever dominates.
+_RRF_K = 60
+# Per-passage excerpt cap in the result payload (voice-lean; Claude paraphrases).
+_EXCERPT_CHARS = 420
 
 
 # --- Path resolution -------------------------------------------------------
@@ -149,6 +169,13 @@ def _iter_corpus_files(corpus: Path):
         if not path.is_file():
             continue
         if any(part.startswith(".") for part in path.relative_to(corpus).parts):
+            continue
+        # Skip README.md — it is meta-documentation ABOUT the knowledge base,
+        # not knowledge. Indexing it lets its generic prose ("keep facts
+        # atomic", "make it survive a disk death") win on common query words
+        # and bury real facts — measured directly in the M46 retrieval probe.
+        # The corpus is for knowledge; the README explains the corpus.
+        if path.name.lower() == "readme.md":
             continue
         if path.suffix.lower() in _TEXT_SUFFIXES:
             yield path
@@ -227,6 +254,60 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
+# --- M46 embedding layer ---------------------------------------------------
+# Lazy: sentence-transformers pulls in torch, far too heavy to import at
+# module load (knowledge.py is imported by llm.py on every startup). Loaded
+# on first use and cached. Sentinel: None = not yet tried, False = load
+# failed (→ permanent keyword-only fallback for the process), else the model.
+_embedder: object | None = None
+
+
+def _get_embedder():
+    """The embedding model, lazily loaded and cached. Returns None if
+    sentence-transformers isn't installed or the model can't load — callers
+    then fall back to keyword-only search. The optional-component contract:
+    M46 must never break M45."""
+    global _embedder
+    if _embedder is None:
+        try:
+            from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+            print(
+                f"[knowledge] loading embedding model ({_EMBED_MODEL})…",
+                file=sys.stderr,
+            )
+            _embedder = SentenceTransformer(_EMBED_MODEL)
+            print("[knowledge] embedding model ready", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — degrade, never crash
+            print(
+                f"[knowledge] embeddings unavailable "
+                f"({type(exc).__name__}: {exc}) — keyword-only search",
+                file=sys.stderr,
+            )
+            _embedder = False
+    return _embedder or None
+
+
+def _embed(texts: list[str]):
+    """Encode texts → an (N, 384) float32 array, L2-normalized so cosine
+    similarity reduces to a plain dot product. Returns None on any failure
+    (caller falls back to keyword-only)."""
+    model = _get_embedder()
+    if model is None or not texts:
+        return None
+    try:
+        import numpy as np  # noqa: PLC0415
+        vecs = model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(vecs, dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[knowledge] encode failed ({exc})", file=sys.stderr)
+        return None
+
+
 @dataclass
 class ReindexResult:
     """Outcome of a reindex, shaped for both a log line and a spoken summary."""
@@ -287,8 +368,18 @@ def reindex() -> ReindexResult:
             "CREATE VIRTUAL TABLE chunks USING fts5("
             "path UNINDEXED, content, tokenize='porter unicode61')"
         )
+        # M46 — companion table holding one embedding per chunk, keyed by the
+        # same rowid we assign explicitly into `chunks` below. A plain table,
+        # not a vector DB: at personal scale (tens to low-thousands of chunks)
+        # a brute-force cosine over a numpy array is microseconds — same
+        # "stdlib/minimal when it's sufficient" judgement as M45's sqlite3.
+        conn.execute("DROP TABLE IF EXISTS vectors")
+        conn.execute(
+            "CREATE TABLE vectors (rowid INTEGER PRIMARY KEY, embedding BLOB)"
+        )
 
         n_files = n_chunks = 0
+        chunk_rows: list[tuple[int, str]] = []  # (rowid, text) for embedding
         for path in _iter_corpus_files(corpus):
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -298,14 +389,31 @@ def reindex() -> ReindexResult:
             rel = str(path.relative_to(corpus))
             file_had_chunk = False
             for chunk in _chunk_text(text):
+                n_chunks += 1  # explicit, deterministic rowid
                 conn.execute(
-                    "INSERT INTO chunks(path, content) VALUES (?, ?)",
-                    (rel, chunk),
+                    "INSERT INTO chunks(rowid, path, content) VALUES (?, ?, ?)",
+                    (n_chunks, rel, chunk),
                 )
-                n_chunks += 1
+                chunk_rows.append((n_chunks, chunk))
                 file_had_chunk = True
             if file_had_chunk:
                 n_files += 1
+
+        # M46 — embed every chunk in one batch and store the vectors. If
+        # sentence-transformers is unavailable, _embed returns None, the
+        # vectors table simply stays empty, and search runs keyword-only.
+        embedded = False
+        if chunk_rows:
+            vecs = _embed([c for _, c in chunk_rows])
+            if vecs is not None and len(vecs) == len(chunk_rows):
+                conn.executemany(
+                    "INSERT INTO vectors(rowid, embedding) VALUES (?, ?)",
+                    [
+                        (rid, vecs[i].tobytes())
+                        for i, (rid, _) in enumerate(chunk_rows)
+                    ],
+                )
+                embedded = True
         conn.commit()
     except sqlite3.Error as exc:
         print(f"[knowledge] reindex sqlite error: {exc}", file=sys.stderr)
@@ -322,9 +430,16 @@ def reindex() -> ReindexResult:
     msg = (
         f"Knowledge updated, sir — indexed {n_chunks} "
         f"passage{'s' if n_chunks != 1 else ''} from {n_files} "
-        f"document{'s' if n_files != 1 else ''}."
+        f"document{'s' if n_files != 1 else ''}"
+        + (", with semantic search."
+           if embedded else
+           " (keyword-only — semantic search is unavailable).")
     )
-    print(f"[knowledge] reindex ok: {n_files} files, {n_chunks} chunks", file=sys.stderr)
+    print(
+        f"[knowledge] reindex ok: {n_files} files, {n_chunks} chunks, "
+        f"semantic={'on' if embedded else 'off'}",
+        file=sys.stderr,
+    )
     return ReindexResult(True, n_files, n_chunks, msg)
 
 
@@ -362,7 +477,54 @@ def _build_match_query(raw: str) -> str | None:
     return " OR ".join(f'"{t}"' for t in terms[:12])
 
 
+def _vector_candidates(conn: sqlite3.Connection, query: str, n: int) -> list[int]:
+    """M46 — top-n chunk rowids by cosine similarity to the query. Returns []
+    (→ the caller runs keyword-only) when embeddings are unavailable: a
+    pre-M46 index with no `vectors` table, an empty table, or
+    sentence-transformers not installed. Never raises."""
+    try:
+        rows = conn.execute("SELECT rowid, embedding FROM vectors").fetchall()
+    except sqlite3.OperationalError:
+        return []  # no `vectors` table — index predates M46 / not reindexed
+    if not rows:
+        return []
+    qv = _embed([query])
+    if qv is None:
+        return []
+    try:
+        import numpy as np  # noqa: PLC0415
+        mat = np.frombuffer(
+            b"".join(emb for _, emb in rows), dtype=np.float32
+        ).reshape(len(rows), -1)
+        sims = mat @ qv[0]                       # both L2-normalized → cosine
+        order = np.argsort(-sims)[:n]
+        return [int(rows[i][0]) for i in order]
+    except Exception as exc:  # noqa: BLE001 — degrade to keyword-only
+        print(f"[knowledge] vector search failed ({exc})", file=sys.stderr)
+        return []
+
+
+def _rrf_fuse(keyword_ids: list[int], vector_ids: list[int]) -> list[int]:
+    """Reciprocal Rank Fusion of two ranked rowid lists. Each list contributes
+    1/(_RRF_K + rank) per item; the summed score ranks the merged set. A chunk
+    both retrievers surface rises; a chunk only one finds still gets a fair
+    shot. With one list empty this degenerates cleanly to the other's order —
+    which is exactly the keyword-only fallback when embeddings are off."""
+    scores: dict[int, float] = {}
+    for ranked in (keyword_ids, vector_ids):
+        for rank, rid in enumerate(ranked):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (_RRF_K + rank + 1)
+    return sorted(scores, key=lambda r: scores[r], reverse=True)
+
+
 def _search(query: str, limit: int) -> str:
+    """M46 hybrid retrieval: FTS5 keyword search + local-embedding vector
+    search, merged by Reciprocal Rank Fusion. Keyword search still carries
+    exact terms (PlexService, ed25519, error strings) where embeddings go
+    fuzzy; vector search carries the paraphrases an inverted index
+    structurally misses ('microphone' for 'mic', 'home theater' for 'Plex').
+    With embeddings unavailable the vector list is empty and this degrades
+    exactly to the M45 keyword-only behaviour. Never raises."""
     db = _db_path()
     if not db.exists():
         return (
@@ -370,30 +532,48 @@ def _search(query: str, limit: int) -> str:
             "knowledge folder and ask me to update my knowledge."
         )
 
-    match = _build_match_query(query)
-    if match is None:
-        return f"I couldn't form a search from '{query}', sir."
+    match = _build_match_query(query)  # None ⇒ no usable keyword terms
 
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(str(db))
-        # bm25() ranks relevance (lower = better; it's a cost, so ORDER BY
-        # ascending). snippet() returns a focused excerpt with the matched
-        # terms marked by «…» so Claude sees why the passage matched.
-        rows = conn.execute(
-            "SELECT path, "
-            "snippet(chunks, 1, '«', '»', ' … ', ?), "
-            "bm25(chunks) AS rank "
-            "FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?",
-            (_SNIPPET_TOKENS, match, limit),
-        ).fetchall()
-    except sqlite3.OperationalError as exc:
-        # Index missing/corrupt (e.g. never reindexed after first run).
-        print(f"[knowledge] search op error: {exc}", file=sys.stderr)
-        return (
-            "My knowledge index isn't ready, sir — ask me to update my "
-            "knowledge and try again."
-        )
+        # Keyword candidates — bm25-ranked (lower cost = better, so ORDER BY
+        # ascending). Empty list if the query reduced to no usable terms.
+        keyword_ids: list[int] = []
+        if match is not None:
+            try:
+                keyword_ids = [
+                    int(r[0]) for r in conn.execute(
+                        "SELECT rowid FROM chunks WHERE chunks MATCH ? "
+                        "ORDER BY bm25(chunks) LIMIT ?",
+                        (match, _CANDIDATES),
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError as exc:
+                print(f"[knowledge] search op error: {exc}", file=sys.stderr)
+                return (
+                    "My knowledge index isn't ready, sir — ask me to update "
+                    "my knowledge and try again."
+                )
+        # Vector candidates — [] if embeddings unavailable (keyword-only path).
+        vector_ids = _vector_candidates(conn, query, _CANDIDATES)
+
+        if not keyword_ids and not vector_ids:
+            return (
+                f"Nothing in your knowledge base matches '{query}', sir. "
+                f"It may not be something you've taught me yet."
+            )
+
+        fused = _rrf_fuse(keyword_ids, vector_ids)[:limit]
+        placeholders = ",".join("?" * len(fused))
+        passages = {
+            int(rid): (path, content)
+            for rid, path, content in conn.execute(
+                f"SELECT rowid, path, content FROM chunks "
+                f"WHERE rowid IN ({placeholders})",
+                fused,
+            ).fetchall()
+        }
     except sqlite3.Error as exc:
         print(f"[knowledge] search sqlite error: {exc}", file=sys.stderr)
         return "The knowledge search hit a database error, sir."
@@ -401,16 +581,15 @@ def _search(query: str, limit: int) -> str:
         if conn is not None:
             conn.close()
 
-    if not rows:
-        return (
-            f"Nothing in your knowledge base matches '{query}', sir. "
-            f"It may not be something you've taught me yet."
-        )
-
-    out = [f"Found {len(rows)} passage(s) in your knowledge base:"]
-    for path, snip, _rank in rows:
-        snippet = " ".join((snip or "").split())  # collapse whitespace for voice
-        out.append(f"- [{path}] {snippet}")
+    out = [f"Found {len(fused)} passage(s) in your knowledge base:"]
+    for rid in fused:                       # keep fused (relevance) order
+        if rid not in passages:
+            continue
+        path, content = passages[rid]
+        excerpt = " ".join((content or "").split())  # collapse for voice
+        if len(excerpt) > _EXCERPT_CHARS:
+            excerpt = excerpt[:_EXCERPT_CHARS] + " …"
+        out.append(f"- [{path}] {excerpt}")
     return "\n".join(out)
 
 

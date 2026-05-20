@@ -72,3 +72,12 @@ opencv-python-headless>=4.8
 # polling rate at <10% one-core utilization. MIT licensed.
 ultralytics>=8.4
 
+# Knowledge-base semantic search (M46) — local sentence embeddings for the
+# knowledge_search hybrid retrieval (keyword FTS5 + vector, fused by RRF).
+# torch (the heavy part) is ALREADY pulled by ultralytics above, so this is
+# an incremental add, not a fresh ~200 MB dep. Model all-MiniLM-L6-v2
+# (384-dim, ~80 MB) auto-downloads to the HF cache on first reindex. LOCAL by
+# requirement — the private corpus must never leave the machine. If this
+# package is absent, knowledge_search degrades cleanly to M45 keyword-only.
+sentence-transformers>=3.0
+
