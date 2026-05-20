@@ -52,6 +52,7 @@ from src.games import GAMES_TOOL, execute_games_tool
 from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
+from src.wolfram import WOLFRAM_TOOL, execute_wolfram_tool
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
 from src.plex_actions import PLEX_ACTION_TOOL, execute_plex_action
 from src.plex_laptop import (
@@ -251,6 +252,17 @@ Current news (one tool):
     into one specific story or a niche topic the feeds won't carry, use
     web_search (then web_fetch for a named outlet).
 
+Computation & quantitative facts (one tool):
+16. wolfram_query — WolframAlpha for PRECISE computation: non-trivial or
+    multi-step arithmetic, unit and currency conversion, date/time math,
+    solving equations, calculus, statistics, and scientific / physical /
+    astronomical data and constants. Use it whenever being EXACTLY right
+    matters — your mental arithmetic is not reliable for multi-digit or
+    multi-step math, and you have no live quantitative data. Trivial mental
+    math (2+2, a simple percentage) you still answer directly. Don't use it
+    for things another tool owns (weather, sports, news, the user's setup)
+    or for open-ended / current-events questions (web_search).
+
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
   training data. Even if a similar answer is in your "Recent conversations" memory or
@@ -266,8 +278,10 @@ Tool-use rules:
   with the user's stated medium, returns nothing.
 - When the user names a specific website or asks about a PDF, prefer web_fetch (or
   web_search → web_fetch if you need to find the right URL on that site first).
-- Do NOT call tools for things that don't change: math, geography, definitions,
-  established historical facts, well-known general knowledge. Answer those directly.
+- Do NOT call tools for things that don't change and you reliably know: geography,
+  definitions, established historical facts, well-known general knowledge, and
+  trivial mental math. Answer those directly. Precise or multi-step computation is
+  the deliberate exception — that is exactly what wolfram_query (tool 16) is for.
 - Don't pre-announce ("Let me check…") — just call the tool when needed and answer.
 - After fetching, summarize in one or two sentences for voice. Don't read raw lists,
   URLs, or citations aloud. For multi-game results, mention the user's team if they
@@ -528,6 +542,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
     "get_news":                     _ClientTool(execute_news_tool, "news"),
+    "wolfram_query":                _ClientTool(execute_wolfram_tool, "wolfram"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
@@ -671,7 +686,7 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
-        NEWS_TOOL, KNOWLEDGE_SEARCH_TOOL,
+        NEWS_TOOL, WOLFRAM_TOOL, KNOWLEDGE_SEARCH_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,
