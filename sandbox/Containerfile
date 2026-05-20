@@ -1,0 +1,29 @@
+# Jarvis code-execution sandbox image (M50).
+#
+# Build it ONCE, after installing Podman, from the repo root:
+#
+#     podman build -t jarvis-code-sandbox sandbox/
+#
+# src/code_exec.py launches an ephemeral, network-less, resource-capped
+# container from this image on every run_code call, feeds the Python source
+# in on stdin, captures stdout/stderr, and destroys the container. The image
+# is the security boundary — see src/code_exec.py's module docstring.
+#
+# Rebuild only if this file changes (e.g. to add a library). The tag name
+# `jarvis-code-sandbox` is what _IMAGE in src/code_exec.py expects.
+
+FROM python:3.12-slim
+
+# The data-science staples, baked in. The sandbox runs with --network=none,
+# so whatever is NOT in this image can never be pip-installed at run time —
+# the image contents are the entire toolbox. Keep this list deliberately
+# small; add a library here (and rebuild) only when a real task needs it.
+RUN pip install --no-cache-dir numpy pandas
+
+# Defense in depth: run as a non-root user inside the container too. Podman
+# is already rootless on the host and the container is ephemeral + network-
+# less + resource-capped, but a non-root in-container user costs nothing and
+# closes one more door.
+RUN useradd --create-home sandbox
+USER sandbox
+WORKDIR /home/sandbox

@@ -53,6 +53,7 @@ from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
 from src.wolfram import WOLFRAM_TOOL, execute_wolfram_tool
+from src.code_exec import CODE_EXEC_TOOL, execute_code_tool
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
 from src.plex_actions import PLEX_ACTION_TOOL, execute_plex_action
 from src.plex_laptop import (
@@ -262,6 +263,30 @@ Computation & quantitative facts (one tool):
     math (2+2, a simple percentage) you still answer directly. Don't use it
     for things another tool owns (weather, sports, news, the user's setup)
     or for open-ended / current-events questions (web_search).
+
+Code execution (one tool):
+17. run_code — execute Python in an isolated, single-use sandbox container
+    (Python 3.12 + numpy + pandas; NO network, NO access to the user's
+    files or machine; killed after 30 seconds). Use it for genuine
+    PROGRAMMING tasks no other tool covers — parsing or transforming data
+    the user gave you, multi-step algorithmic or simulation work, generating
+    structured output (CSV, JSON, tables).
+    WHEN THE USER SAYS "CODE": if the user explicitly asks you to
+    "write code", "use code", "code it", or otherwise to compute an
+    answer WITH code, that IS a direct request for this tool — call
+    run_code and give them the RESULT. Honor their stated medium, the
+    same way you trust "the movie X" for get_movie_tv_info. Do NOT just
+    print a code block as your reply: the user wants the OUTCOME, not
+    the source — and on the voice channel a block of code read aloud is
+    useless. Only display the code itself when they explicitly ask to
+    SEE it (e.g. "show me the code"). When in doubt on voice, run it and
+    report the result.
+    NOT for a clean-answer computation the user did NOT ask you to code
+    (that's wolfram_query), NOT for facts (web_search), and NOT for anything
+    touching the user's real files or system (the sandbox cannot see them —
+    there is no tool for that). You write the code, it runs, you get stdout
+    / stderr / exit-code back — fix and re-run if it errors. Summarize the
+    result for voice; never read raw code aloud.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -543,6 +568,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
     "get_news":                     _ClientTool(execute_news_tool, "news"),
     "wolfram_query":                _ClientTool(execute_wolfram_tool, "wolfram"),
+    "run_code":                     _ClientTool(execute_code_tool, "code"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
@@ -567,6 +593,10 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
 _RESTRICTED_DENY: frozenset[str] = frozenset({
     # BLOCK — mutating / dangerous
     "system_control", "pc_shell", "run_pc_diagnostics_collector", "plex_action",
+    # BLOCK — arbitrary code execution (M50). Sandboxed on the PC, but a
+    # phone-origin turn must never be able to make Jarvis run code at all —
+    # the principle holds regardless of the isolation.
+    "run_code",
     # EXCLUDE — read-only but sensitive from a remote
     "read_local_file", "screen_snapshot", "camera_snapshot",
 })
@@ -686,7 +716,7 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
-        NEWS_TOOL, WOLFRAM_TOOL, KNOWLEDGE_SEARCH_TOOL,
+        NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL, KNOWLEDGE_SEARCH_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,
