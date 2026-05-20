@@ -70,8 +70,14 @@ def _rms(chunk_i16: np.ndarray) -> float:
 def _record_until_silence(
     session: AudioSession,
     on_amplitude: "Callable[[float], None] | None" = None,
+    max_pre_speech_sec: float | None = None,
 ) -> np.ndarray:
     """State-machine VAD: wait for speech start, then stop on sustained silence.
+
+    `max_pre_speech_sec` (M51) overrides how long to wait for speech to START
+    before giving up. None ⇒ the normal post-wake-word value (MAX_PRE_SPEECH_
+    SEC); the conversational follow-up window passes a longer value so the
+    user has time to gather a follow-up without re-saying "Hey Jarvis".
 
     Silence threshold is computed adaptively from pre-speech ambient noise:
     track the loudest pre-speech chunk (excluding any chunk loud enough to be
@@ -90,9 +96,23 @@ def _record_until_silence(
     """
     chunks: list[np.ndarray] = []
     chunks_per_sec = session.sample_rate / session.chunk_samples
-    max_chunks = int(MAX_RECORDING_SEC * chunks_per_sec)
     silence_hang_chunks = int(SILENCE_HANG_SEC * chunks_per_sec)
-    max_pre_speech_chunks = int(MAX_PRE_SPEECH_SEC * chunks_per_sec)
+    # M51: the follow-up window passes a longer pre-speech timeout; None ⇒
+    # the normal post-wake-word value, so the wake-word path is unchanged.
+    pre_speech_sec = (
+        max_pre_speech_sec if max_pre_speech_sec is not None
+        else MAX_PRE_SPEECH_SEC
+    )
+    max_pre_speech_chunks = int(pre_speech_sec * chunks_per_sec)
+    # Total recording ceiling. Normal path: exactly MAX_RECORDING_SEC (no
+    # change). Follow-up path: the pre-speech window PLUS the full speech
+    # budget, so a user who takes a few seconds to begin a follow-up still
+    # gets the normal ~15s to actually say it (the long wait must not eat
+    # into the speech allowance).
+    if max_pre_speech_sec is None:
+        max_chunks = int(MAX_RECORDING_SEC * chunks_per_sec)
+    else:
+        max_chunks = int((pre_speech_sec + MAX_RECORDING_SEC) * chunks_per_sec)
 
     speaking = False
     silence_chunks = 0
@@ -178,8 +198,14 @@ def transcribe_after_wake(
     on_amplitude: "Callable[[float], None] | None" = None,
     server_url: str = "",
     backend: str = "auto",
+    max_pre_speech_sec: float | None = None,
 ) -> Transcript:
     """Record from `session` until silence, then transcribe.
+
+    `max_pre_speech_sec` (M51) — how long to wait for the user to START
+    speaking before returning an empty Transcript. None ⇒ the normal
+    post-wake-word timeout; the conversational follow-up window passes a
+    longer value so a follow-up needs no "Hey Jarvis".
 
     `on_speech_ended` fires after audio capture ends (silence detected) but
     before transcription starts — useful for flipping a UI state pill from
@@ -203,7 +229,10 @@ def transcribe_after_wake(
     if backend == "cpu" or not server_url:
         _get_model(model_name)
 
-    audio_i16 = _record_until_silence(session, on_amplitude=on_amplitude)
+    audio_i16 = _record_until_silence(
+        session, on_amplitude=on_amplitude,
+        max_pre_speech_sec=max_pre_speech_sec,
+    )
 
     if audio_i16.size == 0:
         return Transcript(text="", language="")

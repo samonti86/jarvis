@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -159,6 +160,39 @@ def _seal_session(
         summary=summary_text,
     ))
     print(f"[memory] sealed session: {summary_text}", file=sys.stderr)
+
+
+# M51 — conversational follow-up window. After Jarvis answers, the listen
+# loop stays open for this many seconds and accepts a follow-up WITHOUT a
+# fresh "Hey Jarvis"; silence past the window falls back to wake-word mode.
+# Long enough to gather a follow-up thought, short enough to bound the
+# no-wake-word false-capture window (ambient speech / TV).
+_FOLLOWUP_WINDOW_SEC = 12.0
+
+# M51 — conversation sign-offs. When the user's turn ENDS with one of these,
+# the follow-up window is NOT opened — an explicit "that's all" should close
+# the conversation cleanly, not leave the mic listening for 12s. Matched by
+# suffix on a normalized transcript: a genuine sign-off is the tail of what
+# the user says, so "thanks Jarvis, that is all" matches but "that's all I
+# need — what about the Jets?" does not.
+_DISMISSAL_PHRASES = frozenset({
+    "that is all", "thats all", "that is all for now", "thats all for now",
+    "that will be all", "thatll be all", "that is it", "thats it",
+    "that is everything", "thats everything", "nothing else", "nothing more",
+    "no thank you", "no thanks", "im done", "im good", "im all set",
+    "we are done", "were done", "all done", "thank you jarvis",
+    "thanks jarvis", "goodbye", "good night", "goodnight",
+})
+
+
+def _is_dismissal(text: str) -> bool:
+    """True if the user's utterance is a conversation sign-off — M51 uses this
+    to skip opening a follow-up window after it. Suffix match on a normalized
+    transcript (lowercased, punctuation/apostrophes stripped)."""
+    norm = " ".join(re.sub(r"[^a-z0-9 ]+", "", (text or "").lower()).split())
+    if not norm:
+        return False
+    return any(norm == p or norm.endswith(" " + p) for p in _DISMISSAL_PHRASES)
 
 
 def listen_loop(
@@ -629,32 +663,49 @@ def listen_loop(
 
     try:
         with AudioSession(sample_rate=cfg.sample_rate) as session:
+            # M51: True ⇒ the previous turn just ended; listen for a follow-up
+            # WITHOUT requiring "Hey Jarvis" (a longer pre-speech window;
+            # silence past it falls back to wake-word mode). Starts False —
+            # the first turn after startup always needs the wake word.
+            followup = False
             while not ui.shutdown.is_set():
-                ui.set_state(State.IDLE)
                 session.drain()
 
-                wait_for_wake_word(
-                    session,
-                    threshold=cfg.wake_word_threshold,
-                    shutdown_event=ui.shutdown,
-                    reset_event=reset_event,
-                )
-                if ui.shutdown.is_set():
-                    break
+                # M51: a queued reset cancels any open follow-up window — drop
+                # to the wake-word path below, which handles the reset.
+                if followup and reset_event.is_set():
+                    followup = False
 
-                # Reset clicked while we were idle-listening. Seal+clear now,
-                # without forcing the user to ask another question first.
-                if reset_event.is_set():
-                    if history:
-                        print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
-                        ui.add_system_text("conversation reset.")
-                    else:
-                        print("[main] reset clicked, but no active conversation to seal")
-                    seal_and_refresh()
-                    reset_event.clear()
-                    continue  # back to top — listen for next wake
+                if followup:
+                    # Follow-up window: skip the wake word, capture (below)
+                    # directly with a longer pre-speech timeout. The blue
+                    # LISTENING pill is the visual cue; if the user says
+                    # nothing, the window simply elapses.
+                    ui.set_state(State.LISTENING)
+                else:
+                    ui.set_state(State.IDLE)
+                    wait_for_wake_word(
+                        session,
+                        threshold=cfg.wake_word_threshold,
+                        shutdown_event=ui.shutdown,
+                        reset_event=reset_event,
+                    )
+                    if ui.shutdown.is_set():
+                        break
 
-                ui.set_state(State.LISTENING)
+                    # Reset clicked while we were idle-listening. Seal+clear
+                    # now, without forcing another question first.
+                    if reset_event.is_set():
+                        if history:
+                            print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
+                            ui.add_system_text("conversation reset.")
+                        else:
+                            print("[main] reset clicked, but no active conversation to seal")
+                        seal_and_refresh()
+                        reset_event.clear()
+                        continue  # back to top — listen for next wake
+
+                    ui.set_state(State.LISTENING)
 
                 try:
                     transcript = transcribe_after_wake(
@@ -671,25 +722,40 @@ def listen_loop(
                         # Auto-fallback by default.
                         server_url=cfg.stt_server_url,
                         backend=cfg.stt_backend,
+                        # M51: a follow-up turn waits longer for the user to
+                        # start; the normal post-wake path uses the default.
+                        max_pre_speech_sec=(
+                            _FOLLOWUP_WINDOW_SEC if followup else None
+                        ),
                     )
                 except Exception as exc:
                     print(f"[main] STT failed: {exc}")
+                    followup = False
                     continue
 
                 if not transcript.text:
-                    print("[main] (no speech captured)\n")
+                    # M51: no speech. In a follow-up window that just means
+                    # the window elapsed — fall back to wake-word mode.
+                    if followup:
+                        print("[main] follow-up window elapsed — back to wake word\n",
+                              file=sys.stderr)
+                        followup = False
+                    else:
+                        print("[main] (no speech captured)\n")
                     continue
 
                 # Hand the transcript to the security subsystem first. It
                 # consumes the turn (returns True) for both challenge
                 # authentication AND activate/disarm intents — claude
                 # isn't called for either. Falls through to process_question
-                # on a non-match.
+                # on a non-match. M51: an intent turn is handled but is NOT a
+                # conversational Q&A, so it ends any follow-up chain.
                 if security_watcher is not None:
                     try:
                         if security_watcher.handle_transcript(transcript.text):
                             ui.add_user_text(transcript.text, transcript.language)
                             ui.set_state(State.IDLE)
+                            followup = False
                             continue
                     except Exception as exc:
                         print(f"[main] security.handle_transcript raised: {exc}",
@@ -705,6 +771,7 @@ def listen_loop(
                         ui.add_user_text(transcript.text, transcript.language)
                         on_enroll_face()
                         ui.set_state(State.IDLE)
+                        followup = False
                         continue
 
                 # M45: knowledge-base voice intents. AFTER face-enroll (a
@@ -721,15 +788,28 @@ def listen_loop(
                         ui.add_user_text(transcript.text, transcript.language)
                         on_knowledge_remember(_fact)
                         ui.set_state(State.IDLE)
+                        followup = False
                         continue
                     if (on_knowledge_reindex is not None
                             and _kb.matches_reindex_intent(transcript.text)):
                         ui.add_user_text(transcript.text, transcript.language)
                         on_knowledge_reindex()
                         ui.set_state(State.IDLE)
+                        followup = False
                         continue
 
                 process_question(transcript.text, transcript.language)
+                # M51: a real Q&A turn just completed — open the follow-up
+                # window so the next thing the user says needs no wake word,
+                # UNLESS the user signed off ("that's all", "no thank you",
+                # ...). An explicit dismissal ends the conversation cleanly
+                # instead of leaving the mic open for 12s.
+                if _is_dismissal(transcript.text):
+                    print("[main] user signed off — no follow-up window\n",
+                          file=sys.stderr)
+                    followup = False
+                else:
+                    followup = True
     finally:
         # Quit / shutdown: seal whatever's still in memory so we don't lose it.
         if history:
