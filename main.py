@@ -1000,13 +1000,52 @@ def main() -> None:
             # import error in remote_console/remote_pwa) must degrade to
             # "no remote console", never an unhandled ImportError that
             # breaks startup — the project's optional-component contract.
+            import os as _os  # noqa: PLC0415
+            import ssl as _ssl  # noqa: PLC0415
             from src.remote_console import RemoteConsoleServer  # noqa: PLC0415
+
+            # M48.3 prereq — opportunistic TLS: build an SSLContext ONLY if
+            # both .env paths are set AND both files exist on disk. Either
+            # missing or unreadable ⇒ log loudly and fall back to plain
+            # HTTP/WS (LAN-mode dev path). A misconfigured cert MUST NOT
+            # crash Jarvis — same optional-component contract as the rest of
+            # the remote console. Stays defensively quiet about secret
+            # values: only the *paths* (not contents) ever reach the log.
+            ssl_ctx = None
+            cf, kf = cfg.tls_cert_file, cfg.tls_key_file
+            if cf or kf:
+                if not (cf and kf):
+                    print(
+                        "[remote] TLS half-configured (only one of "
+                        "JARVIS_TLS_CERT_FILE/JARVIS_TLS_KEY_FILE set) — "
+                        "falling back to plain HTTP/WS",
+                        file=sys.stderr,
+                    )
+                elif not (_os.path.isfile(cf) and _os.path.isfile(kf)):
+                    print(
+                        f"[remote] TLS files not found "
+                        f"(cert={cf!r}, key={kf!r}) — falling back to "
+                        f"plain HTTP/WS",
+                        file=sys.stderr,
+                    )
+                else:
+                    try:
+                        ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+                        ssl_ctx.load_cert_chain(certfile=cf, keyfile=kf)
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"[remote] TLS load failed ({exc!r}) — "
+                            f"falling back to plain HTTP/WS",
+                            file=sys.stderr,
+                        )
+                        ssl_ctx = None
 
             remote_server = RemoteConsoleServer(
                 token=cfg.remote_token,
                 host=cfg.remote_bind,
                 port=cfg.remote_port,
                 on_control=_remote_control,
+                ssl_context=ssl_ctx,
             )
             ui.set_remote(remote_server)
             remote_server.start()

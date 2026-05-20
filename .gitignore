@@ -1,6 +1,15 @@
 # Secrets
 .env
 
+# M48.3 prereq — TLS material (Tailscale `*.ts.net` certs from `tailscale cert`).
+# Belt-and-suspenders: the files SHOULD live in %LOCALAPPDATA%\Jarvis\tls\ (out
+# of the repo entirely) but if anyone ever points the .env paths into the repo
+# or runs `tailscale cert` from here, these patterns keep the key out of git.
+*.crt
+*.key
+*.pem
+tls/
+
 # Python
 venv/
 __pycache__/

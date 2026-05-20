@@ -39,6 +39,8 @@ class Config:
     remote_token: str          # M48 — shared secret the phone PWA must present on WS connect. BLANK = remote console DISABLED (safe default: the server only starts when a token is set).
     remote_port: int           # M48 — TCP port the LAN remote-console server listens on.
     remote_bind: str           # M48 — interface to bind. "0.0.0.0" = all (LAN-reachable; the token + a LAN-only firewall rule are the controls). Never port-forward this.
+    tls_cert_file: str         # M48.3 prereq — absolute path to a TLS cert (e.g. from `tailscale cert <host>.ts.net`). BOTH cert+key set ⇒ HTTPS/WSS; either missing ⇒ plain HTTP/WS (LAN-mode fallback). File MUST live outside the repo (it's a credential).
+    tls_key_file: str          # M48.3 prereq — absolute path to the matching TLS private key. Same on/off semantics as tls_cert_file. Keep out of git.
 
 
 def load() -> Config:
@@ -79,4 +81,15 @@ def load() -> Config:
         remote_token=os.getenv("JARVIS_REMOTE_TOKEN", "").strip(),
         remote_port=int(os.getenv("JARVIS_REMOTE_PORT", "8765")),
         remote_bind=os.getenv("JARVIS_REMOTE_BIND", "0.0.0.0").strip(),
+        # M48.3 prereq — TLS via Tailscale's MagicDNS `*.ts.net` cert
+        # (`tailscale cert <host>` mints the pair via Let's Encrypt; both files
+        # are credentials and MUST live outside the repo). When both are set
+        # the WS server speaks HTTPS+WSS (secure context → unlocks
+        # getUserMedia for push-to-talk, loosens iOS <audio> gesture rules,
+        # enables PWA Add-to-Home-Screen lifecycle, AND delivers off-LAN).
+        # Either missing ⇒ fall back to plain HTTP/WS like today (LAN-mode
+        # dev path) — never crash on a misconfigured cert, the optional-
+        # component contract.
+        tls_cert_file=os.getenv("JARVIS_TLS_CERT_FILE", "").strip(),
+        tls_key_file=os.getenv("JARVIS_TLS_KEY_FILE", "").strip(),
     )

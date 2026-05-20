@@ -32,6 +32,7 @@ import asyncio
 import base64
 import hmac
 import json
+import ssl
 import sys
 import threading
 from typing import Callable
@@ -66,10 +67,17 @@ class RemoteConsoleServer:
         port: int,
         on_text: Callable[[str], None] | None = None,
         on_control: Callable[[str], dict] | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._token = token
         self._host = host
         self._port = port
+        # M48.3 prereq — when set, `serve(ssl=...)` makes the single listener
+        # speak TLS for BOTH the PWA HTTP fetch and the WS upgrade (browser
+        # sees https:// → upgrades to wss://, the PWA already detects this
+        # via `location.protocol`, so no client-side change needed). None ⇒
+        # plain HTTP/WS, today's LAN-mode behaviour, unchanged.
+        self._ssl_context = ssl_context
         # Handlers are settable late: on_control is known at construction
         # (SecurityWatcher exists in main()), but on_text needs the
         # text_queue, which lives in listen_loop's scope and is wired once
@@ -117,18 +125,53 @@ class RemoteConsoleServer:
         except Exception as exc:  # noqa: BLE001 — must never take down Jarvis
             _log(f"server thread crashed (remote console disabled): {exc!r}")
 
+    @staticmethod
+    def _swallow_proactor_resets(
+        loop: asyncio.AbstractEventLoop, context: dict
+    ) -> None:
+        """M48.2c noise filter — silence the cosmetic asyncio ProactorEventLoop
+        traceback that fires when a TLS peer drops mid-handshake. iOS Safari
+        opens a couple of probe sockets while resolving HTTP/2 / OCSP / ALPN
+        and abruptly closes the ones it doesn't use; the remote-side RST hits
+        asyncio's `_call_connection_lost`, which calls
+        `socket.shutdown(SHUT_RDWR)` on an already-gone socket and raises
+        `ConnectionResetError [WinError 10054]`. The exception is handled
+        inside asyncio (server keeps running, surviving connection completes
+        the WS upgrade fine), but the default exception handler still logs
+        the traceback — pure log bloat over time. Surgical filter: only swallow
+        a `ConnectionResetError` whose callback is *specifically* the Proactor
+        connection-lost cleanup; any other exception type or callback site
+        still propagates to the default handler so we don't blind ourselves
+        to real bugs."""
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        if (isinstance(exc, ConnectionResetError)
+                and "_ProactorBasePipeTransport._call_connection_lost" in msg):
+            return
+        loop.default_exception_handler(context)
+
     async def _main(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._loop.set_exception_handler(self._swallow_proactor_resets)
         try:
             async with serve(
                 self._handler,
                 self._host,
                 self._port,
                 process_request=self._process_request,
+                ssl=self._ssl_context,  # None ⇒ plain HTTP/WS; set ⇒ HTTPS/WSS
             ):
+                scheme = "https" if self._ssl_context else "http"
+                mode = (
+                    "HTTPS/WSS (Tailscale secure-context — use the MagicDNS "
+                    "name, not the IP, or the cert will mismatch)"
+                    if self._ssl_context
+                    else "HTTP/WS (LAN-mode; set JARVIS_TLS_CERT_FILE + "
+                    "JARVIS_TLS_KEY_FILE to upgrade)"
+                )
                 _log(
-                    f"listening on {self._host}:{self._port} "
-                    f"(LAN-only; token required). Open http://<this-pc-ip>:"
+                    f"listening on {self._host}:{self._port} ({mode}; "
+                    f"token required). Open {scheme}://<this-host>:"
                     f"{self._port}/ on the phone."
                 )
                 await asyncio.Future()  # run forever
