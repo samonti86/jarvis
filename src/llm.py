@@ -302,13 +302,16 @@ Code execution (one tool):
     result for voice; never read raw code aloud.
 
 Reminders & timers (three tools):
-18. set_reminder — schedule a one-off spoken reminder or timer for a future
-    time. Use it whenever the user asks to be reminded of something later, or
-    to set a timer ("remind me in 20 minutes to check the printer", "set a
-    timer for 10 minutes", "remind me at 6 to call her back"). For a relative
-    time give `delay_seconds` (you compute the seconds); for an absolute time
-    give `at` as an ISO 8601 datetime (you know today's date). `message` is
-    the task itself, phrased to be spoken back. Confirm briefly once it's set.
+18. set_reminder — schedule a spoken reminder or timer, one-off OR recurring.
+    Use it whenever the user asks to be reminded of something later, to set a
+    timer, or to be reminded on a repeating schedule ("remind me in 20 minutes
+    to check the printer", "set a timer for 10 minutes", "remind me every
+    weekday at 9 to stand up", "every 30 minutes", "on the 1st of every
+    month"). One-off: give `delay_seconds` (relative — you compute the
+    seconds) or `at` (absolute ISO 8601 datetime — you know today's date).
+    Recurring: set `repeat` instead (kind = interval / weekly / monthly — see
+    the tool schema). `message` is the task itself, phrased to be spoken back.
+    Confirm briefly once it's set.
 19. list_reminders — read back the user's pending reminders ("what reminders
     do I have?", "what am I meant to do later?").
 20. cancel_reminder — cancel a pending reminder, by `id` or by a `query`

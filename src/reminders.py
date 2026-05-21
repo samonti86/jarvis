@@ -3,7 +3,8 @@
 Everything Jarvis did before this was present-tense: a question comes in, an
 answer goes out. This module gives him a future tense — "remind me in 20
 minutes to check the printer" schedules a spoken reminder that fires later,
-on its own, with no further prompting.
+on its own, with no further prompting. M54 added recurrence: a reminder can
+repeat on an interval, weekly, or monthly schedule.
 
 Design decisions (settled with the user before the build):
   - **Tools, not a deterministic intent matcher.** `set_reminder` /
@@ -27,6 +28,15 @@ Design decisions (settled with the user before the build):
     datetime (Claude knows today's date; the system prompt deliberately does
     NOT carry the time-of-day, since that would bust the prompt cache every
     minute).
+  - **Recurrence — three kinds, no full calendar engine (M54).** `interval`
+    (a fixed period — every N minutes/hours), `weekly` (a weekday set + a
+    time-of-day — every day / weekday / Monday), `monthly` (a day-of-month +
+    a time, clamped to the month's last day). weekly/monthly recompute the
+    wall-clock time each occurrence so they stay correct across DST; interval
+    is for sub-day periods where that's moot. A recurring reminder is re-armed
+    on fire (same id, fire_at advanced) rather than removed — and the next
+    slot is computed from now(), so a long outage yields exactly ONE catch-up
+    fire, never a backlog stampede.
 
 Storage: %LOCALAPPDATA%\\Jarvis\\reminders.json — a JSON list, atomically
 written (temp + os.replace) so a crash mid-write can never corrupt it.
@@ -39,6 +49,7 @@ exception into the listen loop or the scheduler thread.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sys
@@ -98,14 +109,18 @@ def _save(reminders: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def add(message: str, fire_at: datetime) -> dict:
-    """Append one reminder and return the stored record."""
+def add(message: str, fire_at: datetime, repeat: dict | None = None) -> dict:
+    """Append one reminder and return the stored record. `repeat` (M54), when
+    given, is a validated recurrence spec — its presence makes the reminder
+    recurring (re-armed on fire instead of removed)."""
     rec = {
         "id": "r" + uuid.uuid4().hex[:6],
         "message": message,
         "fire_at": fire_at.strftime(_ISO),
         "created_at": datetime.now().strftime(_ISO),
     }
+    if repeat:
+        rec["repeat"] = repeat
     with _LOCK:
         items = _load()
         items.append(rec)
@@ -144,15 +159,26 @@ def cancel(rid: str | None = None, query: str | None = None) -> dict | list[dict
 
 
 def pop_due(now: datetime) -> list[dict]:
-    """Atomically remove and return every reminder due at or before `now`,
-    soonest first. The scheduler's hot path — string compare, no parsing
-    (see the _ISO note above)."""
+    """Atomically collect every reminder due at or before `now`. A one-shot
+    reminder is removed; a RECURRING one (M54) is re-armed in place — same id,
+    fire_at advanced to its next occurrence after `now`. Computing the next
+    slot from `now` (not the stale fire_at) means a long outage yields exactly
+    ONE catch-up fire, never a backlog stampede. Returns the due records as
+    they fired, soonest-first, for the scheduler to announce."""
     cutoff = now.strftime(_ISO)
     with _LOCK:
         items = _load()
         due = [r for r in items if r.get("fire_at") and r["fire_at"] <= cutoff]
-        if due:
-            _save([r for r in items if r not in due])
+        if not due:
+            return []
+        survivors = [r for r in items if r not in due]
+        for r in due:
+            repeat = r.get("repeat")
+            if repeat:
+                nxt = _next_occurrence(repeat, now)
+                if nxt is not None:  # malformed spec → drop it, fail soft
+                    survivors.append({**r, "fire_at": nxt.strftime(_ISO)})
+        _save(survivors)
     due.sort(key=lambda r: r.get("fire_at", ""))
     return due
 
@@ -180,19 +206,154 @@ def _human_dt(dt: datetime) -> str:
     return dt.strftime("%a %b %d, %I:%M %p").replace(" 0", " ")
 
 
+def _human_time(hhmm: str) -> str:
+    """'07:00' → '7:00 AM'. For describing a recurrence's time-of-day."""
+    p = _parse_hhmm(hhmm)
+    if p is None:
+        return hhmm
+    return datetime(2000, 1, 1, p[0], p[1]).strftime("%I:%M %p").lstrip("0")
+
+
+# --- recurrence (M54) ------------------------------------------------------
+
+_WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                  "Friday", "Saturday", "Sunday"]
+_MIN_INTERVAL_SEC = 60  # tighter than this is reminder-spam, almost certainly an error
+
+
+def _parse_hhmm(s: str | None) -> tuple[int, int] | None:
+    """'09:00' / '9:00' → (9, 0). None if unparseable or out of range."""
+    try:
+        parts = str(s).strip().split(":")
+        hh, mm = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError, AttributeError):
+        return None
+    return (hh, mm) if 0 <= hh <= 23 and 0 <= mm <= 59 else None
+
+
+def _validate_repeat(repeat: dict) -> dict | str:
+    """Validate + normalize a recurrence spec from the tool input. Returns a
+    clean spec dict, or a voice-friendly error string for Claude. Never raises."""
+    if not isinstance(repeat, dict):
+        return "That recurrence didn't make sense, sir."
+    kind = str(repeat.get("kind") or "").strip().lower()
+    if kind == "interval":
+        try:
+            secs = int(repeat.get("interval_seconds"))
+        except (TypeError, ValueError):
+            return "I need a valid interval for a repeating reminder, sir."
+        if secs < _MIN_INTERVAL_SEC:
+            return "That interval is too short, sir — a minute is the tightest I'll repeat."
+        return {"kind": "interval", "interval_seconds": secs}
+    if kind == "weekly":
+        try:
+            days = sorted({int(d) for d in (repeat.get("weekdays") or [])})
+        except (TypeError, ValueError):
+            return "I couldn't read those weekdays, sir."
+        if not days or any(d < 0 or d > 6 for d in days):
+            return "I need valid weekdays — Monday to Sunday — for that, sir."
+        hhmm = _parse_hhmm(repeat.get("time"))
+        if hhmm is None:
+            return "I need a valid time of day for that repeating reminder, sir."
+        return {"kind": "weekly", "weekdays": days, "time": f"{hhmm[0]:02d}:{hhmm[1]:02d}"}
+    if kind == "monthly":
+        try:
+            day = int(repeat.get("day"))
+        except (TypeError, ValueError):
+            return "I need a day of the month for that, sir."
+        if day < 1 or day > 31:
+            return "That day of the month isn't valid, sir."
+        hhmm = _parse_hhmm(repeat.get("time"))
+        if hhmm is None:
+            return "I need a valid time of day for that monthly reminder, sir."
+        return {"kind": "monthly", "day": day, "time": f"{hhmm[0]:02d}:{hhmm[1]:02d}"}
+    return "I can repeat reminders by interval, weekly, or monthly, sir."
+
+
+def _next_occurrence(repeat: dict, after: datetime) -> datetime | None:
+    """The next time this recurrence fires, strictly after `after`. Used both
+    for the first occurrence (after = now) and to re-arm a fired recurring
+    reminder (after = now) — so a long outage yields exactly one catch-up
+    fire. None on a malformed spec (callers fail soft)."""
+    kind = repeat.get("kind")
+    if kind == "interval":
+        try:
+            return after + timedelta(seconds=int(repeat["interval_seconds"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if kind == "weekly":
+        hhmm = _parse_hhmm(repeat.get("time"))
+        days = set(repeat.get("weekdays") or [])
+        if hhmm is None or not days:
+            return None
+        for offset in range(0, 9):  # 0..8 — guaranteed to hit a chosen weekday
+            d = (after + timedelta(days=offset)).replace(
+                hour=hhmm[0], minute=hhmm[1], second=0, microsecond=0)
+            if d > after and d.weekday() in days:
+                return d
+        return None
+    if kind == "monthly":
+        hhmm = _parse_hhmm(repeat.get("time"))
+        try:
+            day = int(repeat["day"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if hhmm is None:
+            return None
+        y, m = after.year, after.month
+        for _ in range(13):  # this month, then forward — always finds one
+            last = calendar.monthrange(y, m)[1]  # clamp: 31 → the real last day
+            d = datetime(y, m, min(day, last), hhmm[0], hhmm[1])
+            if d > after:
+                return d
+            m, y = (1, y + 1) if m == 12 else (m + 1, y)
+        return None
+    return None
+
+
+def _describe_repeat(repeat: dict) -> str:
+    """A spoken-friendly description of a recurrence, for list_reminders."""
+    kind = repeat.get("kind")
+    if kind == "interval":
+        secs = int(repeat.get("interval_seconds", 0))
+        if secs >= 3600 and secs % 3600 == 0:
+            n = secs // 3600
+            return f"every {n} hour{'s' if n != 1 else ''}"
+        n = max(1, secs // 60)
+        return f"every {n} minute{'s' if n != 1 else ''}"
+    if kind == "weekly":
+        days = sorted(repeat.get("weekdays") or [])
+        when = _human_time(repeat.get("time", ""))
+        if days == [0, 1, 2, 3, 4, 5, 6]:
+            return f"every day at {when}"
+        if days == [0, 1, 2, 3, 4]:
+            return f"every weekday at {when}"
+        if days == [5, 6]:
+            return f"every weekend at {when}"
+        names = ", ".join(_WEEKDAY_NAMES[d] for d in days if 0 <= d <= 6)
+        return f"every {names} at {when}"
+    if kind == "monthly":
+        return (f"on day {repeat.get('day')} of every month "
+                f"at {_human_time(repeat.get('time', ''))}")
+    return "on a schedule"
+
+
 # --- Anthropic tool definitions --------------------------------------------
 
 SET_REMINDER_TOOL = {
     "name": "set_reminder",
     "description": (
-        "Schedule a one-off spoken reminder or timer for a future time. Use "
-        "this whenever the user asks to be reminded of something later, or to "
-        "set a timer — 'remind me in 20 minutes to check the printer', 'set a "
-        "timer for 10 minutes', 'remind me at 6 to call her back'. Give "
-        "EITHER delay_seconds (a relative time like 'in 20 minutes' — you "
-        "compute the seconds) OR at (an absolute time as an ISO 8601 "
-        "datetime; you know today's date). Never both. `message` is what "
-        "Jarvis speaks aloud when it fires, phrased as the task itself "
+        "Schedule a spoken reminder or timer — one-off OR recurring. Use this "
+        "whenever the user asks to be reminded of something later, to set a "
+        "timer, or to be reminded on a repeating schedule — 'remind me in 20 "
+        "minutes to check the printer', 'set a timer for 10 minutes', 'remind "
+        "me every weekday at 9 to stand up', 'every 30 minutes', 'on the 1st "
+        "of every month'. For a ONE-OFF reminder give EITHER delay_seconds (a "
+        "relative time — you compute the seconds) OR at (an absolute ISO 8601 "
+        "datetime; you know today's date), never both. For a RECURRING "
+        "reminder set `repeat` instead — delay_seconds/at are then ignored, "
+        "the first occurrence is derived from the recurrence. `message` is "
+        "what Jarvis speaks aloud when it fires, phrased as the task itself "
         "('check the printer', 'your 10-minute timer is up'). Confirm the "
         "reminder briefly once it's set."
     ),
@@ -218,8 +379,59 @@ SET_REMINDER_TOOL = {
                 "description": (
                     "For an ABSOLUTE time: ISO 8601 local datetime, e.g. "
                     "'2026-05-21T18:00:00'. Use for 'at 6pm', 'tomorrow at "
-                    "9'. Omit if using `delay_seconds`."
+                    "9'. Omit if using `delay_seconds` or `repeat`."
                 ),
+            },
+            "repeat": {
+                "type": "object",
+                "description": (
+                    "OMIT for a normal one-shot reminder. Include to make the "
+                    "reminder RECUR; delay_seconds/at are then ignored — the "
+                    "first occurrence is derived from the recurrence."
+                ),
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["interval", "weekly", "monthly"],
+                        "description": (
+                            "interval = a fixed period (every N minutes or "
+                            "hours). weekly = chosen weekdays at a time of day "
+                            "— use this for 'every day at 7am' too (all seven "
+                            "days). monthly = a day of the month at a time."
+                        ),
+                    },
+                    "interval_seconds": {
+                        "type": "integer",
+                        "description": (
+                            "kind=interval only: whole seconds between fires "
+                            "(minimum 60)."
+                        ),
+                    },
+                    "weekdays": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "kind=weekly only: days as integers, 0=Monday … "
+                            "6=Sunday. [0,1,2,3,4,5,6] = every day; "
+                            "[0,1,2,3,4] = every weekday; [5,6] = weekends."
+                        ),
+                    },
+                    "day": {
+                        "type": "integer",
+                        "description": (
+                            "kind=monthly only: day of the month, 1-31. "
+                            "Clamped to the month's last day — so 31 means "
+                            "'the last day of every month'."
+                        ),
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": (
+                            "kind=weekly or monthly: time of day, 'HH:MM' "
+                            "24-hour (e.g. '07:00', '18:30')."
+                        ),
+                    },
+                },
             },
         },
         "required": ["message"],
@@ -274,6 +486,22 @@ def execute_set_reminder(params: dict) -> str:
     if len(message) > _MAX_MESSAGE_LEN:
         message = message[:_MAX_MESSAGE_LEN]
 
+    # M54: a recurring reminder. The first occurrence is derived from the
+    # recurrence itself, so delay_seconds/at are intentionally ignored here.
+    repeat = params.get("repeat")
+    if repeat:
+        spec = _validate_repeat(repeat)
+        if isinstance(spec, str):
+            return spec  # validation failed — already a voice-friendly message
+        fire_at = _next_occurrence(spec, datetime.now())
+        if fire_at is None:
+            return "I couldn't work out when that should recur, sir."
+        rec = add(message, fire_at, repeat=spec)
+        return (
+            f"Recurring reminder set — \"{message}\", {_describe_repeat(spec)}. "
+            f"First one at {_human_dt(fire_at)}. id: {rec['id']}."
+        )
+
     delay = params.get("delay_seconds")
     at = (params.get("at") or "").strip()
     if delay is not None and at:
@@ -320,9 +548,17 @@ def execute_list_reminders(params: dict) -> str:  # noqa: ARG001 — no params
     for r in items:
         dt = _parse_iso(r.get("fire_at", ""))
         when = _human_dt(dt) if dt else r.get("fire_at", "unknown time")
-        lines.append(
-            f"- \"{r.get('message', '?')}\" at {when} (id: {r.get('id', '?')})"
-        )
+        msg, rid = r.get("message", "?"), r.get("id", "?")
+        repeat = r.get("repeat")
+        if repeat:
+            # M54: a recurring reminder — lead with the schedule, then the
+            # next occurrence, so "what do I have" reads naturally.
+            lines.append(
+                f"- \"{msg}\" — {_describe_repeat(repeat)} (next: {when}, "
+                f"id: {rid})"
+            )
+        else:
+            lines.append(f"- \"{msg}\" at {when} (id: {rid})")
     return "\n".join(lines)
 
 
@@ -346,7 +582,19 @@ def execute_cancel_reminder(params: dict) -> str:
         return (
             f"Several reminders match that, sir — which one? {opts}"
         )
-    return f"Cancelled, sir — \"{result.get('message', '?')}\" will no longer fire."
+    # Report what's left, so Claude states "what remains" from fact rather
+    # than inferring it from a stale earlier list in the conversation (which
+    # gave a wrong "the trash reminder remains" when that one had fired).
+    remaining = list_pending()
+    if remaining:
+        names = "; ".join(f"\"{x.get('message', '?')}\"" for x in remaining)
+        tail = f" Still pending: {names}."
+    else:
+        tail = " Nothing else is pending."
+    return (
+        f"Cancelled, sir — \"{result.get('message', '?')}\" will no longer "
+        f"fire.{tail}"
+    )
 
 
 # --- scheduler -------------------------------------------------------------
