@@ -53,6 +53,10 @@ from src.games import GAMES_TOOL, execute_games_tool
 from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
+from src.reminders import (
+    CANCEL_REMINDER_TOOL, LIST_REMINDERS_TOOL, SET_REMINDER_TOOL,
+    execute_cancel_reminder, execute_list_reminders, execute_set_reminder,
+)
 from src.wolfram import WOLFRAM_TOOL, execute_wolfram_tool
 from src.code_exec import CODE_EXEC_TOOL, execute_code_tool
 from src.pc_diagnostics import PC_DIAGNOSTICS_TOOL, execute_pc_diagnostics_tool
@@ -296,6 +300,21 @@ Code execution (one tool):
     there is no tool for that). You write the code, it runs, you get stdout
     / stderr / exit-code back — fix and re-run if it errors. Summarize the
     result for voice; never read raw code aloud.
+
+Reminders & timers (three tools):
+18. set_reminder — schedule a one-off spoken reminder or timer for a future
+    time. Use it whenever the user asks to be reminded of something later, or
+    to set a timer ("remind me in 20 minutes to check the printer", "set a
+    timer for 10 minutes", "remind me at 6 to call her back"). For a relative
+    time give `delay_seconds` (you compute the seconds); for an absolute time
+    give `at` as an ISO 8601 datetime (you know today's date). `message` is
+    the task itself, phrased to be spoken back. Confirm briefly once it's set.
+19. list_reminders — read back the user's pending reminders ("what reminders
+    do I have?", "what am I meant to do later?").
+20. cancel_reminder — cancel a pending reminder, by `id` or by a `query`
+    substring of its message ("cancel the printer reminder"). Pass the query
+    directly when the user names it; call list_reminders first only if the
+    query would be ambiguous.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -579,6 +598,9 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "wolfram_query":                _ClientTool(execute_wolfram_tool, "wolfram"),
     "run_code":                     _ClientTool(execute_code_tool, "code"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
+    "set_reminder":                 _ClientTool(execute_set_reminder, "reminder_set"),
+    "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
+    "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -736,6 +758,7 @@ def stream_response(
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL, KNOWLEDGE_SEARCH_TOOL,
+        SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

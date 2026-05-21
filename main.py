@@ -1073,11 +1073,12 @@ def main() -> None:
     from src.security import SecurityWatcher
     from src.text_to_speech import speak_streaming
 
-    # Queue items are (text, on_done) tuples; on_done fires after playback
-    # so callers can defer state until the user has actually heard the
-    # prompt (SecurityWatcher's 15s challenge timer uses this). maxsize
-    # caps memory growth if TTS wedges + announces pile up.
-    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None] | None] = (
+    # Queue items are (text, on_done, label) tuples; on_done fires after
+    # playback so callers can defer state until the user has actually heard
+    # the prompt (SecurityWatcher's 15s challenge timer uses this); label is
+    # the console emoji tag (🚨 alert / ⏰ reminder). maxsize caps memory
+    # growth if TTS wedges + announces pile up.
+    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None, str] | None] = (
         queue.Queue(maxsize=16)
     )
     announce_stop = threading.Event()
@@ -1092,17 +1093,17 @@ def main() -> None:
     def _announcer_loop() -> None:
         """Dedicated proactive-speech thread (see comment above for why).
 
-        Each queued item is (text, on_done). on_done is fired in `finally`
-        after playback so it runs even if TTS itself failed — a failed
-        announce shouldn't strand the caller's state machine."""
+        Each queued item is (text, on_done, label). on_done is fired in
+        `finally` after playback so it runs even if TTS itself failed — a
+        failed announce shouldn't strand the caller's state machine."""
         print("[announcer] worker thread started", file=sys.stderr)
         while not announce_stop.is_set():
             item = announce_queue.get()
             if item is None or announce_stop.is_set():
                 break
-            text, on_done = item
+            text, on_done, label = item
             print(f"[announce] {text}")
-            ui.add_system_text(f"🚨 {text}")
+            ui.add_system_text(f"{label} {text}")
             # Bracket actual playback so the watcher's cooperative gate
             # (security._is_announcing) defers heavy bursts for exactly the
             # window speech is on the wire. Cleared in finally so a TTS
@@ -1132,7 +1133,11 @@ def main() -> None:
     )
     announcer_thread.start()
 
-    def _announce(text: str, on_done: Callable[[], None] | None = None) -> None:
+    def _announce(
+        text: str,
+        on_done: Callable[[], None] | None = None,
+        label: str = "🚨",
+    ) -> None:
         """Public entry: enqueue a proactive announcement. Non-blocking —
         returns immediately and the Announcer thread plays it. Bypasses
         the mute check (security alerts override quiet mode by design).
@@ -1141,11 +1146,14 @@ def main() -> None:
         on_done (optional) fires AFTER the playback completes (or fails) —
         used by SecurityWatcher's challenge path to defer the 15s timer
         start until the user has actually heard the prompt, otherwise
-        prompt-playback time eats into the response budget."""
+        prompt-playback time eats into the response budget.
+
+        label (optional) tags the console line — 🚨 for the default
+        (security) announce, ⏰ for an M53 reminder firing."""
         if not text:
             return
         try:
-            announce_queue.put_nowait((text, on_done))
+            announce_queue.put_nowait((text, on_done, label))
         except queue.Full:
             # Queue is wedged (TTS playback stuck?). Log + drop newest so
             # callers don't block. on_done won't fire — callers using it
@@ -1156,6 +1164,21 @@ def main() -> None:
                 f"[announce] queue full (TTS wedged?) — dropping: {text!r}",
                 file=sys.stderr,
             )
+
+    # M53: reminders & timers. The scheduler thread polls reminders.json and
+    # fires due reminders through _announce — a reminder is a proactive
+    # announce, so it rides the same WASAPI-safe Announcer path as a security
+    # alert. Bound to the ⏰ label so reminders read as reminders in the
+    # console, not 🚨 alerts. Daemon thread; reminder_stop ends it cleanly at
+    # shutdown. The local import matches the SecurityWatcher pattern above.
+    from src.reminders import run_scheduler as _run_reminder_scheduler
+    reminder_stop = threading.Event()
+    threading.Thread(
+        target=_run_reminder_scheduler,
+        args=(lambda t: _announce(t, label="⏰"), reminder_stop),
+        name="ReminderScheduler",
+        daemon=True,
+    ).start()
 
     # M35: pass the configured passphrase (empty → CHALLENGE step skipped,
     # M34 announce-only behavior) and the evidence directory (where
@@ -1359,6 +1382,10 @@ def main() -> None:
     # instead of being killed mid-playback as a daemon.
     announce_stop.set()
     announce_queue.put(None)
+
+    # M53: stop the reminder scheduler. Daemon thread, so it dies with the
+    # process either way; the event lets it exit its poll-wait cleanly.
+    reminder_stop.set()
 
     # Give listen_loop time to see the shutdown event, exit its loop cleanly,
     # and run its try/finally — which seals the active session to disk. Worst
