@@ -113,6 +113,7 @@ def speak_streaming(
     language: str = "en",
     on_first_audio: Callable[[], None] | None = None,
     on_amplitude: Callable[[float], None] | None = None,
+    interrupt_event: "threading.Event | None" = None,
 ) -> None:
     """Tier B: pipelined synth+playback as text chunks arrive from the LLM stream.
 
@@ -131,11 +132,29 @@ def speak_streaming(
     daemon ticker thread that runs alongside sd.play(). Audio path itself is
     untouched — the ticker only reads the envelope and emits values.
 
+    `interrupt_event` (optional, M52 barge-in) — polled during playback;
+    when set, playback stops, the synth/producer threads are wound down, and
+    the function returns *normally*. An interrupt is not an error, so it
+    deliberately does NOT raise (unlike the producer-error path below) — the
+    caller distinguishes the two by inspecting the event afterwards.
+
+    The mid-sentence cut is done HERE, on the caller's thread: each sentence
+    plays non-blocking (sd.play(blocking=False)) and a short poll loop watches
+    interrupt_event, calling sd.stop() itself when it fires. This is load-
+    bearing — sd.stop() MUST run on the thread that owns the output stream.
+    Windows WASAPI streams are COM space-threaded; calling sd.stop() from
+    the barge-in monitor thread is a cross-space violation that hard-
+    crashes the process (cf. project_wasapi_thread_audio_owner). The monitor
+    therefore only sets the event — it never touches the audio API.
+
     On any exception in the text producer (e.g., LLM stream raising), this
     function re-raises it after threads drain, so the caller can roll back
     conversation history. Per-sentence synth failures are logged and skipped.
     """
     voice = VOICE_BY_LANG.get(language, DEFAULT_VOICE)
+
+    def _interrupted() -> bool:
+        return interrupt_event is not None and interrupt_event.is_set()
 
     sentence_q: queue.Queue[str | None] = queue.Queue()
     audio_q: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue(maxsize=2)
@@ -151,6 +170,12 @@ def speak_streaming(
         try:
             buffer = ""
             for chunk in text_iter:
+                # M52: stop pulling the LLM stream the moment the user barges
+                # in. stream_response also polls the same event and closes its
+                # HTTP stream, so this is belt-and-suspenders — but it makes
+                # the producer wind down promptly even mid-buffer.
+                if _interrupted():
+                    break
                 buffer += chunk
                 while True:
                     m = _SENTENCE_RE.search(buffer)
@@ -195,6 +220,11 @@ def speak_streaming(
 
     first = True
     while True:
+        # M52: poll the barge-in event before starting each sentence — covers
+        # the gap between sentences. The mid-sentence cut is handled by the
+        # non-blocking play + poll loop below (sd.stop on this thread).
+        if _interrupted():
+            break
         item = audio_q.get()
         if item is None:
             break
@@ -225,7 +255,29 @@ def speak_streaming(
                 )
                 ticker_thread.start()
 
-        sd.play(samples, samplerate=sample_rate, blocking=True)
+        # M52: play non-blocking and poll, so the barge-in cut (sd.stop) and
+        # the completion check both run on THIS thread — the one that owns
+        # the WASAPI/COM output stream. sd.stop() from the monitor thread is
+        # a cross-space COM call that HARD-crashes the process (the
+        # original M52 bug; cf. project_wasapi_thread_audio_owner — WASAPI is
+        # thread-affine). The monitor now only sets interrupt_event.
+        sd.play(samples, samplerate=sample_rate, blocking=False)
+        # Hard cap well past the real duration so a misbehaving stream can't
+        # hang the loop; normal exit is the .active check or the interrupt.
+        play_deadline = time.monotonic() + len(samples) / sample_rate + 1.0
+        while time.monotonic() < play_deadline:
+            if _interrupted():
+                break
+            try:
+                if not sd.get_stream().active:
+                    break  # sentence finished playing on its own
+            except Exception:
+                break  # no current stream / already closed — treat as done
+            time.sleep(0.02)
+        try:
+            sd.stop()  # owner-thread cut: ends the sentence on a barge-in,
+        except Exception as exc:  # or tidies the finished stream otherwise
+            print(f"[tts] sd.stop failed: {exc}", file=sys.stderr)
 
         # Stop the ticker promptly so it doesn't run past playback end. The
         # console's own decay logic settles bars back to flat from here.
@@ -234,10 +286,35 @@ def speak_streaming(
         if ticker_thread is not None:
             ticker_thread.join(timeout=0.2)
 
-    t_prod.join()
-    t_synth.join()
+        # M52: barged in — stop here rather than play the next queued sentence.
+        if _interrupted():
+            break
 
-    if producer_errors:
+    # M52: on a barge-in, the synth worker may be parked on a full audio_q
+    # (maxsize=2) since we stopped pulling. Drain it to its None sentinel so
+    # the worker unblocks and the joins below can't hang. The producer sees
+    # interrupt_event in its own loop and winds down independently. Playback
+    # itself was already stopped on this thread by the poll loop above.
+    if _interrupted():
+        while True:
+            try:
+                drained = audio_q.get(timeout=5.0)
+            except queue.Empty:
+                break
+            if drained is None:
+                break
+
+    # On a clean turn the worker threads are already done (the LLM stream
+    # ended), so these joins are instant. On a barge-in they wind down within
+    # the timeout; both are daemon threads, so a rare straggler (e.g. producer
+    # blocked inside a slow tool call) dies with the process — it must not
+    # delay dropping the user into the follow-up listening window.
+    t_prod.join(timeout=1.0)
+    t_synth.join(timeout=1.0)
+
+    # An interrupt is a normal outcome, not a failure — only surface a genuine
+    # producer error, and only when we weren't barged in.
+    if producer_errors and not _interrupted():
         raise producer_errors[0]
 
 

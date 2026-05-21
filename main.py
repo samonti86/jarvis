@@ -53,11 +53,24 @@ from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
 from src.tray import State
 from src.ui import JarvisUI
-from src.wake_word import wait_for_wake_word
+from src.wake_word import monitor_for_wake_word, wait_for_wake_word
 
 
 MAX_PAIRS = 10            # cap conversation at 10 exchanges (20 messages)
 IDLE_RESET_SEC = 600.0    # 10 min of silence → forget conversation
+
+
+def _barge_in_enabled() -> bool:
+    """M52 kill switch. JARVIS_BARGE_IN ∈ {0,false,no,off} disables barge-in
+    entirely — the escape hatch if the soak ever shows the concurrent
+    wake-word monitor stutters the Python-fed TTS path (the documented
+    stutter-gate risk: see project_security_audio_stutter_gate). Default on.
+    Read once at import; it never changes mid-session."""
+    raw = os.getenv("JARVIS_BARGE_IN", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+_BARGE_IN_ENABLED = _barge_in_enabled()
 
 
 class _TeeStream:
@@ -184,15 +197,42 @@ _DISMISSAL_PHRASES = frozenset({
     "thanks jarvis", "goodbye", "good night", "goodnight",
 })
 
+# M51 follow-on (2026-05-21): a trailing courtesy masks a sign-off. "That is
+# all, thank you" ends with "thank you", not "that is all", so the bare suffix
+# match missed it — the window stayed open and the user had to repeat "that is
+# all". We strip ONE trailing courtesy and re-test, rather than registering
+# bare "thank you" as a dismissal phrase: that would false-trip questions like
+# "how do you say thank you". Longest-first so the whole phrase is removed.
+_TRAILING_COURTESY = (
+    "thank you very much", "thank you so much", "thanks so much",
+    "thank you", "thanks", "please",
+)
+
 
 def _is_dismissal(text: str) -> bool:
     """True if the user's utterance is a conversation sign-off — M51 uses this
     to skip opening a follow-up window after it. Suffix match on a normalized
-    transcript (lowercased, punctuation/apostrophes stripped)."""
+    transcript (lowercased, punctuation/apostrophes stripped), with one
+    trailing courtesy ("...thank you") stripped before re-testing."""
     norm = " ".join(re.sub(r"[^a-z0-9 ]+", "", (text or "").lower()).split())
     if not norm:
         return False
-    return any(norm == p or norm.endswith(" " + p) for p in _DISMISSAL_PHRASES)
+
+    def _suffix_match(s: str) -> bool:
+        return bool(s) and any(
+            s == p or s.endswith(" " + p) for p in _DISMISSAL_PHRASES
+        )
+
+    if _suffix_match(norm):
+        return True
+    # Retry with a trailing courtesy removed — "that is all, thank you". A
+    # bare "thank you" (norm == courtesy) strips to "" → _suffix_match False,
+    # so plain politeness still does NOT close the conversation (M51's
+    # deliberate choice: only "thank you JARVIS" — with the name — signs off).
+    for courtesy in _TRAILING_COURTESY:
+        if norm == courtesy or norm.endswith(" " + courtesy):
+            return _suffix_match(norm[: -len(courtesy)].strip())
+    return False
 
 
 def listen_loop(
@@ -271,13 +311,26 @@ def listen_loop(
         attachments: list[dict] | None = None,
         origin: str = "voice",
         reply_audio: "Callable[[bytes], None] | None" = None,
-    ) -> None:
+        session: AudioSession | None = None,
+    ) -> bool:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
+
+        Returns True if the user barged in (M52) and the turn was cut short —
+        the voice loop uses that to drop straight into a listening window.
+        Every other path (normal completion, errors, the text/phone paths
+        that ignore the return) yields False.
 
         Called from both voice path (after STT, no attachments) and text path
         (after typed Enter, optional attachments). Caller is responsible for
         setting THINKING before calling; SPEAKING is set automatically when
         TTS audio starts.
+
+        `session` (M52) — the PC mic AudioSession, passed ONLY by the voice
+        path. Its presence (plus an audible, non-restricted turn) is what
+        enables the barge-in monitor: the monitor needs the mic, and only the
+        voice path holds the session. Text/phone callers pass None, so the
+        interrupt machinery threads through every layer as an inert no-op and
+        those paths stay byte-identical to pre-M52.
 
         `origin` (M48.2/M48.2a): where the turn came from — the single
         honest signal two separate per-turn concerns derive from:
@@ -285,9 +338,9 @@ def listen_loop(
           - "console"    : PC typed         → speaks (subject to mute), full tools
           - "phone_text" : phone typed      → text-only, RESTRICTED tools
           - "phone_voice": phone PTT (M48.3)→ audio→phone, RESTRICTED tools
-        `speak` and `restricted` are derived below — they are NOT the same
-        axis (phone_voice will speak yet still be restricted), which is why
-        the prior single `speak` bool was replaced by `origin`. The phone
+        `text_only` and `restricted` are derived below — they are NOT the
+        same axis (phone_voice will speak yet still be restricted), which is
+        why the prior single `speak` bool was replaced by `origin`. The phone
         gets a deliberately reduced tool surface (no system_control /
         pc_shell / collector / plex_action; no file/screen/camera) —
         enforced server-side in stream_response, NOT prompt-only
@@ -301,11 +354,13 @@ def listen_loop(
         nonlocal session_language, session_started_at, last_turn_time
 
         # M48.2/M48.2a — the two per-turn concerns, derived from one origin.
-        # speak: phone-text is text-only (M48.2); everything else speaks
+        # text_only: phone-text is text-only (M48.2); everything else speaks
         # (subject to mute). restricted: any phone origin gets the reduced
         # tool surface (M48.2a) — phone_voice (M48.3) will speak AND be
         # restricted, which is why these are separate axes off `origin`.
-        speak = origin != "phone_text"
+        # NB: deliberately NOT named `speak` — that shadowed the imported
+        # speak() function and crashed the apology path ('bool' not callable).
+        text_only = origin == "phone_text"
         restricted = origin in ("phone_text", "phone_voice")
 
         with processing_lock:
@@ -386,6 +441,10 @@ def listen_loop(
                 ui.add_image_thumbnail(image_bytes, label)
 
             def llm_stream():
+                # `interrupt_event` is a free variable bound just below (before
+                # this generator is ever called) — None unless barge-in is
+                # active for this turn, in which case stream_response polls it
+                # and closes the HTTP stream when the user cuts in.
                 for chunk in stream_response(
                     api_key=cfg.anthropic_api_key,
                     messages=history,
@@ -397,6 +456,7 @@ def listen_loop(
                     on_image_captured=on_image_captured,
                     engineer_mode=engineer,
                     restricted=restricted,
+                    interrupt_event=interrupt_event,
                 ):
                     response_chunks.append(chunk)
                     print(chunk, end="", flush=True)
@@ -408,11 +468,11 @@ def listen_loop(
             # already visible in the console regardless.
             muted = ui.is_muted()
 
-            # M48.2: phone-text turns are text-only by origin (speak=False),
+            # M48.2: phone-text turns are text-only by origin (text_only),
             # independent of the global mute toggle. Folded into the same
             # silent-drain path mute already uses — one branch, no new code
             # path to keep correct.
-            silent = muted or not speak
+            silent = muted or text_only
 
             # M48.2b: reply_audio set ⇒ this turn's reply audio goes to the
             # ORIGINATING PHONE, never the PC. The PC therefore drains
@@ -420,6 +480,22 @@ def listen_loop(
             # below is mute-INDEPENDENT (the locked rule: the remote user
             # must hear the answer they asked for, regardless of PC mute).
             pc_silent = silent or reply_audio is not None
+
+            # M52 — barge-in. Enabled only for a PC-voice turn that actually
+            # speaks aloud: we need the mic AudioSession (only the voice path
+            # passes it) and audible playback to interrupt. phone/console/
+            # muted turns leave interrupt_event None, so it threads through
+            # llm_stream → stream_response → speak_streaming as an inert
+            # no-op and those paths are byte-identical to pre-M52.
+            barge_enabled = (
+                _BARGE_IN_ENABLED
+                and session is not None
+                and origin == "voice"
+                and not pc_silent
+            )
+            interrupt_event = threading.Event() if barge_enabled else None
+            monitor_stop = threading.Event()
+            monitor_thread: threading.Thread | None = None
 
             try:
                 if pc_silent:
@@ -432,11 +508,26 @@ def listen_loop(
                     for _ in llm_stream():
                         pass
                 else:
+                    # M52: run the barge-in monitor for the duration of
+                    # playback. It reads the mic on its own thread and, on a
+                    # "Hey Jarvis", just sets interrupt_event — speak_streaming
+                    # polls it and performs the sd.stop() cut on its own
+                    # (stream-owning) thread, the WASAPI thread-affinity fix.
+                    if barge_enabled:
+                        monitor_thread = threading.Thread(
+                            target=monitor_for_wake_word,
+                            args=(session, interrupt_event, monitor_stop),
+                            kwargs={"threshold": cfg.wake_word_threshold},
+                            name="BargeInMonitor",
+                            daemon=True,
+                        )
+                        monitor_thread.start()
                     speak_streaming(
                         llm_stream(),
                         language=language,
                         on_first_audio=lambda: ui.set_state(State.SPEAKING),
                         on_amplitude=ui.set_amplitude,
+                        interrupt_event=interrupt_event,
                     )
             except Exception as exc:
                 history.pop()  # keep history alternating user/assistant cleanly
@@ -465,13 +556,30 @@ def listen_loop(
                 # the error path (extra failure surface for little gain — the
                 # text is enough to convey the hiccup).
                 ui.add_jarvis_text(apology)
-                return
+                return False
+            finally:
+                # M52: always wind the barge-in monitor down — normal end,
+                # exception, OR barge-in. monitor_stop makes its next
+                # session.read() (≤80ms away) the last; the join is instant
+                # on a clean turn and capped short otherwise (daemon thread).
+                if monitor_thread is not None:
+                    monitor_stop.set()
+                    monitor_thread.join(timeout=1.0)
             print()
+
+            # M52: did the user barge in? interrupt_event survives the monitor
+            # join (Events don't auto-reset), so this read is stable. A
+            # barged-in turn keeps whatever partial reply was streamed — it is
+            # real context for the follow-up ("as I was saying...") — and
+            # signals the voice loop to open a listening window at once.
+            interrupted = interrupt_event is not None and interrupt_event.is_set()
+            if interrupted:
+                print("[main] turn interrupted by barge-in", file=sys.stderr)
 
             full_response = "".join(response_chunks).strip()
             if not full_response:
                 history.pop()  # nothing came back; drop the orphan user message
-                return
+                return interrupted
 
             history.append({"role": "assistant", "content": full_response})
             _trim_history(history)
@@ -502,6 +610,7 @@ def listen_loop(
                     print(f"[main] phone reply audio failed: {exc}",
                           file=sys.stderr)
             print()
+            return interrupted
 
     def text_input_loop() -> None:
         """Consume typed questions from the queue. Short timeout so we notice
@@ -668,8 +777,25 @@ def listen_loop(
             # silence past it falls back to wake-word mode). Starts False —
             # the first turn after startup always needs the wake word.
             followup = False
+            # M52: True for the single iteration right after a barge-in. The
+            # user typically says "Hey Jarvis" AND the new question in one
+            # breath, so the buffered mic audio holds the start of that
+            # question. We must NOT drain it (draining is correct after a
+            # normal wake word, where the user pauses) — see below.
+            barged = False
             while not ui.shutdown.is_set():
-                session.drain()
+                # M52: skip the drain on the post-barge-in iteration so the
+                # already-spoken follow-up survives into capture; otherwise
+                # the user's words between "Hey Jarvis" and here are discarded
+                # (the M52 "missed the start of my question" bug). The barge-in
+                # monitor consumed the queue up to ~end of "Hey Jarvis", so
+                # what remains is the question itself (plus a brief TTS-echo
+                # tail Whisper tolerates). Every other iteration drains as
+                # before — clearing the just-finished reply's echo.
+                if barged:
+                    barged = False
+                else:
+                    session.drain()
 
                 # M51: a queued reset cancels any open follow-up window — drop
                 # to the wake-word path below, which handles the reset.
@@ -798,13 +924,27 @@ def listen_loop(
                         followup = False
                         continue
 
-                process_question(transcript.text, transcript.language)
-                # M51: a real Q&A turn just completed — open the follow-up
-                # window so the next thing the user says needs no wake word,
-                # UNLESS the user signed off ("that's all", "no thank you",
-                # ...). An explicit dismissal ends the conversation cleanly
-                # instead of leaving the mic open for 12s.
-                if _is_dismissal(transcript.text):
+                # M52: pass the AudioSession so process_question can run the
+                # barge-in monitor — only the voice path has the mic, so only
+                # the voice path can be interrupted. Returns True iff the user
+                # cut Jarvis off mid-reply with "Hey Jarvis".
+                interrupted = process_question(
+                    transcript.text, transcript.language, session=session,
+                )
+                # M51/M52: open the follow-up window so the next utterance
+                # needs no wake word. A barge-in ALWAYS opens it — the user
+                # interrupted precisely to say something now, and the wake
+                # word that triggered the barge-in carries no transcript to
+                # sign off with, so the dismissal check is skipped on that
+                # path. Otherwise (a normal completed turn) honour an explicit
+                # sign-off ("that's all", "no thank you", ...) and close
+                # cleanly instead of leaving the mic open for 12s.
+                if interrupted:
+                    print("[main] barge-in — straight into listening\n",
+                          file=sys.stderr)
+                    followup = True
+                    barged = True  # M52: next iteration skips session.drain()
+                elif _is_dismissal(transcript.text):
                     print("[main] user signed off — no follow-up window\n",
                           file=sys.stderr)
                     followup = False
