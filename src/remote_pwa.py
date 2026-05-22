@@ -19,8 +19,8 @@ PWA_MANIFEST = """{
   "name": "Jarvis",
   "short_name": "Jarvis",
   "display": "standalone",
-  "background_color": "#0b0f14",
-  "theme_color": "#0b0f14",
+  "background_color": "#0a0e14",
+  "theme_color": "#0a0e14",
   "start_url": "/"
 }"""
 
@@ -33,71 +33,100 @@ PWA_HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Jarvis">
-<meta name="theme-color" content="#0b0f14">
+<meta name="theme-color" content="#0a0e14">
 <link rel="manifest" href="/manifest.json">
 <title>Jarvis</title>
 <style>
-  :root { --bg:#0b0f14; --panel:#121821; --line:#1f2a37; --tx:#e6edf3;
-          --dim:#8b98a5; --accent:#3b82f6; --ok:#22c55e; --warn:#f59e0b;
-          --bad:#ef4444; }
+  /* M57 — "Arc Reactor" palette: matches the desktop console (src/console.py)
+     — near-black + electric arc-reactor cyan, Iron-Man gold for THINKING. */
+  :root { --bg:#0a0e14; --panel:#10161f; --line:#1d2b3a; --border:#21465a;
+          --tx:#cdd9e5; --dim:#5b6b7f; --accent:#22d3ee; --hot:#7df3ff;
+          --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--tx);
     font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
   body { display:flex; flex-direction:column;
     padding:env(safe-area-inset-top) env(safe-area-inset-right)
             env(safe-area-inset-bottom) env(safe-area-inset-left); }
-  header { display:flex; align-items:center; gap:10px; padding:12px 16px;
-    border-bottom:1px solid var(--line); background:var(--panel); }
-  header b { font-weight:600; letter-spacing:.5px; }
-  #pill { margin-left:auto; font-size:13px; padding:4px 10px; border-radius:999px;
-    background:#26313f; color:var(--dim); }
-  #armed { font-size:12px; padding:4px 9px; border-radius:999px;
-    border:1px solid var(--line); color:var(--dim); }
+  header { display:flex; align-items:center; gap:10px; padding:11px 16px;
+    border-bottom:1px solid var(--border); background:var(--panel);
+    box-shadow:0 1px 14px rgba(34,211,238,.10); }
+  header b { font-weight:700; letter-spacing:3.5px; font-size:17px;
+    color:var(--accent); text-shadow:0 0 9px rgba(34,211,238,.55); }
+
+  /* Arc-reactor orb — the desktop console's centrepiece, header-sized for
+     the phone: concentric rings, a rotating arc, a breathing glow. State
+     class (.s-*) swaps the colour; idle is the default. */
+  .orb { width:30px; height:30px; border-radius:50%; position:relative;
+    flex:0 0 auto; --orb:#3f5468; --orbhot:#6b8299;
+    background:radial-gradient(circle at 50% 50%,
+      var(--orbhot) 0%, var(--orb) 40%, rgba(0,0,0,0) 72%);
+    animation:orbBreathe 3.4s ease-in-out infinite; }
+  .orb::before { content:""; position:absolute; inset:-3px; border-radius:50%;
+    border:2px solid transparent; border-top-color:var(--orbhot);
+    border-right-color:var(--orb); animation:orbSpin 3s linear infinite; }
+  .orb::after { content:""; position:absolute; inset:5px; border-radius:50%;
+    border:1px solid var(--orb); opacity:.55; }
+  .orb.s-listening { --orb:#22d3ee; --orbhot:#7df3ff; }
+  .orb.s-thinking  { --orb:#f5b942; --orbhot:#ffd98a; }
+  .orb.s-speaking  { --orb:#34e6d0; --orbhot:#9af7ec;
+    animation:orbBreathe 1.1s ease-in-out infinite; }
+  @keyframes orbSpin { to { transform:rotate(360deg); } }
+  @keyframes orbBreathe { 0%,100% { box-shadow:0 0 7px var(--orb); }
+    50% { box-shadow:0 0 17px var(--orbhot); } }
+
+  #pill { margin-left:auto; font-size:12px; padding:4px 11px; border-radius:999px;
+    background:#16202c; color:var(--dim); border:1px solid var(--line); }
+  #armed { font-size:11px; padding:4px 9px; border-radius:999px;
+    border:1px solid var(--line); color:var(--dim); letter-spacing:.5px; }
   #armed.on { color:#fff; background:var(--bad); border-color:var(--bad); }
   #log { flex:1; overflow-y:auto; padding:14px 16px; }
-  .m { margin:9px 0; max-width:88%; padding:9px 12px; border-radius:12px;
+  .m { margin:9px 0; max-width:88%; padding:9px 12px; border-radius:13px;
     white-space:pre-wrap; word-wrap:break-word; }
-  .you { margin-left:auto; background:var(--accent); color:#fff;
-    border-bottom-right-radius:3px; }
-  .jar { background:var(--panel); border:1px solid var(--line);
-    border-bottom-left-radius:3px; }
+  .you { margin-left:auto; background:#13313b; border:1px solid #205265;
+    color:#e2f6fa; border-bottom-right-radius:3px; }
+  .jar { background:var(--panel); border:1px solid var(--border);
+    color:var(--tx); border-bottom-left-radius:3px;
+    box-shadow:0 0 10px rgba(34,211,238,.06); }
   .sys { background:transparent; color:var(--dim); font-size:13px;
     text-align:center; max-width:100%; }
-  footer { border-top:1px solid var(--line); background:var(--panel);
+  footer { border-top:1px solid var(--border); background:var(--panel);
     padding:10px 12px 14px; display:flex; flex-direction:column; gap:9px; }
   .row { display:flex; gap:8px; }
   input,button { font:inherit; border-radius:10px; border:1px solid var(--line);
-    background:#0f141b; color:var(--tx); padding:12px 13px; }
-  #txt { flex:1; min-width:0; }
+    background:#0c141d; color:var(--tx); padding:12px 13px; }
+  #txt { flex:1; min-width:0; border-color:var(--border); }
   /* M48.3: iOS long-press on a button = text-selection / context callout
      (the spike's locked finding); touch-action manipulation also kills the
      300ms double-tap-zoom delay. Applied globally — every button benefits. */
-  button { background:#1c2735; cursor:pointer;
+  button { background:#16212e; cursor:pointer; border-color:var(--border);
     -webkit-user-select:none; -webkit-touch-callout:none;
     touch-action:manipulation; user-select:none; }
   button:active { opacity:.7; }
-  #send { background:var(--accent); border-color:var(--accent); color:#fff;
-    font-weight:600; }
+  #send { background:var(--accent); border-color:var(--accent); color:#06222a;
+    font-weight:700; }
   .ctl { flex:1; padding:13px; font-weight:600; }
-  #arm { background:#15281b; border-color:#225133; color:#7ee2a8; }
-  #disarm { background:#2a1717; border-color:#5a2a2a; color:#f0a3a3; }
+  #arm { background:#10241a; border-color:#225133; color:#7ee2a8; }
+  #disarm { background:#241313; border-color:#5a2a2a; color:#f0a3a3; }
   #setup { position:fixed; inset:0; background:var(--bg); display:none;
     flex-direction:column; justify-content:center; padding:28px; gap:14px; }
   #setup.show { display:flex; }
-  #setup h2 { margin:0 0 4px; font-weight:600; }
+  #setup h2 { margin:0 0 4px; font-weight:700; color:var(--accent);
+    letter-spacing:1px; }
   #setup p { margin:0; color:var(--dim); font-size:14px; }
   .hidden { display:none !important; }
-  #spk { background:#1c2735; }
-  #spk.on { background:#15281b; border-color:#225133; color:#7ee2a8; }
+  #spk { background:#16212e; }
+  #spk.on { background:#10241a; border-color:#225133; color:#7ee2a8; }
   /* M48.3 — mic in two visual states. Idle = neutral; recording = the
      disarm-button red palette ("this is hot, tap to stop" — the same visual
      vocabulary used for active danger elsewhere in the UI). */
-  #mic { background:#1c2735; }
-  #mic.on { background:#2a1717; border-color:#5a2a2a; color:#f0a3a3; }
+  #mic { background:#16212e; }
+  #mic.on { background:#241313; border-color:#5a2a2a; color:#f0a3a3; }
 </style>
 </head>
 <body>
 <header>
+  <div id="orb" class="orb"></div>
   <b>JARVIS</b>
   <span id="armed">UNARMED</span>
   <span id="pill">connecting…</span>
@@ -137,7 +166,7 @@ PWA_HTML = r"""<!DOCTYPE html>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const log = $("log"), pill = $("pill"), armedEl = $("armed");
+  const log = $("log"), pill = $("pill"), armedEl = $("armed"), orb = $("orb");
   let ws = null, retry = 0, token = localStorage.getItem("jarvisToken") || "";
 
   // M48.2b — opt-in "Speak replies" (default OFF; phone-text stays silent
@@ -429,11 +458,20 @@ PWA_HTML = r"""<!DOCTYPE html>
     pill.style.background = color || "#26313f";
     pill.style.color = color ? "#fff" : "var(--dim)";
   }
-  const STATE_COLOR = { idle:"", listening:"#2563eb", thinking:"#b45309",
-                        speaking:"#15803d" };
+  // Pill colours — darker on-palette shades so white pill text stays
+  // readable (the header orb carries the vivid state colour now).
+  const STATE_COLOR = { idle:"", listening:"#0e7490", thinking:"#a16207",
+                        speaking:"#0f766e" };
   function setArmed(on) {
     armedEl.textContent = on ? "ARMED" : "UNARMED";
     armedEl.classList.toggle("on", !!on);
+  }
+  // M57 — reflect Jarvis's state on the header arc-reactor orb. Whitelisted:
+  // an unknown / empty / connection-only state falls back to the idle look.
+  function setOrb(state) {
+    const s = String(state || "").toLowerCase();
+    orb.className = ["listening", "thinking", "speaking"].includes(s)
+      ? "orb s-" + s : "orb";
   }
 
   // dial(): the single re-entrant entry point. Everything that wants a
@@ -494,8 +532,11 @@ PWA_HTML = r"""<!DOCTYPE html>
         case "snapshot":
           setArmed(m.armed);
           setPill(m.state || "connected",
-                  STATE_COLOR[m.state] ?? "#15803d"); break;
-        case "state": setPill(m.state, STATE_COLOR[m.state] ?? ""); break;
+                  STATE_COLOR[m.state] ?? "#0f766e");
+          setOrb(m.state); break;
+        case "state":
+          setPill(m.state, STATE_COLOR[m.state] ?? "");
+          setOrb(m.state); break;
         case "armed": setArmed(m.armed); break;
         case "user":
           line("you", m.text);
