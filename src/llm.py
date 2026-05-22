@@ -53,6 +53,7 @@ from src.games import GAMES_TOOL, execute_games_tool
 from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
+from src.briefing import BRIEFING_TOOL, execute_briefing_tool
 from src.reminders import (
     CANCEL_REMINDER_TOOL, LIST_REMINDERS_TOOL, SET_REMINDER_TOOL,
     execute_cancel_reminder, execute_list_reminders, execute_set_reminder,
@@ -258,10 +259,11 @@ Personal knowledge (your private store — one tool):
 
 Current news (one tool):
 15. get_news — current headlines by topic from curated reputable RSS feeds
-    (categories: top, world, tech, business, science). ALWAYS prefer this
-    over web_search for general "what's the news / what's the latest <topic>
-    news / what's happening today" questions — it returns fresh structured
-    headlines and is faster and more reliable than scraping. The optional
+    (categories: top, world, tech, business, science, sports [NHL/NFL/WWE],
+    gaming [PlayStation/Nintendo]). ALWAYS prefer this over web_search for
+    general "what's the news / what's the latest <topic> news / what's
+    happening today" questions — it returns fresh structured headlines and
+    is faster and more reliable than scraping. The optional
     `topic` only filters those current feeds (not a web-wide search); to dig
     into one specific story or a niche topic the feeds won't carry, use
     web_search (then web_fetch for a named outlet).
@@ -318,6 +320,20 @@ Reminders & timers (three tools):
     substring of its message ("cancel the printer reminder"). Pass the query
     directly when the user names it; call list_reminders first only if the
     query would be ambiguous.
+
+The morning briefing (one tool):
+21. get_briefing — the user's composed "good morning" briefing: today's
+    weather, sports and gaming headlines, overnight security events, and the
+    reminders due today, all gathered in one call. Use it when the user says
+    "good morning", asks for "my briefing" / "the morning briefing", or
+    "what's my day looking like". ALWAYS call get_briefing for such a
+    request — EVERY time, even if you already briefed earlier in this same
+    conversation. A briefing is a fresh-state request, like asking the
+    time: never reply "I already briefed you" or answer from an earlier
+    briefing in memory — re-run the tool and give the current one. It
+    already includes today's weather, so do NOT also call get_weather for a
+    briefing. Voice the result as a natural, concise briefing — greet them,
+    a sentence or two per section; don't recite it verbatim.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -604,6 +620,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "set_reminder":                 _ClientTool(execute_set_reminder, "reminder_set"),
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
     "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
+    "get_briefing":                 _ClientTool(execute_briefing_tool, "briefing"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -762,6 +779,7 @@ def stream_response(
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL, KNOWLEDGE_SEARCH_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
+        BRIEFING_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

@@ -53,12 +53,13 @@ NEWS_TOOL = {
     "name": "get_news",
     "description": (
         "Get current news headlines by topic from curated reputable RSS "
-        "feeds (BBC, NPR, Ars Technica, The Verge, Hacker News). ALWAYS "
+        "feeds (BBC, NPR, Ars Technica, The Verge, ESPN, and more). ALWAYS "
         "prefer this over web_search for general 'what's the news', "
         "'what's happening today', or 'what's the latest <topic> news' "
         "questions — it returns fresh structured headlines and is faster "
         "and more reliable than scraping. Categories: top (general "
-        "headlines), world, tech, business, science. Use web_search "
+        "headlines), world, tech, business, science, sports (NHL/NFL/WWE), "
+        "gaming (PlayStation/Nintendo). Use web_search "
         "instead when the user wants to dig into one specific story, names "
         "a specific outlet/URL (then web_fetch), or asks about a niche "
         "topic these general feeds won't cover. NOTE: this reads a fixed "
@@ -70,10 +71,12 @@ NEWS_TOOL = {
         "properties": {
             "category": {
                 "type": "string",
-                "enum": ["top", "world", "tech", "business", "science"],
+                "enum": ["top", "world", "tech", "business", "science",
+                         "sports", "gaming"],
                 "description": (
                     "Which feed bucket. 'top' = general headlines (default "
-                    "if the user just asks for 'the news')."
+                    "if the user just asks for 'the news'). 'sports' covers "
+                    "NHL / NFL / WWE; 'gaming' covers PlayStation / Nintendo."
                 ),
             },
             "topic": {
@@ -126,6 +129,21 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
         "https://feeds.npr.org/1007/rss.xml",
     ],
+    # M55 — sports + gaming. Added for the "good morning" briefing, which
+    # deliberately serves these in place of general/world news. Every URL
+    # below was verified live (HTTP 200, parses, has entries) through
+    # http_util's fetch path before being committed — two other WWE
+    # candidates were dropped for 301/308 redirects (httpx doesn't follow
+    # them; the M47 landmine). https-canonical, no-redirect URLs only.
+    "sports": [
+        "https://www.espn.com/espn/rss/nhl/news",
+        "https://www.espn.com/espn/rss/nfl/news",
+        "https://www.wrestlinginc.com/feed/",
+    ],
+    "gaming": [
+        "https://www.pushsquare.com/feeds/latest",
+        "https://www.nintendolife.com/feeds/latest",
+    ],
 }
 
 # Spoken words → canonical category. Voice says "technology", "world news",
@@ -145,6 +163,12 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "economic": "business", "money": "business",
     "science": "science", "sci": "science", "scientific": "science",
     "space": "science", "research": "science", "environment": "science",
+    "sports": "sports", "sport": "sports", "nhl": "sports", "hockey": "sports",
+    "nfl": "sports", "football": "sports", "wwe": "sports",
+    "wrestling": "sports",
+    "gaming": "gaming", "games": "gaming", "game": "gaming",
+    "video games": "gaming", "videogames": "gaming",
+    "playstation": "gaming", "nintendo": "gaming",
 }
 
 # Voice cap. Claude condenses for speech anyway; a lean payload also keeps
@@ -293,6 +317,8 @@ def _format(category: str, items: list[dict], topic: str | None) -> str:
         "tech": "Technology news",
         "business": "Business news",
         "science": "Science news",
+        "sports": "Sports news",
+        "gaming": "Gaming news",
     }.get(category, "Headlines")
     header = f"{label}" + (f" matching '{topic}'" if topic else "") + ":"
     lines = [header]

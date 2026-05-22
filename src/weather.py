@@ -127,13 +127,13 @@ def _temp_unit(units: str) -> str:
     return "°C" if units == "metric" else "°F"
 
 
-def _geocode(location: str) -> tuple[float, float, str] | None:
-    """Resolve a place name to (lat, lon, display_name). Returns None on
-    miss or any error — caller treats None as 'place not found'."""
+def _geocode_query(name: str) -> tuple[float, float, str] | None:
+    """One geocoding lookup for a bare place name. Returns None on miss or
+    any error — caller treats None as 'place not found'."""
     r = _http_get_with_retry(
         _GEOCODE_URL,
         params={
-            "name": location,
+            "name": name,
             "count": 1,
             "language": "en",
             "format": "json",
@@ -144,7 +144,7 @@ def _geocode(location: str) -> tuple[float, float, str] | None:
     try:
         data = r.json()
     except ValueError as exc:
-        print(f"[weather] geocode JSON parse failed ({location}): {exc}", file=sys.stderr)
+        print(f"[weather] geocode JSON parse failed ({name}): {exc}", file=sys.stderr)
         return None
 
     results = data.get("results") or []
@@ -158,11 +158,28 @@ def _geocode(location: str) -> tuple[float, float, str] | None:
 
     # Build a friendly display string ("Denver, Florida, United States").
     # admin1 is the state/province; country is the country.
-    name = top.get("name") or location
+    place = top.get("name") or name
     admin1 = top.get("admin1")
     country = top.get("country")
-    display = ", ".join(p for p in (name, admin1, country) if p)
+    display = ", ".join(p for p in (place, admin1, country) if p)
     return float(lat), float(lon), display
+
+
+def _geocode(location: str) -> tuple[float, float, str] | None:
+    """Resolve a place name to (lat, lon, display_name). Returns None on miss.
+
+    Open-Meteo's geocoder matches a bare place NAME — it does NOT understand a
+    "City, State" / "City, Country" suffix and returns nothing for one
+    (verified: "Fort Lauderdale, FL" misses every time, "Fort Lauderdale"
+    resolves). But "City, ST" is exactly what a user naturally writes — in
+    JARVIS_HOME_LOCATION, or what Claude may pass through. So if the full
+    string misses and it contains a comma, retry with just the part before
+    the first comma. The resolved result's display name still carries the
+    state/country, so the user can see which place it picked."""
+    hit = _geocode_query(location)
+    if hit is None and "," in location:
+        hit = _geocode_query(location.split(",", 1)[0].strip())
+    return hit
 
 
 def _fetch_forecast(
