@@ -123,7 +123,13 @@ class JarvisUI:
         t = self._tray
         if t is not None:
             t.set_state(state)
-        self._remote_call("update_state", getattr(state, "value", str(state)))
+        # The phone's state-pill needs the state NAME ("thinking") — NOT
+        # State's `.value`, which is an (r,g,b) tuple for the tray icon.
+        # The old getattr(...,"value",...) shipped that tuple, so the PWA
+        # got `state:[255,204,0]`, missed STATE_COLOR, and the pill never
+        # showed Jarvis's state. `.name.lower()` matches the PWA's
+        # STATE_COLOR keys and the server snapshot's "idle" default.
+        self._remote_call("update_state", state.name.lower())
 
     def add_user_text(self, text: str, language: str = "en") -> None:
         self.console.add_user_text(text, language)
