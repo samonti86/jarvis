@@ -54,6 +54,7 @@ from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
 from src.briefing import BRIEFING_TOOL, execute_briefing_tool
+from src.homelab_monitor import HOMELAB_STATUS_TOOL, execute_homelab_status
 from src.reminders import (
     CANCEL_REMINDER_TOOL, LIST_REMINDERS_TOOL, SET_REMINDER_TOOL,
     execute_cancel_reminder, execute_list_reminders, execute_set_reminder,
@@ -334,6 +335,17 @@ The morning briefing (one tool):
     already includes today's weather, so do NOT also call get_weather for a
     briefing. Voice the result as a natural, concise briefing — greet them,
     a sentence or two per section; don't recite it verbatim.
+
+Homelab monitoring (one tool):
+22. homelab_status — the live health of the user's homelab: whether the Plex
+    laptop is reachable, whether Plex Media Server is responding, and its disk
+    space. Use it for "how's the homelab?", "is Plex up?", "is the Plex box
+    okay?", "check the homelab". It probes everything fresh — like asking the
+    time, run it EVERY time and never answer from an earlier check. Read the
+    per-check result back concisely. This is the on-demand snapshot; Jarvis
+    also watches the homelab in the background and speaks up on his own when
+    something breaks. For DETAILED CPU/RAM/disk numbers on the Plex laptop use
+    plex_laptop_health instead — homelab_status is the quick up/down view.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -621,6 +633,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
     "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
     "get_briefing":                 _ClientTool(execute_briefing_tool, "briefing"),
+    "homelab_status":               _ClientTool(execute_homelab_status, "homelab"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -779,7 +792,7 @@ def stream_response(
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL, KNOWLEDGE_SEARCH_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
-        BRIEFING_TOOL,
+        BRIEFING_TOOL, HOMELAB_STATUS_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

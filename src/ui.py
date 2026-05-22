@@ -64,6 +64,12 @@ class JarvisUI:
         self._security_activate: Callable[[], None] | None = None
         self._security_deactivate: Callable[[], None] | None = None
         self._security_is_armed: Callable[[], bool] | None = None
+        # M56: homelab-monitor toggle wiring — set via set_on_homelab_toggle
+        # from main.py after HomelabMonitor is instantiated. Same late-wiring
+        # pattern as the security toggle above.
+        self._homelab_activate: Callable[[], None] | None = None
+        self._homelab_deactivate: Callable[[], None] | None = None
+        self._homelab_is_active: Callable[[], bool] | None = None
         # M39: face-enrollment trigger. Wired post-construction (after
         # face_auth / cameras / announce are available in main.py) so the
         # tray menu can render before the dependency graph is complete.
@@ -297,6 +303,34 @@ class JarvisUI:
         is wired, so the menu still renders cleanly during early startup."""
         return bool(self._security_is_armed and self._security_is_armed())
 
+    def set_on_homelab_toggle(
+        self, on_activate: Callable[[], None], on_deactivate: Callable[[], None],
+        is_active: Callable[[], bool],
+    ) -> None:
+        """Wire the tray's Homelab-monitoring toggle to the HomelabMonitor
+        (M56). main.py calls this after instantiating the monitor. is_active
+        is read each time the menu opens (pystray re-evaluates `checked`)."""
+        self._homelab_activate = on_activate
+        self._homelab_deactivate = on_deactivate
+        self._homelab_is_active = is_active
+
+    def _handle_toggle_homelab(self) -> None:
+        """Tray callback: flip homelab monitoring via the wired monitor. Same
+        code path the JARVIS_HOMELAB_MONITOR flag uses — monitor is idempotent."""
+        if self._homelab_is_active is None:
+            return
+        if self._homelab_is_active():
+            if self._homelab_deactivate is not None:
+                self._homelab_deactivate()
+        else:
+            if self._homelab_activate is not None:
+                self._homelab_activate()
+
+    def _homelab_is_active_or_false(self) -> bool:
+        """Tray-checkbox safe wrapper: returns False before HomelabMonitor is
+        wired, so the menu renders cleanly during early startup."""
+        return bool(self._homelab_is_active and self._homelab_is_active())
+
     # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------
@@ -335,6 +369,8 @@ class JarvisUI:
             on_engineer_toggle=self._handle_toggle_engineer,
             security_enabled=self._security_is_armed_or_false,
             on_security_toggle=self._handle_toggle_security,
+            homelab_enabled=self._homelab_is_active_or_false,
+            on_homelab_toggle=self._handle_toggle_homelab,
             on_enroll_face=self._handle_enroll_face,
             on_reindex_knowledge=self._handle_reindex_knowledge,
             on_restart=self._handle_restart,

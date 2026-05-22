@@ -63,6 +63,8 @@ class JarvisTray:
         on_engineer_toggle: Callable[[], None] | None = None,
         security_enabled: Callable[[], bool] | None = None,
         on_security_toggle: Callable[[], None] | None = None,
+        homelab_enabled: Callable[[], bool] | None = None,
+        on_homelab_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
         on_reindex_knowledge: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
@@ -88,6 +90,8 @@ class JarvisTray:
         self._on_engineer_toggle = on_engineer_toggle
         self._security_enabled = security_enabled
         self._on_security_toggle = on_security_toggle
+        self._homelab_enabled = homelab_enabled
+        self._on_homelab_toggle = on_homelab_toggle
         self._on_enroll_face = on_enroll_face
         self._on_reindex_knowledge = on_reindex_knowledge
         self._on_restart = on_restart
@@ -139,6 +143,17 @@ class JarvisTray:
                 "Security mode",
                 self._handle_toggle_security,
                 checked=lambda item: bool(self._security_enabled()),
+            ))
+        if homelab_enabled is not None and on_homelab_toggle is not None:
+            # Homelab monitoring (M56): starts/stops the proactive background
+            # watcher — Plex-laptop reachability, Plex liveness, disk space.
+            # Same state the JARVIS_HOMELAB_MONITOR .env flag sets at startup;
+            # `checked` re-evaluates each menu open so it tracks voice/.env
+            # changes too.
+            menu_items.append(pystray.MenuItem(
+                "Homelab monitoring",
+                self._handle_toggle_homelab,
+                checked=lambda item: bool(self._homelab_enabled()),
             ))
         if on_enroll_face is not None:
             # M39: enroll the user's face for the security-mode auth path.
@@ -229,6 +244,10 @@ class JarvisTray:
     def _handle_toggle_security(self) -> None:
         if self._on_security_toggle is not None:
             self._on_security_toggle()
+
+    def _handle_toggle_homelab(self) -> None:
+        if self._on_homelab_toggle is not None:
+            self._on_homelab_toggle()
 
     def _handle_enroll_face(self) -> None:
         if self._on_enroll_face is not None:

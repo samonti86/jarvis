@@ -143,6 +143,43 @@ def send_discord_alert_for_path(
     )
 
 
+def send_discord_message(webhook_url: str, content: str) -> bool:
+    """Post a plain-text message to a Discord webhook.
+
+    The generic counterpart to send_discord_alert, which is hardwired to the
+    M35 intruder deterrent (fixed text + an image attachment). M56's homelab
+    monitor needs to push arbitrary up/down alert lines, so this is the
+    no-attachment, caller-supplied-text path.
+
+    Returns True on HTTP 2xx, False on any failure. Never raises — callers
+    fire-and-forget. `content` is clamped to Discord's 2000-char limit.
+    """
+    if not webhook_url or not content:
+        return False
+
+    payload = {"content": content[:1900], "username": "Jarvis"}
+    try:
+        resp = httpx.post(
+            webhook_url, json=payload, timeout=_DISCORD_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        print(f"[notify] discord message failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return False
+
+    if resp.status_code >= 400:
+        print(
+            f"[notify] discord message returned HTTP {resp.status_code}: "
+            f"{resp.text[:200]}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"[notify] discord message sent (HTTP {resp.status_code})",
+          file=sys.stderr)
+    return True
+
+
 # 20s — Gmail SMTP usually completes in <2s, but we'd rather absorb a slow
 # TLS handshake on a flaky network than timeout during send. Still well
 # under the watcher's tolerance for a backgrounded task.

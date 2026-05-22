@@ -1273,6 +1273,31 @@ def main() -> None:
         is_armed=security_watcher.is_armed,
     )
 
+    # M56: proactive homelab monitoring. Constructed ALWAYS (the
+    # homelab_status tool + the tray toggle need the instance) but the
+    # background poll loop only runs once activate()d. Default off — opt-in
+    # via JARVIS_HOMELAB_MONITOR or the tray toggle, the same safe-default,
+    # least-privilege stance as security mode. Reuses the existing
+    # plex_laptop_client (its run() is lock-serialised, so the monitor thread
+    # safely shares the one SSH connection the tool path uses) and the M38
+    # Discord webhook for phone push. Spoken alerts ride _announce (the
+    # WASAPI-safe Announcer path), tagged 🖥 so they read distinctly from
+    # 🚨 security alerts and ⏰ reminders in the console.
+    from src.homelab_monitor import HomelabMonitor
+    homelab_monitor = HomelabMonitor(
+        announce=lambda t: _announce(t, label="🖥"),
+        plex_host=cfg.plex_laptop_host,
+        plex_laptop_client=plex_laptop_client,
+        discord_webhook_url=cfg.discord_webhook_url,
+    )
+    if cfg.homelab_monitor_enabled:
+        homelab_monitor.activate()
+    ui.set_on_homelab_toggle(
+        on_activate=homelab_monitor.activate,
+        on_deactivate=homelab_monitor.deactivate,
+        is_active=homelab_monitor.is_active,
+    )
+
     # M48.1: LAN remote console. Gated on the token — blank ⇒ the server is
     # NEVER constructed (a surface that can disarm security must not exist
     # unless deliberately configured with a secret;
@@ -1376,6 +1401,10 @@ def main() -> None:
     # so it dies with the process either way, but explicit shutdown lets
     # any in-flight inference complete cleanly without log noise.
     security_watcher.shutdown()
+
+    # M56: stop the homelab monitor's poll loop. Daemon thread, so it dies
+    # with the process anyway; the event lets it exit its poll-wait cleanly.
+    homelab_monitor.shutdown()
 
     # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
     # _announcer_loop so it can check the stop flag and exit cleanly,

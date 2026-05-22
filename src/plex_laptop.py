@@ -657,3 +657,52 @@ _HEALTH_FORMATTERS = {
     "disk": _format_disk,
     "network": _format_network,
 }
+
+
+# --- Structured helpers (M56) ----------------------------------------------
+#
+# execute_plex_laptop_health returns a voice-FORMATTED string — perfect for
+# Claude to read aloud, awkward for a program to act on. The homelab monitor
+# needs the numbers, not the prose, so this is a clean public seam: it reuses
+# the exact same _HEALTH_DISK_PS script but returns structured data instead
+# of parsing a display string back apart. Defensive contract unchanged —
+# returns None on any failure so the caller fails soft.
+
+
+def fetch_disk_usage(client: PlexLaptopClient) -> list[dict] | None:
+    """Fixed-drive usage on the laptop as structured data —
+    [{id, total, free, pct_free}, ...], one entry per fixed drive.
+
+    Reuses _HEALTH_DISK_PS (the same script behind plex_laptop_health's disk
+    mode). Returns None on ANY failure — unreachable host, non-zero exit,
+    unparseable output — so callers (the M56 monitor's disk check) can fail
+    soft rather than manufacture a false alarm from a transient SSH hiccup.
+    """
+    try:
+        rc, out, err = client.run(_ps_encoded(_HEALTH_DISK_PS))
+    except Exception as exc:  # noqa: BLE001 — never raise into the caller
+        print(f"[plex-laptop] disk usage query failed: {exc}", file=sys.stderr)
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):  # ConvertTo-Json emits a bare object for one drive
+        data = [data]
+    drives: list[dict] = []
+    for v in data:
+        if not isinstance(v, dict):
+            continue
+        total = v.get("total") or 0
+        free = v.get("free") or 0
+        if total <= 0:
+            continue
+        drives.append({
+            "id": v.get("id", "?"),
+            "total": total,
+            "free": free,
+            "pct_free": round(100 * free / total),
+        })
+    return drives or None

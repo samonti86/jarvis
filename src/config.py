@@ -41,6 +41,7 @@ class Config:
     remote_bind: str           # M48 — interface to bind. "0.0.0.0" = all (LAN-reachable; the token + a LAN-only firewall rule are the controls). Never port-forward this.
     tls_cert_file: str         # M48.3 prereq — absolute path to a TLS cert (e.g. from `tailscale cert <host>.ts.net`). BOTH cert+key set ⇒ HTTPS/WSS; either missing ⇒ plain HTTP/WS (LAN-mode fallback). File MUST live outside the repo (it's a credential).
     tls_key_file: str          # M48.3 prereq — absolute path to the matching TLS private key. Same on/off semantics as tls_cert_file. Keep out of git.
+    homelab_monitor_enabled: bool  # M56 — start the proactive homelab monitor at launch. Default off (opt-in via this flag or the tray toggle). Poll/threshold/disk tunables live in src/homelab_monitor.py.
 
 
 def load() -> Config:
@@ -92,4 +93,11 @@ def load() -> Config:
         # component contract.
         tls_cert_file=os.getenv("JARVIS_TLS_CERT_FILE", "").strip(),
         tls_key_file=os.getenv("JARVIS_TLS_KEY_FILE", "").strip(),
+        # M56 — proactive homelab monitoring. OFF unless this is explicitly
+        # truthy: the background poll loop is opt-in (the tray toggle is the
+        # other surface). Same safe-default reasoning as security mode.
+        homelab_monitor_enabled=(
+            os.getenv("JARVIS_HOMELAB_MONITOR", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
     )
