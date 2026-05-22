@@ -28,8 +28,10 @@ on the tray.
 
 from __future__ import annotations
 
+import ctypes
 import io
 import math
+import sys
 import time
 import tkinter as tk
 from pathlib import Path
@@ -44,13 +46,31 @@ from src.tray import State
 
 
 class JarvisConsole:
-    # Palette — restrained sci-fi: dark slate + light cyan accent.
-    BG = "#1a1d23"
-    PANEL_BG = "#22262e"
-    HEADER_FG = "#7dd3fc"
-    USER_FG = "#e2e8f0"
-    JARVIS_FG = "#7dd3fc"
-    DIM_FG = "#64748b"
+    # Palette — Stark HUD: near-black + electric arc-reactor cyan, with a
+    # sparing Iron-Man gold. The console-local _STATE_COLOR map keeps the
+    # orb's per-state palette out of tray.py's State enum.
+    BG = "#0a0e14"          # near-black, faint blue
+    PANEL_BG = "#10161f"    # raised panels (transcript, input, chip)
+    PANEL_LINE = "#1d2b3a"  # dim HUD rings / tick marks
+    BORDER = "#21465a"      # faintly glowing panel edge
+    ACCENT = "#22d3ee"      # electric arc-reactor cyan — primary
+    ACCENT_HOT = "#7df3ff"  # near-white-hot cyan — glow cores, peaks
+    GOLD = "#f5b942"        # Iron Man gold — sparing secondary
+    HEADER_FG = "#22d3ee"
+    USER_FG = "#cdd9e5"
+    JARVIS_FG = "#5ee0f0"
+    DIM_FG = "#5b6b7f"
+
+    ORB_SIZE = 176  # arc-reactor canvas (square; the orb is centred in it)
+
+    # Per-state orb colour — console-local (NOT State.value, which drives the
+    # tray icon). THINKING borrows Iron Man's gold; the rest are reactor cyan.
+    _STATE_COLOR = {
+        State.IDLE: "#3f5468",       # calm dim cyan-slate — reactor at rest
+        State.LISTENING: "#22d3ee",  # electric cyan
+        State.THINKING: "#f5b942",   # gold — "working"
+        State.SPEAKING: "#34e6d0",   # bright teal-cyan
+    }
 
     def __init__(self) -> None:
         ctk.set_appearance_mode("dark")
@@ -58,9 +78,9 @@ class JarvisConsole:
 
         self.root = ctk.CTk()
         self.root.title("Jarvis")
-        self.root.geometry("520x640")
+        self.root.geometry("560x800")
         self.root.configure(fg_color=self.BG)
-        self.root.minsize(400, 480)
+        self.root.minsize(480, 660)
 
         self._state = State.IDLE
         self._anim_start = time.time()
@@ -91,92 +111,88 @@ class JarvisConsole:
         header = ctk.CTkLabel(
             self.root,
             text="J . A . R . V . I . S .",
-            font=("Consolas", 22, "bold"),
+            font=("Consolas", 28, "bold"),
             text_color=self.HEADER_FG,
         )
-        header.pack(pady=(22, 4))
+        header.pack(pady=(24, 3))
 
         subtitle = ctk.CTkLabel(
             self.root,
             text="at your service, sir",
-            font=("Consolas", 9),
+            font=("Consolas", 10),
             text_color=self.DIM_FG,
         )
-        subtitle.pack(pady=(0, 18))
+        subtitle.pack(pady=(0, 12))
 
-        # --- State pill ---
-        state_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        state_frame.pack(pady=(0, 16))
+        # Thin HUD divider under the header.
+        divider = ctk.CTkFrame(
+            self.root, height=2, fg_color=self.BORDER, corner_radius=0,
+        )
+        divider.pack(fill="x", padx=110, pady=(0, 10))
 
-        self._state_canvas = tk.Canvas(
-            state_frame,
-            width=22,
-            height=22,
-            bg=self.BG,
-            highlightthickness=0,
-            bd=0,
+        # --- Arc-reactor orb (the centrepiece) ---
+        # Replaces the old 22px state dot: a layered concentric reactor —
+        # bezel + tick ring, two counter-rotating arcs, a 4-disc radial glow
+        # halo, and a core that breathes (and, while SPEAKING, throbs with the
+        # live TTS amplitude). Built once by _build_orb; _tick_orb then mutates
+        # only fills/coords each frame — the same cheap-redraw pattern as the
+        # waveform.
+        self._orb = tk.Canvas(
+            self.root, width=self.ORB_SIZE, height=self.ORB_SIZE,
+            bg=self.BG, highlightthickness=0, bd=0,
         )
-        self._state_canvas.pack(side="left", padx=(0, 12))
-        self._state_circle = self._state_canvas.create_oval(
-            3, 3, 19, 19, fill=self._color_for(State.IDLE), outline=""
-        )
+        self._orb.pack(pady=(2, 2))
+        self._build_orb()
 
         self._state_label = ctk.CTkLabel(
-            state_frame,
+            self.root,
             text="IDLE",
-            font=("Consolas", 14, "bold"),
+            font=("Consolas", 18, "bold"),
             text_color=self.HEADER_FG,
-            width=110,
-            anchor="w",
         )
-        self._state_label.pack(side="left")
+        self._state_label.pack(pady=(0, 2))
 
-        # Read-only mute indicator. Packed only while muted (controlled by
-        # set_muted). Toggle itself lives on the tray menu — keeping the
-        # console as a passive surface here so we don't duplicate state.
+        # Indicator row — mute / engineer / armed / locked badges sit here,
+        # centred under the state label. Each label's master is this frame,
+        # so the existing _apply_* pack/forget calls land in the right place
+        # with no change to those methods. A plain tk.Frame (not CTkFrame):
+        # it starts childless, and an empty CTkFrame reserves its 200x200
+        # default size — a tk.Frame collapses to its content instead.
+        self._indicator_frame = tk.Frame(self.root, bg=self.BG)
+        self._indicator_frame.pack(pady=(0, 8))
+
+        # Read-only mute indicator. Packed only while muted (set_muted). The
+        # toggle lives on the tray — the console stays a passive surface.
         self._mute_label = ctk.CTkLabel(
-            state_frame,
+            self._indicator_frame,
             text="🔇 muted",
-            font=("Segoe UI Emoji", 11),
+            font=("Segoe UI Emoji", 12),
             text_color=self.DIM_FG,
         )
-        # NB: not packed initially — _apply_muted handles pack/forget.
-
-        # Read-only engineer-mode indicator, same shape as the mute label.
-        # Sits to the right of the mute label when both are active.
+        # Read-only engineer-mode indicator.
         self._engineer_label = ctk.CTkLabel(
-            state_frame,
+            self._indicator_frame,
             text="🛠 engineer",
-            font=("Segoe UI Emoji", 11),
+            font=("Segoe UI Emoji", 12),
             text_color=self.HEADER_FG,
         )
-        # NB: not packed initially — _apply_engineer handles pack/forget.
-
-        # Security-armed indicator (M34). Red because it's a "loud" state —
-        # Jarvis will speak unprompted while armed. Packed only when armed;
-        # toggle lives on the tray and on the voice intent parser.
+        # Security-armed indicator (M34) — red: Jarvis speaks unprompted while
+        # armed.
         self._armed_label = ctk.CTkLabel(
-            state_frame,
+            self._indicator_frame,
             text="🛡 ARMED",
-            font=("Segoe UI Emoji", 11, "bold"),
-            text_color="#ef4444",  # tailwind red-500 — danger but readable on dark BG
+            font=("Segoe UI Emoji", 12, "bold"),
+            text_color="#ef4444",
         )
-        # NB: not packed initially — _apply_armed handles pack/forget.
-
-        # Security-LOCKED indicator (M35 follow-on). Appears when the
-        # 15s challenge timer expired without authentication — deterrent
-        # fired, system is now waiting for the passphrase indefinitely.
-        # Visually distinct from ARMED: padlock icon, deeper red, slightly
-        # larger weight so it reads as a more urgent state. Packed in place
-        # of (not in addition to) the ARMED label, since LOCKED implies
-        # armed — _apply_locked handles the swap.
+        # Security-LOCKED indicator (M35) — deeper red; swapped in for ARMED
+        # by _apply_locked when the deterrent has fired.
         self._locked_label = ctk.CTkLabel(
-            state_frame,
+            self._indicator_frame,
             text="🔒 LOCKED",
-            font=("Segoe UI Emoji", 11, "bold"),
-            text_color="#dc2626",  # tailwind red-600 — one shade deeper than ARMED
+            font=("Segoe UI Emoji", 12, "bold"),
+            text_color="#dc2626",
         )
-        # NB: not packed initially — _apply_locked handles pack/forget.
+        # NB: indicator labels are not packed initially — _apply_* manage that.
 
         # --- Audio waveform visualizer (M17) ---
         # 24 bars that pulse with TTS amplitude. Idle state: flat resting line.
@@ -184,13 +200,16 @@ class JarvisConsole:
         # Sizes tuned in M17 review — bars feel substantial without dominating
         # the window. To resize: bar_width × num_bars + bar_gap × (num_bars-1)
         # should be ≤ canvas_width with comfortable horizontal padding.
-        self._wave_num_bars = 24
+        self._wave_num_bars = 28
         self._wave_bar_width = 7
-        self._wave_bar_gap = 5
+        self._wave_bar_gap = 6
         self._wave_min_height = 3
-        self._wave_max_height = 60
-        self._wave_canvas_width = 440
-        self._wave_canvas_height = 72
+        self._wave_max_height = 64
+        self._wave_canvas_width = 480
+        self._wave_canvas_height = 78
+        # Resting bar colour (dim cyan); _wave_tick brightens each bar toward
+        # ACCENT_HOT at its peak. Computed once — _dim 28×/frame is wasteful.
+        self._wave_rest_color = self._dim(self.ACCENT, 0.42)
 
         self._wave_amplitude = 0.0          # latest reading from set_amplitude
         self._wave_displayed = [0.0] * self._wave_num_bars  # smoothed per-bar
@@ -227,7 +246,7 @@ class JarvisConsole:
             half = self._wave_min_height / 2
             bar_id = self._waveform_canvas.create_rectangle(
                 x1, mid_y - half, x2, mid_y + half,
-                fill=self.HEADER_FG, outline="",
+                fill=self._wave_rest_color, outline="",
             )
             self._wave_bars.append(bar_id)
             self._wave_bar_x.append((x1, x2))
@@ -249,7 +268,7 @@ class JarvisConsole:
         self._status_label = ctk.CTkLabel(
             self.root,
             text="",
-            font=("Consolas", 9),
+            font=("Consolas", 10),
             text_color=self.DIM_FG,
             anchor="w",
         )
@@ -296,12 +315,14 @@ class JarvisConsole:
         self._attach_button = ctk.CTkButton(
             self._entry_row,
             text="📎",
-            width=34,
-            height=34,
-            font=("Segoe UI Emoji", 14),
+            width=38,
+            height=38,
+            font=("Segoe UI Emoji", 16),
             fg_color=self.PANEL_BG,
             text_color=self.HEADER_FG,
-            hover_color=self.BG,
+            hover_color=self.PANEL_LINE,
+            border_width=1,
+            border_color=self.BORDER,
             command=self._on_attach_clicked,
         )
         self._attach_button.pack(side="left", padx=(0, 6))
@@ -309,12 +330,13 @@ class JarvisConsole:
         self._input = ctk.CTkEntry(
             self._entry_row,
             placeholder_text="type to Jarvis…  (Enter to send)",
-            font=("Consolas", 11),
+            font=("Consolas", 13),
             fg_color=self.PANEL_BG,
             text_color=self.USER_FG,
-            border_width=0,
-            corner_radius=6,
-            height=34,
+            border_width=1,
+            border_color=self.BORDER,
+            corner_radius=8,
+            height=38,
         )
         self._input.pack(side="left", fill="x", expand=True)
         # Return submits; bind on the underlying widget so we can return
@@ -322,19 +344,24 @@ class JarvisConsole:
         self._input.bind("<Return>", self._on_return)
 
         # --- Transcript pane ---
-        transcript_frame = ctk.CTkFrame(self.root, fg_color=self.PANEL_BG, corner_radius=8)
-        transcript_frame.pack(padx=20, pady=(0, 20), fill="both", expand=True)
+        transcript_frame = ctk.CTkFrame(
+            self.root, fg_color=self.PANEL_BG, corner_radius=8,
+            border_width=1, border_color=self.BORDER,
+        )
+        transcript_frame.pack(padx=20, pady=(0, 18), fill="both", expand=True)
+        # HUD corner brackets on the four corners (placed, so they track resize).
+        self._add_corner_brackets(transcript_frame)
 
         self._transcript = ctk.CTkTextbox(
             transcript_frame,
-            font=("Consolas", 11),
+            font=("Consolas", 13),
             fg_color=self.PANEL_BG,
             text_color=self.USER_FG,
             wrap="word",
             corner_radius=6,
             border_width=0,
         )
-        self._transcript.pack(padx=10, pady=10, fill="both", expand=True)
+        self._transcript.pack(padx=12, pady=12, fill="both", expand=True)
 
         # Tag-color the underlying tk.Text widget. CTkTextbox doesn't proxy
         # tag_configure, so we reach into ._textbox — that attribute has been
@@ -357,9 +384,12 @@ class JarvisConsole:
         # chains so each can stop/continue without affecting the other.
         # Uptime tick is much slower (60s) — the only field that changes
         # autonomously.
-        self.root.after(125, self._tick_animation)
+        self.root.after(33, self._tick_orb)
         self.root.after(33, self._wave_tick)
         self.root.after(60_000, self._tick_uptime)
+        # Dark-tint the native Windows title bar once the HWND exists (small
+        # delay so winfo_id() is valid). Best-effort; cosmetic.
+        self.root.after(80, self._apply_dark_titlebar)
 
     # ------------------------------------------------------------------
     # Public API — all thread-safe (schedule on Tk thread via .after()).
@@ -497,27 +527,185 @@ class JarvisConsole:
     # Internals — only ever run on Tk's thread.
     # ------------------------------------------------------------------
 
-    def _color_for(self, state: State) -> str:
-        r, g, b = state.value
-        return f"#{r:02x}{g:02x}{b:02x}"
+    # ----- Colour helpers -----
 
-    def _scaled_color(self, state: State, brightness: float) -> str:
-        r, g, b = state.value
-        r, g, b = int(r * brightness), int(g * brightness), int(b * brightness)
-        return f"#{r:02x}{g:02x}{b:02x}"
+    @staticmethod
+    def _hex_rgb(h: str) -> tuple[int, int, int]:
+        h = h.lstrip("#")
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
-    def _tick_animation(self) -> None:
-        if self._state == State.SPEAKING:
-            t = time.time() - self._anim_start
-            brightness = 0.7 + 0.3 * math.sin(t * 2 * math.pi * 2)
-            color = self._scaled_color(self._state, brightness)
-        else:
-            color = self._color_for(self._state)
+    @staticmethod
+    def _clamp8(v: float) -> int:
+        return max(0, min(255, int(v)))
+
+    def _dim(self, hexc: str, factor: float) -> str:
+        """Scale a colour toward black by `factor` (0 = black, 1 = unchanged)."""
+        r, g, b = self._hex_rgb(hexc)
+        c = self._clamp8
+        return f"#{c(r * factor):02x}{c(g * factor):02x}{c(b * factor):02x}"
+
+    def _blend(self, a: str, b: str, t: float) -> str:
+        """Linear blend a → b by t in [0, 1]."""
+        t = max(0.0, min(1.0, t))
+        ra, ga, ba = self._hex_rgb(a)
+        rb, gb, bb = self._hex_rgb(b)
+        c = self._clamp8
+        return (f"#{c(ra + (rb - ra) * t):02x}{c(ga + (gb - ga) * t):02x}"
+                f"{c(ba + (bb - ba) * t):02x}")
+
+    # ----- The arc-reactor orb -----
+
+    def _build_orb(self) -> None:
+        """Create the orb's canvas items once. Layer order (back → front):
+        bezel ring + 12 tick marks, the 4-disc radial glow halo (large →
+        small), a mid ring, the core, then the two rotating arcs on top.
+        _draw_orb mutates only fills / coords each frame."""
+        cv = self._orb
+        s = self.ORB_SIZE
+        cx = cy = s // 2
+        self._orb_cx, self._orb_cy = cx, cy
+        r_out = s // 2 - 10
+        r_mid = int(r_out * 0.80)
+        line = self.PANEL_LINE
+
+        # Bezel ring.
+        cv.create_oval(cx - r_out, cy - r_out, cx + r_out, cy + r_out,
+                       outline=line, width=2)
+        # 12 clock-style tick marks just inside the bezel.
+        for i in range(12):
+            a = math.radians(i * 30)
+            r1, r2 = r_out - 3, r_out - 11
+            cv.create_line(
+                cx + r1 * math.cos(a), cy + r1 * math.sin(a),
+                cx + r2 * math.cos(a), cy + r2 * math.sin(a),
+                fill=line, width=2,
+            )
+        # Radial glow halo — 4 filled discs, large → small. _draw_orb sets
+        # their fills dim → bright each frame to fake a soft radial gradient.
+        self._orb_glow: list[int] = []
+        for rr in (int(r_out * 0.62), int(r_out * 0.46),
+                   int(r_out * 0.32), int(r_out * 0.21)):
+            self._orb_glow.append(
+                cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                               fill=self.BG, outline="")
+            )
+        # Mid ring — drawn after the halo so it stays visible on top of it.
+        cv.create_oval(cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid,
+                       outline=line, width=1)
+        # Core.
+        self._orb_core_r = max(9, int(r_out * 0.16))
+        r = self._orb_core_r
+        self._orb_core = cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                        fill=self.ACCENT, outline="")
+        # Two counter-rotating arcs (on top).
+        self._orb_arc_out = cv.create_arc(
+            cx - r_out, cy - r_out, cx + r_out, cy + r_out,
+            start=0, extent=90, style="arc", outline=self.ACCENT, width=3,
+        )
+        self._orb_arc_mid = cv.create_arc(
+            cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid,
+            start=180, extent=60, style="arc", outline=self.ACCENT, width=2,
+        )
+
+    def _draw_orb(self) -> bool:
+        """One animation frame. Colour = state; the core breathes (and, while
+        SPEAKING, throbs with the live TTS amplitude); the two arcs counter-
+        rotate. Returns False if the canvas is gone (stop scheduling)."""
+        state = self._state
+        base = self._STATE_COLOR.get(state, self.ACCENT)
+        t = time.time() - self._anim_start
+
+        if state == State.SPEAKING:
+            # The reactor reacts to Jarvis's own voice.
+            pulse = 0.42 + 0.58 * min(1.0, self._wave_amplitude * 1.5)
+        elif state == State.IDLE:
+            pulse = 0.50 + 0.16 * math.sin(t * 1.6)      # slow breathing
+        elif state == State.THINKING:
+            pulse = 0.74 + 0.16 * math.sin(t * 5.0)      # quick flicker
+        else:  # LISTENING
+            pulse = 0.84 + 0.12 * math.sin(t * 3.0)
+
+        speed = {                                         # degrees / second
+            State.IDLE: 24, State.LISTENING: 64,
+            State.THINKING: 150, State.SPEAKING: 92,
+        }.get(state, 50)
+        ang = (t * speed) % 360
+
         try:
-            self._state_canvas.itemconfig(self._state_circle, fill=color)
+            self._orb.itemconfig(
+                self._orb_arc_out, start=ang,
+                outline=self._blend(self._dim(base, 0.35), base, pulse),
+            )
+            self._orb.itemconfig(
+                self._orb_arc_mid, start=(-ang * 1.4) % 360,
+                outline=self._dim(base, 0.5 + 0.3 * pulse),
+            )
+            for gid, f in zip(self._orb_glow, (0.18, 0.34, 0.58, 0.92)):
+                self._orb.itemconfig(gid, fill=self._dim(base, f * pulse))
+            self._orb.itemconfig(
+                self._orb_core,
+                fill=self._blend(base, self.ACCENT_HOT, 0.25 + 0.55 * pulse),
+            )
+            r = self._orb_core_r * (0.78 + 0.5 * pulse)
+            cx, cy = self._orb_cx, self._orb_cy
+            self._orb.coords(self._orb_core, cx - r, cy - r, cx + r, cy + r)
         except tk.TclError:
-            return  # widget destroyed; stop scheduling
-        self.root.after(125, self._tick_animation)
+            return False
+        return True
+
+    def _tick_orb(self) -> None:
+        """30 fps arc-reactor animation — its own recursive .after() chain,
+        same pattern as _wave_tick."""
+        if self._destroyed:
+            return
+        if not self._draw_orb():
+            return  # canvas destroyed; stop scheduling
+        self.root.after(33, self._tick_orb)
+
+    def _add_corner_brackets(self, frame) -> None:
+        """Place four small L-shaped HUD brackets at the corners of `frame`.
+        Each is a tiny canvas .place()'d at a corner; relx/rely keeps them
+        pinned through window resizes."""
+        arm = 16
+        # (relx, rely, anchor, x-offset, y-offset, [(x1,y1,x2,y2), ...])
+        corners = [
+            (0.0, 0.0, "nw", 6, 6, [(0, arm, 0, 0), (0, 0, arm, 0)]),
+            (1.0, 0.0, "ne", -6, 6, [(arm, arm, arm, 0), (arm, 0, 0, 0)]),
+            (0.0, 1.0, "sw", 6, -6, [(0, 0, 0, arm), (0, arm, arm, arm)]),
+            (1.0, 1.0, "se", -6, -6, [(arm, 0, arm, arm), (arm, arm, 0, arm)]),
+        ]
+        for relx, rely, anchor, dx, dy, lines in corners:
+            c = tk.Canvas(frame, width=arm + 1, height=arm + 1,
+                          bg=self.PANEL_BG, highlightthickness=0, bd=0)
+            for x1, y1, x2, y2 in lines:
+                c.create_line(x1, y1, x2, y2, fill=self.ACCENT, width=2)
+            c.place(in_=frame, relx=relx, rely=rely, anchor=anchor, x=dx, y=dy)
+
+    def _apply_dark_titlebar(self) -> None:
+        """Tint the native Windows title bar to match the app (Win10 2004+ /
+        Win11). Without this the OS paints the caption with the user's accent
+        colour. Best-effort — any failure (non-Windows, old build) is silently
+        ignored; it's purely cosmetic."""
+        if sys.platform != "win32":
+            return
+        try:
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            dwm = ctypes.windll.dwmapi
+            # DWMWA_USE_IMMERSIVE_DARK_MODE (20) — dark caption + controls.
+            dwm.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(ctypes.c_int(1)),
+                ctypes.sizeof(ctypes.c_int),
+            )
+            # DWMWA_CAPTION_COLOR (35, Win11) — exact tint as 0x00BBGGRR.
+            r, g, b = self._hex_rgb(self.BG)
+            colour = (b << 16) | (g << 8) | r
+            dwm.DwmSetWindowAttribute(
+                hwnd, 35, ctypes.byref(ctypes.c_int(colour)),
+                ctypes.sizeof(ctypes.c_int),
+            )
+        except Exception:
+            pass
 
     def _apply_state(self, state: State) -> None:
         self._state = state
@@ -781,14 +969,23 @@ class JarvisConsole:
                 # a [0.5×amp, 1.0×amp] band. Bars are partially correlated
                 # (all driven by amplitude) but phase-offset for visual life.
                 oscillation = math.sin(t * 6 + self._wave_phases[i]) * 0.5 + 0.5
-                target = self._wave_amplitude * (0.5 + 0.5 * oscillation)
+                # Faint idle shimmer (~2px) so the bar field reads as alive
+                # even at rest, rather than a dead flat line.
+                idle = 0.035 * (0.5 + 0.5 * math.sin(t * 2.2 + self._wave_phases[i]))
+                target = self._wave_amplitude * (0.5 + 0.5 * oscillation) + idle
                 self._wave_displayed[i] += (target - self._wave_displayed[i]) * smoothing
 
-                height = self._wave_min_height + self._wave_displayed[i] * span
+                level = min(1.0, self._wave_displayed[i])
+                height = self._wave_min_height + level * span
                 half = height / 2
                 x1, x2 = self._wave_bar_x[i]
                 self._waveform_canvas.coords(
                     bar_id, x1, mid_y - half, x2, mid_y + half
+                )
+                # Hotter colour toward the peaks — dim cyan → near-white-hot.
+                self._waveform_canvas.itemconfig(
+                    bar_id,
+                    fill=self._blend(self._wave_rest_color, self.ACCENT_HOT, level),
                 )
         except tk.TclError:
             return  # canvas destroyed; stop scheduling
