@@ -42,6 +42,7 @@ class Config:
     tls_cert_file: str         # M48.3 prereq — absolute path to a TLS cert (e.g. from `tailscale cert <host>.ts.net`). BOTH cert+key set ⇒ HTTPS/WSS; either missing ⇒ plain HTTP/WS (LAN-mode fallback). File MUST live outside the repo (it's a credential).
     tls_key_file: str          # M48.3 prereq — absolute path to the matching TLS private key. Same on/off semantics as tls_cert_file. Keep out of git.
     homelab_monitor_enabled: bool  # M56 — start the proactive homelab monitor at launch. Default off (opt-in via this flag or the tray toggle). Poll/threshold/disk tunables live in src/homelab_monitor.py.
+    acoustic_monitor_enabled: bool  # M58 — start acoustic awareness at launch. Default off (opt-in via this flag or the tray toggle). Per-class kill switch + volume floor live in src/sound_detector.py.
 
 
 def load() -> Config:
@@ -98,6 +99,14 @@ def load() -> Config:
         # other surface). Same safe-default reasoning as security mode.
         homelab_monitor_enabled=(
             os.getenv("JARVIS_HOMELAB_MONITOR", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        # M58 — acoustic awareness. OFF unless explicitly truthy: the
+        # background inference loop is opt-in (the tray toggle is the other
+        # surface). Same safe-default reasoning as security mode + the
+        # homelab monitor.
+        acoustic_monitor_enabled=(
+            os.getenv("JARVIS_ACOUSTIC_MONITOR", "").strip().lower()
             in ("1", "true", "yes", "on")
         ),
     )

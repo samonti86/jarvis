@@ -70,6 +70,10 @@ class JarvisUI:
         self._homelab_activate: Callable[[], None] | None = None
         self._homelab_deactivate: Callable[[], None] | None = None
         self._homelab_is_active: Callable[[], bool] | None = None
+        # M58: acoustic-awareness toggle wiring — same pattern as above.
+        self._acoustic_activate: Callable[[], None] | None = None
+        self._acoustic_deactivate: Callable[[], None] | None = None
+        self._acoustic_is_active: Callable[[], bool] | None = None
         # M39: face-enrollment trigger. Wired post-construction (after
         # face_auth / cameras / announce are available in main.py) so the
         # tray menu can render before the dependency graph is complete.
@@ -331,6 +335,34 @@ class JarvisUI:
         wired, so the menu renders cleanly during early startup."""
         return bool(self._homelab_is_active and self._homelab_is_active())
 
+    def set_on_acoustic_toggle(
+        self, on_activate: Callable[[], None], on_deactivate: Callable[[], None],
+        is_active: Callable[[], bool],
+    ) -> None:
+        """Wire the tray's Acoustic-awareness toggle to the SoundDetector
+        (M58). main.py calls this after the detector is instantiated."""
+        self._acoustic_activate = on_activate
+        self._acoustic_deactivate = on_deactivate
+        self._acoustic_is_active = is_active
+
+    def _handle_toggle_acoustic(self) -> None:
+        """Tray callback: flip acoustic awareness via the wired SoundDetector.
+        Same code path the JARVIS_ACOUSTIC_MONITOR flag uses at startup —
+        the detector is idempotent."""
+        if self._acoustic_is_active is None:
+            return
+        if self._acoustic_is_active():
+            if self._acoustic_deactivate is not None:
+                self._acoustic_deactivate()
+        else:
+            if self._acoustic_activate is not None:
+                self._acoustic_activate()
+
+    def _acoustic_is_active_or_false(self) -> bool:
+        """Tray-checkbox safe wrapper: returns False before SoundDetector is
+        wired, so the menu renders cleanly during early startup."""
+        return bool(self._acoustic_is_active and self._acoustic_is_active())
+
     # ------------------------------------------------------------------
     # Lifecycle.
     # ------------------------------------------------------------------
@@ -371,6 +403,8 @@ class JarvisUI:
             on_security_toggle=self._handle_toggle_security,
             homelab_enabled=self._homelab_is_active_or_false,
             on_homelab_toggle=self._handle_toggle_homelab,
+            acoustic_enabled=self._acoustic_is_active_or_false,
+            on_acoustic_toggle=self._handle_toggle_acoustic,
             on_enroll_face=self._handle_enroll_face,
             on_reindex_knowledge=self._handle_reindex_knowledge,
             on_restart=self._handle_restart,

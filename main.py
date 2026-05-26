@@ -1298,6 +1298,48 @@ def main() -> None:
         is_active=homelab_monitor.is_active,
     )
 
+    # M58: acoustic awareness. Constructed ALWAYS (the tray toggle needs the
+    # instance) but the audio capture + inference loop only runs once
+    # activate()d. Default off — opt-in via JARVIS_ACOUSTIC_MONITOR or the
+    # tray toggle, same safe-default + least-privilege stance as security
+    # mode and the homelab monitor. Owns its own sd.InputStream at 32 kHz
+    # (the AudioSession is single-reader-by-design — wake-word loop owns it
+    # during listening, M52 barge-in during TTS — so M58 captures
+    # independently). Reuses the M38 Discord webhook; tagged 🔔 on the
+    # Announcer so alerts read distinctly from 🚨 / 🖥 / ⏰.
+    from src.sound_detector import SoundDetector
+    sound_detector = SoundDetector(
+        announce=lambda t: _announce(t, label="🔔"),
+        discord_webhook_url=cfg.discord_webhook_url,
+    )
+    if cfg.acoustic_monitor_enabled:
+        sound_detector.activate()
+    ui.set_on_acoustic_toggle(
+        on_activate=sound_detector.activate,
+        on_deactivate=sound_detector.deactivate,
+        is_active=sound_detector.is_active,
+    )
+
+    # M58 follow-up — couple acoustic awareness to security mode. The user's
+    # mental model is "armed = away from home, where Jarvis should also be
+    # listening for non-speech events"; this chains sound_detector.activate
+    # / deactivate onto the security-armed edge. The independent tray toggle
+    # for acoustic still works for "I want it on while I'm home" cases — the
+    # coupling is one-way (security state drives acoustic, never the
+    # reverse). Activate/deactivate are idempotent, so a manual flip
+    # followed by a coupled flip never double-fires.
+    def _security_armed_changed(armed: bool) -> None:
+        ui.set_armed_indicator(armed)
+        try:
+            if armed:
+                sound_detector.activate()
+            else:
+                sound_detector.deactivate()
+        except Exception as exc:
+            print(f"[main] coupling acoustic to security failed: {exc}",
+                  file=sys.stderr)
+    security_watcher.set_on_armed_changed(_security_armed_changed)
+
     # M48.1: LAN remote console. Gated on the token — blank ⇒ the server is
     # NEVER constructed (a surface that can disarm security must not exist
     # unless deliberately configured with a secret;
@@ -1405,6 +1447,10 @@ def main() -> None:
     # M56: stop the homelab monitor's poll loop. Daemon thread, so it dies
     # with the process anyway; the event lets it exit its poll-wait cleanly.
     homelab_monitor.shutdown()
+
+    # M58: stop acoustic awareness. Closes the InputStream + signals the
+    # inference loop to exit. Daemon-threaded so this is just clean wind-down.
+    sound_detector.shutdown()
 
     # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
     # _announcer_loop so it can check the stop flag and exit cleanly,

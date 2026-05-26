@@ -390,6 +390,17 @@ class SecurityWatcher:
     def is_armed(self) -> bool:
         return self._armed.is_set()
 
+    def set_on_armed_changed(
+        self, callback: "Callable[[bool], None] | None",
+    ) -> None:
+        """Replace the on_armed_changed callback set at construction time.
+        Used by main.py to *chain* late-constructed subsystems onto the
+        armed-state edge — e.g. M58 acoustic awareness, which is built after
+        SecurityWatcher and wants to auto-arm/disarm with security. Safe
+        because activate() / deactivate() are only ever called post-startup
+        (voice intent, tray, remote console), never during construction."""
+        self._on_armed_changed = callback
+
     # ---------------------------------------------------------------------
     # Private utility: defensive call. Used by all the UI-callback and
     # announce sites so a misbehaving caller never breaks the watcher.

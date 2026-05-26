@@ -65,6 +65,8 @@ class JarvisTray:
         on_security_toggle: Callable[[], None] | None = None,
         homelab_enabled: Callable[[], bool] | None = None,
         on_homelab_toggle: Callable[[], None] | None = None,
+        acoustic_enabled: Callable[[], bool] | None = None,
+        on_acoustic_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
         on_reindex_knowledge: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
@@ -92,6 +94,8 @@ class JarvisTray:
         self._on_security_toggle = on_security_toggle
         self._homelab_enabled = homelab_enabled
         self._on_homelab_toggle = on_homelab_toggle
+        self._acoustic_enabled = acoustic_enabled
+        self._on_acoustic_toggle = on_acoustic_toggle
         self._on_enroll_face = on_enroll_face
         self._on_reindex_knowledge = on_reindex_knowledge
         self._on_restart = on_restart
@@ -154,6 +158,18 @@ class JarvisTray:
                 "Homelab monitoring",
                 self._handle_toggle_homelab,
                 checked=lambda item: bool(self._homelab_enabled()),
+            ))
+        if acoustic_enabled is not None and on_acoustic_toggle is not None:
+            # Acoustic awareness (M58): starts/stops the ambient-sound
+            # classifier — doorbell, knock, smoke alarm, glass break, phone,
+            # kitchen timer, running water (experimental). Same state the
+            # JARVIS_ACOUSTIC_MONITOR .env flag sets at startup. First arm
+            # is heavy (downloads the ~325 MB Cnn14 checkpoint on a fresh
+            # install) — subsequent arms are quick.
+            menu_items.append(pystray.MenuItem(
+                "Acoustic awareness",
+                self._handle_toggle_acoustic,
+                checked=lambda item: bool(self._acoustic_enabled()),
             ))
         if on_enroll_face is not None:
             # M39: enroll the user's face for the security-mode auth path.
@@ -248,6 +264,10 @@ class JarvisTray:
     def _handle_toggle_homelab(self) -> None:
         if self._on_homelab_toggle is not None:
             self._on_homelab_toggle()
+
+    def _handle_toggle_acoustic(self) -> None:
+        if self._on_acoustic_toggle is not None:
+            self._on_acoustic_toggle()
 
     def _handle_enroll_face(self) -> None:
         if self._on_enroll_face is not None:
