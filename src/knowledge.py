@@ -101,6 +101,53 @@ KNOWLEDGE_SEARCH_TOOL = {
 }
 
 
+# M60.x — the WRITE companion to knowledge_search. The voice-intent path
+# (`_REMEMBER_INTENT_RE`, below) requires the word "permanently/forever" to
+# disambiguate from episodic-memory "remember when..."; this LLM-facing tool
+# lets Claude write the corpus on any natural "remember this for me"
+# phrasing — closing the gap surfaced when the user said "I want to remember
+# my pets' names" and the regex didn't fire. The underlying remember_fact()
+# is the same: one dated .md file per fact, atomic, reindex on success.
+KNOWLEDGE_REMEMBER_TOOL = {
+    "name": "knowledge_remember",
+    "description": (
+        "Save a DURABLE fact to the user's PRIVATE knowledge base — one "
+        "dated markdown file per fact, immediately searchable via "
+        "knowledge_search. Use this whenever the user wants you to record "
+        "something LASTING about themselves or their environment: pets' "
+        "names, the wifi password, a 3D-printer profile for a material, a "
+        "homelab quirk, a personal preference, a decision they want to "
+        "remember. Triggered by phrasings like 'remember [that] X', 'save "
+        "X', 'note X', 'add X to your knowledge', 'don't forget that X' — "
+        "with or without the word 'permanently'. Phrase `fact` as a FULL, "
+        "SELF-CONTAINED sentence — it will later be matched against the "
+        "user's search queries, so be explicit (e.g. 'My four pets are "
+        "Aria, Basil, Cosmo, and Delta.' rather than 'pets: "
+        "aria basil cosmo delta'). Confirm briefly once saved. "
+        "For SHORT-TERM reminders ('remind me at 5pm to take the trash out') "
+        "use set_reminder instead — that's the ephemeral channel; "
+        "knowledge_remember is the LONG-TERM corpus. Do NOT use this for "
+        "public facts (web_search has those) or for conversation context "
+        "(your episodic memory handles it automatically)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fact": {
+                "type": "string",
+                "description": (
+                    "A self-contained sentence stating the fact, written "
+                    "so a future search query about the topic will "
+                    "retrieve it. Subject + predicate; avoid pronouns "
+                    "that would be ambiguous out of context."
+                ),
+            },
+        },
+        "required": ["fact"],
+    },
+}
+
+
 # Default corpus location. Read at call time (NOT cached in the frozen Config
 # dataclass) for the same reason src/tmdb.py reads TMDB_API_KEY fresh each
 # call: it stays hot-swappable in dev, and the user can `git clone` the
@@ -669,6 +716,18 @@ def remember_fact(fact: str) -> str:
         "I've saved that to your knowledge folder, sir, though the index "
         "didn't refresh — ask me to update my knowledge."
     )
+
+
+def execute_knowledge_remember(params: dict) -> str:
+    """Tool executor — wraps remember_fact() so Claude can write the corpus
+    via the LLM tool path (the M60.x complement to the voice-intent path,
+    whose regex requires the word 'permanently'). Returns a voice-ready
+    confirmation. Never raises — defensive contract inherited from
+    remember_fact()."""
+    fact = (params.get("fact") or "").strip()
+    if not fact:
+        return "There was nothing to remember, sir."
+    return remember_fact(fact)
 
 
 # --- Voice-intent matchers -------------------------------------------------

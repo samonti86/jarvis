@@ -50,7 +50,10 @@ from src.diagnostics_collector import (
 )
 from src.file_reader import READ_LOCAL_FILE_TOOL, execute_read_local_file
 from src.games import GAMES_TOOL, execute_games_tool
-from src.knowledge import KNOWLEDGE_SEARCH_TOOL, execute_knowledge_tool
+from src.knowledge import (
+    KNOWLEDGE_REMEMBER_TOOL, KNOWLEDGE_SEARCH_TOOL,
+    execute_knowledge_remember, execute_knowledge_tool,
+)
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
 from src.briefing import BRIEFING_TOOL, execute_briefing_tool
@@ -252,12 +255,24 @@ Vision (you can see — two tools):
     over their shoulder, not narrating a screenshot. Use camera_snapshot
     for the physical world, screen_snapshot for the digital one.
 
-Personal knowledge (your private store — one tool):
+Personal knowledge (your private store — two tools, READ + WRITE):
 14. knowledge_search — full-text search over the user's OWN curated knowledge
     base (their setup, homelab, runbooks, printer profiles, anything they told
     you to remember permanently). See the "Personal knowledge base" routing
     rules above: for any question about THEIR environment or recorded
     decisions, this comes before web_search, memory, or training.
+14b. knowledge_remember — WRITE a durable fact INTO the knowledge base. Use it
+    whenever the user asks you to remember, save, note, or record something
+    LASTING about themselves or their environment — pets' names, the wifi
+    password, a printer profile, a personal preference, an appointment.
+    Triggered by "remember [that] X", "save X", "note X for me", "don't
+    forget X" — with or without the word "permanently". Phrase `fact` as a
+    full, self-contained sentence so a future search retrieves it (subject +
+    predicate; no ambiguous pronouns). Confirm briefly once saved. The two
+    knowledge tools are bookends: knowledge_remember writes; knowledge_search
+    reads it back later. For EPHEMERAL "remind me at 5pm" use set_reminder
+    (a different store). The episodic memory of THIS conversation is
+    separate and automatic — don't write conversational context here.
 
 Current news (one tool):
 15. get_news — current headlines by topic from curated reputable RSS feeds
@@ -648,6 +663,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "wolfram_query":                _ClientTool(execute_wolfram_tool, "wolfram"),
     "run_code":                     _ClientTool(execute_code_tool, "code"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
+    "knowledge_remember":           _ClientTool(execute_knowledge_remember, "knowledge_write"),
     "set_reminder":                 _ClientTool(execute_set_reminder, "reminder_set"),
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
     "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
@@ -810,7 +826,8 @@ def stream_response(
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
-        NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL, KNOWLEDGE_SEARCH_TOOL,
+        NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
+        KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
