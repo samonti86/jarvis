@@ -1,10 +1,24 @@
-"""Outlook calendar awareness (M62) — read-only Microsoft Graph integration.
+"""Outlook calendar awareness (M62 + M62.1).
 
-Jarvis reads the user's personal Microsoft account calendar (outlook.com /
-hotmail.com / live.com) via the Graph API, scoped to `Calendars.Read` only.
-The morning briefing gains today's events, and Claude has a tool for
-on-demand queries ("what's on my calendar this week?", "do I have anything
-later?").
+Two backends, one tool surface. The dispatcher (`_fetch_events`) picks based
+on what's configured:
+
+- **OUTLOOK_ICAL_URL** — the M62.1 pivot path. Outlook.com's "Publish
+  calendar" feature gives a secret `.ics` URL; Jarvis fetches it with httpx
+  and expands recurring events with `recurring-ical-events` (the
+  client-side analog of Graph's `/calendarView`). No OAuth, no Azure,
+  no MSAL. Read-only by construction.
+- **OUTLOOK_CLIENT_ID** — the original M62 Graph path. MSAL device-code
+  OAuth, `Calendars.Read` scope, refresh-token cache. Needs an Azure app
+  registration (~10 min user task; broken if the user's Entra tenant is
+  blocked, which is what motivated M62.1).
+
+The iCal path wins when both are set — it's simpler and has fewer failure
+modes (no token expiry, no Azure dependency).
+
+The tool surface (`get_calendar_events`) and the briefing's
+`_calendar_section()` are backend-agnostic — they call the dispatcher and
+get back `CalendarEvent` instances either way.
 
 Two paths, separated by design:
 
@@ -59,6 +73,12 @@ import httpx
 # --- Configuration ---------------------------------------------------------
 
 CLIENT_ID = os.getenv("OUTLOOK_CLIENT_ID", "").strip()
+
+# M62.1 — published iCal URL (Outlook.com → Settings → Calendar → Shared
+# calendars → Publish a calendar → "Can view all details"). Bearer
+# credential — treat like a webhook URL (gitignored .env). Set this for the
+# simpler / Azure-free path; it wins over CLIENT_ID when both are set.
+ICAL_URL = os.getenv("OUTLOOK_ICAL_URL", "").strip()
 
 # Personal Microsoft accounts (outlook.com / hotmail.com / live.com). For
 # work/school accounts swap this for the org's tenant ID — different
@@ -191,14 +211,129 @@ class CalendarEvent:
 
 
 def _fetch_events(start_utc: datetime, end_utc: datetime) -> tuple[list[CalendarEvent] | None, str]:
-    """Returns (events, status). On success: (list, ""). On any failure:
-    (None, voice-friendly error message). Status messages are intended for
-    direct relay to the user."""
+    """Top-level dispatcher. Picks the backend by what's configured:
+    iCal URL wins when set (M62.1, simpler), Graph is the fallback (M62),
+    neither configured returns a clear setup message. Returns (events, status):
+    on success (list, ""); on any failure (None, voice-friendly error)."""
+    if ICAL_URL:
+        return _fetch_events_ical(start_utc, end_utc)
+    if CLIENT_ID:
+        return _fetch_events_graph(start_utc, end_utc)
+    return (None, "Outlook calendar isn't configured, sir — set either "
+            "OUTLOOK_ICAL_URL (the simpler path) or OUTLOOK_CLIENT_ID in "
+            ".env. See .env.example for setup instructions.")
+
+
+def _fetch_events_ical(start_utc: datetime, end_utc: datetime) -> tuple[list[CalendarEvent] | None, str]:
+    """The M62.1 backend: fetch Outlook.com's published .ics URL, parse with
+    icalendar, expand recurring events into the requested window with
+    recurring-ical-events. Read-only, no auth, no Azure.
+
+    The fetch is uncached on our side; Microsoft typically caches the
+    published feed server-side for ~hours, so "today's events" can be a
+    few hours stale. Acceptable for v1; the alternative (polling more
+    aggressively) would burn bandwidth for no real benefit since the
+    user's calendar doesn't change minute-to-minute."""
+    try:
+        resp = httpx.get(ICAL_URL, follow_redirects=True, timeout=15.0)
+    except httpx.HTTPError as exc:
+        print(f"[outlook] ical fetch failed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return (None, "I couldn't reach the Outlook iCal feed just now, sir.")
+    if resp.status_code != 200:
+        print(f"[outlook] ical HTTP {resp.status_code}: {resp.text[:200]}",
+              file=sys.stderr)
+        return (None, f"Outlook iCal returned HTTP {resp.status_code}, sir — "
+                f"check the URL in OUTLOOK_ICAL_URL is still valid.")
+
+    # Lazy imports — keeps the module loadable even before
+    # recurring-ical-events is installed (e.g. on a fresh checkout where
+    # `pip install -r requirements.txt` hasn't been run yet).
+    try:
+        import icalendar  # noqa: PLC0415 — lazy
+        import recurring_ical_events  # noqa: PLC0415 — lazy
+    except ImportError as exc:
+        print(f"[outlook] ical libs missing: {exc}", file=sys.stderr)
+        return (None, "I'm missing the iCal parsing library, sir — "
+                "run `pip install -r requirements.txt`.")
+    try:
+        cal = icalendar.Calendar.from_ical(resp.content)
+    except Exception as exc:  # noqa: BLE001 — many parser failure modes
+        print(f"[outlook] ical parse failed: {exc}", file=sys.stderr)
+        return (None, "I couldn't parse the Outlook iCal feed, sir — "
+                "the URL might be pointing at something else.")
+    try:
+        raw_events = recurring_ical_events.of(cal).between(start_utc, end_utc)
+    except Exception as exc:  # noqa: BLE001 — RRULE expansion can throw
+        print(f"[outlook] ical recurrence expansion failed: {exc}",
+              file=sys.stderr)
+        return (None, "I couldn't expand recurring events from the feed, sir.")
+
+    events: list[CalendarEvent] = []
+    for ev in raw_events:
+        normalised = _normalise_ical_event(ev)
+        if normalised is not None:
+            events.append(normalised)
+    events.sort(key=lambda e: e.start_local)
+    return (events, "")
+
+
+def _normalise_ical_event(vevent) -> CalendarEvent | None:
+    """Convert an icalendar VEVENT to our CalendarEvent shape. Mirrors
+    _normalise() (Graph) — same output type, just a different input."""
+    try:
+        from datetime import date  # noqa: PLC0415 — narrow scope
+        subject = str(vevent.get("SUMMARY", "")).strip() or "(no subject)"
+        location = str(vevent.get("LOCATION", "")).strip()
+        dtstart_prop = vevent.get("DTSTART")
+        dtend_prop = vevent.get("DTEND")
+        if dtstart_prop is None:
+            return None
+        start = dtstart_prop.dt
+        # An all-day event's DTSTART is a `date` (no time). datetime is a
+        # subclass of date, so order matters: check datetime first.
+        is_all_day = isinstance(start, date) and not isinstance(start, datetime)
+        if is_all_day:
+            # Promote DATE → DATETIME at midnight; treat as local time for
+            # display (an all-day event is "all of that calendar day in the
+            # viewer's wall clock" by convention).
+            start = datetime.combine(start, datetime.min.time())
+            if dtend_prop is not None:
+                end_raw = dtend_prop.dt
+                if isinstance(end_raw, date) and not isinstance(end_raw, datetime):
+                    end = datetime.combine(end_raw, datetime.min.time())
+                else:
+                    end = end_raw
+            else:
+                end = start + timedelta(days=1)
+        else:
+            end = dtend_prop.dt if dtend_prop is not None else start + timedelta(hours=1)
+        # Ensure tz-aware. icalendar usually returns aware datetimes when
+        # the VEVENT has TZID (Microsoft always sets it), but be defensive.
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        return CalendarEvent(
+            subject=subject,
+            start_local=start.astimezone(),
+            end_local=end.astimezone(),
+            location=location,
+            is_all_day=is_all_day,
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive per-event
+        print(f"[outlook] ical event normalise failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _fetch_events_graph(start_utc: datetime, end_utc: datetime) -> tuple[list[CalendarEvent] | None, str]:
+    """The original M62 backend: Graph API with MSAL refresh-token cache.
+    Called by the dispatcher only when OUTLOOK_CLIENT_ID is set (so a None
+    client here means msal not installed / client init failed)."""
     client = _get_client()
     if client is None:
-        return (None, "Outlook calendar isn't configured, sir — set "
-                "OUTLOOK_CLIENT_ID in .env. See .env.example for the "
-                "one-time setup.")
+        return (None, "The Graph client couldn't initialise, sir — check "
+                "that msal is installed (`pip install -r requirements.txt`).")
     token = client.silent_token()
     if not token:
         return (None, "Outlook calendar authorisation has expired or "

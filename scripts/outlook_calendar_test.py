@@ -188,6 +188,158 @@ check("format all-day event -> says 'all day'",
       "all day" in out.lower())
 
 
+# --- M62.1 — iCal backend + dispatcher precedence ------------------------
+
+# Test 8: _normalise_ical_event on a real icalendar VEVENT
+# (build the .ics in memory and let icalendar parse it — exercises the same
+# code path the live fetch does, minus the httpx round-trip).
+import icalendar  # noqa: E402
+
+ICS_SINGLE = (
+    "BEGIN:VCALENDAR\r\n"
+    "PRODID:-//Test//EN\r\n"
+    "VERSION:2.0\r\n"
+    "BEGIN:VEVENT\r\n"
+    "UID:test-single@example.com\r\n"
+    "DTSTART:20260601T140000Z\r\n"
+    "DTEND:20260601T150000Z\r\n"
+    "SUMMARY:Engineering standup\r\n"
+    "LOCATION:Conference Room A\r\n"
+    "END:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+cal = icalendar.Calendar.from_ical(ICS_SINGLE)
+vevents = [c for c in cal.walk("VEVENT")]
+check("ICS single-event parse: 1 VEVENT extracted", len(vevents) == 1)
+
+ev = oc._normalise_ical_event(vevents[0])
+check("_normalise_ical_event: subject extracted",
+      ev is not None and ev.subject == "Engineering standup")
+check("_normalise_ical_event: location extracted",
+      ev is not None and ev.location == "Conference Room A")
+check("_normalise_ical_event: is_all_day=False on timed event",
+      ev is not None and ev.is_all_day is False)
+check("_normalise_ical_event: tz-aware datetimes returned",
+      ev is not None
+      and ev.start_local.tzinfo is not None
+      and ev.end_local.tzinfo is not None)
+
+
+# Test 9: an all-day event — Microsoft / icalendar use VALUE=DATE (no time)
+ICS_ALLDAY = (
+    "BEGIN:VCALENDAR\r\n"
+    "PRODID:-//Test//EN\r\n"
+    "VERSION:2.0\r\n"
+    "BEGIN:VEVENT\r\n"
+    "UID:test-allday@example.com\r\n"
+    "DTSTART;VALUE=DATE:20260615\r\n"
+    "DTEND;VALUE=DATE:20260616\r\n"
+    "SUMMARY:Memorial Day holiday\r\n"
+    "END:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+cal = icalendar.Calendar.from_ical(ICS_ALLDAY)
+vevents = list(cal.walk("VEVENT"))
+ev = oc._normalise_ical_event(vevents[0])
+check("_normalise_ical_event: all-day flagged",
+      ev is not None and ev.is_all_day is True)
+check("_normalise_ical_event: all-day subject still parses",
+      ev is not None and ev.subject == "Memorial Day holiday")
+
+
+# Test 10: recurring-ical-events expands RRULE into instances inside window
+import recurring_ical_events  # noqa: E402
+
+ICS_WEEKLY = (
+    "BEGIN:VCALENDAR\r\n"
+    "PRODID:-//Test//EN\r\n"
+    "VERSION:2.0\r\n"
+    "BEGIN:VEVENT\r\n"
+    "UID:test-weekly@example.com\r\n"
+    "DTSTART:20260601T130000Z\r\n"   # Monday 1pm UTC
+    "DTEND:20260601T133000Z\r\n"
+    "SUMMARY:Weekly standup\r\n"
+    "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n"
+    "END:VEVENT\r\n"
+    "END:VCALENDAR\r\n"
+)
+cal = icalendar.Calendar.from_ical(ICS_WEEKLY)
+# Window: 4 Mondays starting June 1, 2026 → expect 4 instances
+window_start = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
+window_end = datetime(2026, 6, 29, 0, 0, tzinfo=timezone.utc)
+expanded = recurring_ical_events.of(cal).between(window_start, window_end)
+check("recurring-ical-events expands FREQ=WEEKLY into 4 instances",
+      len(expanded) == 4)
+normalised_count = sum(1 for ve in expanded
+                       if oc._normalise_ical_event(ve) is not None)
+check("all 4 expanded VEVENTs normalise cleanly",
+      normalised_count == 4)
+
+
+# Test 11: dispatcher precedence — iCal wins when both configured
+# We mock _fetch_events_ical and _fetch_events_graph to verify which one
+# the dispatcher actually calls under each env combination.
+_ical_calls = []
+_graph_calls = []
+
+def _fake_ical(start, end):
+    _ical_calls.append((start, end))
+    return ([], "")
+
+def _fake_graph(start, end):
+    _graph_calls.append((start, end))
+    return ([], "")
+
+_orig_ical = oc._fetch_events_ical
+_orig_graph = oc._fetch_events_graph
+_orig_url = oc.ICAL_URL
+_orig_client_id = oc.CLIENT_ID
+oc._fetch_events_ical = _fake_ical
+oc._fetch_events_graph = _fake_graph
+try:
+    # (a) Both set ⇒ iCal wins
+    oc.ICAL_URL = "https://example.com/calendar.ics"
+    oc.CLIENT_ID = "some-client-id"
+    _ical_calls.clear(); _graph_calls.clear()
+    oc._fetch_events(datetime.now(timezone.utc),
+                     datetime.now(timezone.utc) + timedelta(hours=1))
+    check("dispatcher: both configured -> iCal wins",
+          len(_ical_calls) == 1 and len(_graph_calls) == 0)
+
+    # (b) Only Graph set ⇒ Graph used
+    oc.ICAL_URL = ""
+    oc.CLIENT_ID = "some-client-id"
+    _ical_calls.clear(); _graph_calls.clear()
+    oc._fetch_events(datetime.now(timezone.utc),
+                     datetime.now(timezone.utc) + timedelta(hours=1))
+    check("dispatcher: only CLIENT_ID -> Graph used",
+          len(_ical_calls) == 0 and len(_graph_calls) == 1)
+
+    # (c) Only iCal set ⇒ iCal used
+    oc.ICAL_URL = "https://example.com/calendar.ics"
+    oc.CLIENT_ID = ""
+    _ical_calls.clear(); _graph_calls.clear()
+    oc._fetch_events(datetime.now(timezone.utc),
+                     datetime.now(timezone.utc) + timedelta(hours=1))
+    check("dispatcher: only ICAL_URL -> iCal used",
+          len(_ical_calls) == 1 and len(_graph_calls) == 0)
+
+    # (d) Neither set ⇒ voice-friendly setup message
+    oc.ICAL_URL = ""
+    oc.CLIENT_ID = ""
+    events, err = oc._fetch_events(datetime.now(timezone.utc),
+                                   datetime.now(timezone.utc) + timedelta(hours=1))
+    check("dispatcher: neither configured -> setup message",
+          events is None
+          and "OUTLOOK_ICAL_URL" in err
+          and "OUTLOOK_CLIENT_ID" in err)
+finally:
+    oc._fetch_events_ical = _orig_ical
+    oc._fetch_events_graph = _orig_graph
+    oc.ICAL_URL = _orig_url
+    oc.CLIENT_ID = _orig_client_id
+
+
 # --- summary --------------------------------------------------------------
 # Restore env state so subsequent imports in the same session see the
 # original value.

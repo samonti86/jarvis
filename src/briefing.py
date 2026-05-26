@@ -145,13 +145,16 @@ def _calendar_section() -> str:
     (silent failure here would mean a missed meeting)."""
     try:
         from src.outlook_calendar import (  # noqa: PLC0415 — lazy
-            CLIENT_ID, today_events,
+            CLIENT_ID, ICAL_URL, today_events,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[briefing] calendar import failed: {exc}", file=sys.stderr)
         return ""
-    if not CLIENT_ID:
-        return ""    # silently omit when user hasn't configured Outlook
+    if not (CLIENT_ID or ICAL_URL):
+        # Silently omit when neither backend is configured. M62.1 added the
+        # iCal path — the original CLIENT_ID-only check would have silently
+        # skipped the section for users who configured iCal but not Graph.
+        return ""
     events, err = today_events()
     if err:
         # Configured but auth expired / Graph erroring. SURFACE this — a
