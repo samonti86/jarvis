@@ -1424,6 +1424,87 @@ def main() -> None:
         print("[remote] JARVIS_REMOTE_TOKEN unset — remote console disabled",
               file=sys.stderr)
 
+    # M60 — self-status registry. Each subsystem reports a one-line status
+    # via the `status_report` tool ("Jarvis, are you healthy?"). Registered
+    # HERE so every closure captures the live locals; order is display order
+    # in the report. Last-write-wins on a re-register (safe under any future
+    # re-construction). Cheap — the getters only run when status_report is
+    # called, not on every turn.
+    from src.self_status import (
+        count_session_errors as _ss_errors,
+        process_private_mb as _ss_mem,
+        register as _ss_register,
+    )
+
+    def _status_security() -> str:
+        if security_watcher.is_locked():
+            return "Security: LOCKED (post-deterrent — awaiting passphrase)"
+        if security_watcher.is_armed():
+            return "Security: ARMED"
+        return "Security: standing down"
+
+    def _status_acoustic() -> str:
+        return (f"Acoustic awareness: "
+                f"{'active' if sound_detector.is_active() else 'off'}")
+
+    def _status_homelab() -> str:
+        return (f"Homelab monitor: "
+                f"{'active' if homelab_monitor.is_active() else 'off'}")
+
+    def _status_plex_mcp() -> str:
+        if plex_client is None:
+            return "Plex MCP: unavailable"
+        try:
+            n: object = len(plex_client.tool_names)
+        except Exception:
+            n = "?"
+        return f"Plex MCP: connected ({n} tools)"
+
+    def _status_plex_laptop() -> str:
+        if plex_laptop_client is None:
+            return "Plex laptop SSH: unconfigured"
+        return f"Plex laptop SSH: configured ({cfg.plex_laptop_host})"
+
+    def _status_remote() -> str:
+        if remote_server is None:
+            return "Remote console: off"
+        tls = bool(cfg.tls_cert_file and cfg.tls_key_file)
+        proto = "HTTPS/WSS" if tls else "HTTP/WS"
+        return f"Remote console: listening on port {cfg.remote_port} ({proto})"
+
+    def _status_stt() -> str:
+        if cfg.stt_server_url:
+            return (f"STT: GPU server ({cfg.stt_server_url}) — "
+                    f"backend={cfg.stt_backend}")
+        return f"STT: local CPU only — backend={cfg.stt_backend}"
+
+    def _status_reminders() -> str:
+        from src.reminders import list_pending  # noqa: PLC0415 — lazy
+        items = list_pending()
+        n = len(items)
+        briefings = sum(1 for r in items if r.get("action") == "briefing")
+        if briefings:
+            return f"Reminders: {n} pending ({briefings} scheduled briefing(s))"
+        return f"Reminders: {n} pending"
+
+    def _status_memory() -> str:
+        return f"Process memory: {_ss_mem():.0f} MB private bytes"
+
+    def _status_errors() -> str:
+        n, ctx = _ss_errors()
+        return f"Log errors: {n} concerning lines ({ctx})"
+
+    _ss_register("Security", _status_security)
+    _ss_register("Acoustic awareness", _status_acoustic)
+    _ss_register("Homelab monitor", _status_homelab)
+    _ss_register("Plex MCP", _status_plex_mcp)
+    _ss_register("Plex laptop", _status_plex_laptop)
+    _ss_register("Remote console", _status_remote)
+    _ss_register("STT backend", _status_stt)
+    _ss_register("Reminders", _status_reminders)
+    _ss_register("Process memory", _status_memory)
+    _ss_register("Log errors", _status_errors)
+
     worker = threading.Thread(
         target=listen_loop,
         args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
