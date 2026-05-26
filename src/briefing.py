@@ -137,6 +137,41 @@ def _security_section() -> str:
         return "Overnight security: status unavailable."
 
 
+def _calendar_section() -> str:
+    """Today's Outlook calendar events (M62). Silently omitted when
+    OUTLOOK_CLIENT_ID isn't set — we don't want to nag a user who never
+    configured the integration. Configured-but-unauthorised / configured-
+    but-Graph-erroring states ARE surfaced so the user knows to re-auth
+    (silent failure here would mean a missed meeting)."""
+    try:
+        from src.outlook_calendar import (  # noqa: PLC0415 — lazy
+            CLIENT_ID, today_events,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[briefing] calendar import failed: {exc}", file=sys.stderr)
+        return ""
+    if not CLIENT_ID:
+        return ""    # silently omit when user hasn't configured Outlook
+    events, err = today_events()
+    if err:
+        # Configured but auth expired / Graph erroring. SURFACE this — a
+        # silent skip here would hide a missed meeting.
+        return f"Calendar: {err}"
+    if events is None or len(events) == 0:
+        return "Calendar: nothing scheduled today."
+    n = len(events)
+    lines = [f"Calendar — {n} event{'s' if n != 1 else ''} today:"]
+    for ev in events:
+        if ev.is_all_day:
+            lines.append(f"- (all day) {ev.subject}")
+        else:
+            line = f"- {ev.start_local.strftime('%H:%M')} {ev.subject}"
+            if ev.location:
+                line += f"  ({ev.location})"
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def _reminders_section() -> str:
     """The pending reminders whose next fire is today (M53/M54 store)."""
     try:
@@ -169,8 +204,11 @@ def execute_briefing_tool(params: dict) -> str:  # noqa: ARG001 — param-less t
     sections = [
         _weather_section(),
         _security_section(),
+        _calendar_section(),    # M62 — silent skip when Outlook isn't configured
         _reminders_section(),
         _news_section("sports", "Sports"),
         _news_section("gaming", "Gaming"),
     ]
-    return "\n\n".join(sections)
+    # Drop empty sections so an unconfigured optional channel (currently
+    # only calendar) doesn't produce a double-blank-line gap in the output.
+    return "\n\n".join(s for s in sections if s)

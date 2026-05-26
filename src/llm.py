@@ -54,6 +54,7 @@ from src.knowledge import (
     KNOWLEDGE_REMEMBER_TOOL, KNOWLEDGE_SEARCH_TOOL,
     execute_knowledge_remember, execute_knowledge_tool,
 )
+from src.outlook_calendar import GET_CALENDAR_TOOL, execute_calendar_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
 from src.briefing import BRIEFING_TOOL, execute_briefing_tool
@@ -381,6 +382,20 @@ Self-status (one tool):
     user explicitly asked for a full report. Like the briefing and
     homelab_status, this is a fresh-state question — re-run every time.
 
+Outlook calendar (one tool):
+24. get_calendar_events — read events from the user's Outlook calendar
+    (personal Microsoft account, read-only). Use it for "what's on my
+    calendar", "do I have anything later", "what's my next meeting", "am I
+    free at 3pm", "what's tomorrow looking like". Pick `timeframe` based on
+    the question: 'today' is the default; 'tomorrow' for "what's tomorrow";
+    'this_week' for "what's the week looking like"; 'next_24h' for
+    "anything coming up". Read the result back conversationally — name the
+    times and subjects naturally (not as a JSON dump). If the tool returns
+    a setup instruction (calendar not configured / authorisation expired),
+    relay that plainly and do NOT fabricate events. The user cannot create
+    or modify events through Jarvis — read-only by design; if they ask to
+    schedule something, say so.
+
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
   training data. Even if a similar answer is in your "Recent conversations" memory or
@@ -664,6 +679,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "run_code":                     _ClientTool(execute_code_tool, "code"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "knowledge_remember":           _ClientTool(execute_knowledge_remember, "knowledge_write"),
+    "get_calendar_events":          _ClientTool(execute_calendar_tool, "calendar"),
     "set_reminder":                 _ClientTool(execute_set_reminder, "reminder_set"),
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
     "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
@@ -827,7 +843,7 @@ def stream_response(
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
-        KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL,
+        KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,

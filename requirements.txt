@@ -72,6 +72,14 @@ opencv-python-headless>=4.8
 # polling rate at <10% one-core utilization. MIT licensed.
 ultralytics>=8.4
 
+# Outlook calendar awareness (M62) — read-only Microsoft Graph integration.
+# msal is Microsoft's official authentication library: handles the
+# device-code OAuth flow (one-time, via scripts/outlook_auth.py), token
+# cache, silent refresh. Pure Python (~few MB); cryptography is its only
+# notable transitive dep (already pulled by paramiko M24). Used for
+# get_calendar_events tool + the briefing's calendar section.
+msal>=1.30
+
 # Acoustic awareness (M58) — proactive ambient-sound detection. PANNs Cnn14
 # audio tagger (AudioSet 527 classes) for doorbell / smoke alarm / glass /
 # knock / etc. Pulls librosa + numba + soundfile as transitive deps. AST via
