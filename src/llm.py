@@ -314,7 +314,13 @@ Reminders & timers (three tools):
     seconds) or `at` (absolute ISO 8601 datetime — you know today's date).
     Recurring: set `repeat` instead (kind = interval / weekly / monthly — see
     the tool schema). `message` is the task itself, phrased to be spoken back.
-    Confirm briefly once it's set.
+    Confirm briefly once it's set. **Scheduled briefings (M59):** if the user
+    asks to be briefed on a schedule — "brief me every weekday at 7", "set up a
+    morning briefing at 7am", "every day at 7 give me my briefing" — call
+    set_reminder with `action="briefing"` AND a `repeat` spec. That makes the
+    reminder TRIGGER the get_briefing composition at fire time instead of just
+    speaking `message`; use a short label like "morning briefing" for the
+    message itself. The user can list / cancel it like any reminder.
 19. list_reminders — read back the user's pending reminders ("what reminders
     do I have?", "what am I meant to do later?").
 20. cancel_reminder — cancel a pending reminder, by `id` or by a `query`

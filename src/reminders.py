@@ -109,10 +109,17 @@ def _save(reminders: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def add(message: str, fire_at: datetime, repeat: dict | None = None) -> dict:
+def add(
+    message: str, fire_at: datetime,
+    repeat: dict | None = None, action: str | None = None,
+) -> dict:
     """Append one reminder and return the stored record. `repeat` (M54), when
     given, is a validated recurrence spec — its presence makes the reminder
-    recurring (re-armed on fire instead of removed)."""
+    recurring (re-armed on fire instead of removed). `action` (M59), when set
+    to "briefing", changes what happens on fire: instead of speaking the
+    `message` text, the scheduler composes + announces the M55 morning
+    briefing. Other actions may follow; unknown values are stored verbatim
+    and treated as a no-op by the scheduler (forward-compatible)."""
     rec = {
         "id": "r" + uuid.uuid4().hex[:6],
         "message": message,
@@ -121,6 +128,8 @@ def add(message: str, fire_at: datetime, repeat: dict | None = None) -> dict:
     }
     if repeat:
         rec["repeat"] = repeat
+    if action:
+        rec["action"] = action
     with _LOCK:
         items = _load()
         items.append(rec)
@@ -433,6 +442,22 @@ SET_REMINDER_TOOL = {
                     },
                 },
             },
+            "action": {
+                "type": "string",
+                "enum": ["briefing"],
+                "description": (
+                    "M59 — OPTIONAL. When set to 'briefing', the reminder "
+                    "TRIGGERS the morning briefing composition (weather + "
+                    "sports / gaming news + overnight security events + "
+                    "today's reminders) instead of just speaking the "
+                    "`message` text. Use this for 'brief me every weekday at "
+                    "7am' / 'set up a scheduled morning briefing' / 'every "
+                    "morning at 7 give me the briefing'. `message` becomes a "
+                    "short label shown in list_reminders (e.g. 'morning "
+                    "briefing'). Combine with `repeat` to schedule a "
+                    "recurring briefing — the canonical use."
+                ),
+            },
         },
         "required": ["message"],
     },
@@ -486,6 +511,14 @@ def execute_set_reminder(params: dict) -> str:
     if len(message) > _MAX_MESSAGE_LEN:
         message = message[:_MAX_MESSAGE_LEN]
 
+    # M59 — optional action on fire. Currently only "briefing" is supported.
+    # Unknown values are rejected here (vs. silently stored) so a typo gives
+    # the user a clear error instead of a silent never-firing-as-expected.
+    action = (params.get("action") or "").strip().lower() or None
+    if action and action not in {"briefing"}:
+        return (f"I don't know the '{action}' action, sir — only "
+                f"'briefing' is supported right now.")
+
     # M54: a recurring reminder. The first occurrence is derived from the
     # recurrence itself, so delay_seconds/at are intentionally ignored here.
     repeat = params.get("repeat")
@@ -496,9 +529,10 @@ def execute_set_reminder(params: dict) -> str:
         fire_at = _next_occurrence(spec, datetime.now())
         if fire_at is None:
             return "I couldn't work out when that should recur, sir."
-        rec = add(message, fire_at, repeat=spec)
+        rec = add(message, fire_at, repeat=spec, action=action)
+        kind_label = "briefing" if action == "briefing" else "reminder"
         return (
-            f"Recurring reminder set — \"{message}\", {_describe_repeat(spec)}. "
+            f"Recurring {kind_label} set — \"{message}\", {_describe_repeat(spec)}. "
             f"First one at {_human_dt(fire_at)}. id: {rec['id']}."
         )
 
@@ -532,10 +566,11 @@ def execute_set_reminder(params: dict) -> str:
     if fire_at > now + timedelta(days=_MAX_HORIZON_DAYS):
         return "That's further out than I can schedule, sir."
 
-    rec = add(message, fire_at)
+    rec = add(message, fire_at, action=action)
+    kind_label = "Briefing" if action == "briefing" else "Reminder"
     return (
-        f"Reminder set — \"{message}\" — will fire at {_human_dt(fire_at)}. "
-        f"id: {rec['id']}."
+        f"{kind_label} set — \"{message}\" — will fire at "
+        f"{_human_dt(fire_at)}. id: {rec['id']}."
     )
 
 
@@ -550,15 +585,19 @@ def execute_list_reminders(params: dict) -> str:  # noqa: ARG001 — no params
         when = _human_dt(dt) if dt else r.get("fire_at", "unknown time")
         msg, rid = r.get("message", "?"), r.get("id", "?")
         repeat = r.get("repeat")
+        # M59: a briefing-action reminder gets a "(briefing)" tag so the user
+        # hears that this one COMPOSES + speaks the morning briefing instead
+        # of just speaking its message. The action ride along the rec verbatim.
+        action_tag = " (briefing)" if r.get("action") == "briefing" else ""
         if repeat:
             # M54: a recurring reminder — lead with the schedule, then the
             # next occurrence, so "what do I have" reads naturally.
             lines.append(
-                f"- \"{msg}\" — {_describe_repeat(repeat)} (next: {when}, "
-                f"id: {rid})"
+                f"- \"{msg}\"{action_tag} — {_describe_repeat(repeat)} "
+                f"(next: {when}, id: {rid})"
             )
         else:
-            lines.append(f"- \"{msg}\" at {when} (id: {rid})")
+            lines.append(f"- \"{msg}\"{action_tag} at {when} (id: {rid})")
     return "\n".join(lines)
 
 
@@ -611,6 +650,43 @@ def _fire_text(rec: dict, now: datetime) -> str:
     return f"Sir, a reminder — {msg}."
 
 
+def _greeting_for(hour: int) -> str:
+    """Time-of-day greeting for a scheduled briefing fire — morning before
+    noon, afternoon up to 17:00, evening after. A briefing scheduled for 6 pm
+    shouldn't be greeted with 'Good morning, sir.'"""
+    if hour < 12:
+        return "Good morning, sir."
+    if hour < 17:
+        return "Good afternoon, sir."
+    return "Good evening, sir."
+
+
+def _fire_briefing(rec: dict, announce: Callable[[str], None],
+                   now: datetime) -> None:
+    """M59 — a reminder with action='briefing' fires the M55 briefing
+    composition instead of speaking its static message. Runs on a throwaway
+    thread because the briefing composition fetches weather/news/etc. and
+    can take 5–10 s — we don't want to block the scheduler poll loop. The
+    `_fire_text` path stays synchronous (cheap; just a string)."""
+    rid = rec.get("id", "?")
+
+    def _worker() -> None:
+        try:
+            from src.briefing import execute_briefing_tool  # noqa: PLC0415 — lazy
+            text = execute_briefing_tool({})
+        except Exception as exc:  # noqa: BLE001 — never propagate to the thread top
+            print(f"[reminders] briefing composition failed: {exc}",
+                  file=sys.stderr)
+            announce("Sir, the scheduled briefing failed to compile.")
+            return
+        greeting = _greeting_for(now.hour)
+        announce(f"{greeting} Your scheduled briefing:\n\n{text}")
+
+    threading.Thread(
+        target=_worker, name=f"BriefingFire-{rid}", daemon=True,
+    ).start()
+
+
 def run_scheduler(
     announce: Callable[[str], None],
     stop_event: threading.Event,
@@ -620,15 +696,26 @@ def run_scheduler(
     (main.py's WASAPI-safe Announcer path). Polls immediately on start, so
     reminders that came due while Jarvis was off fire right after launch.
     Wrapped so a single bad poll can never kill the thread — a dead scheduler
-    would silently drop every future reminder."""
+    would silently drop every future reminder.
+
+    M59: a reminder with action='briefing' is dispatched via _fire_briefing
+    (on its own worker thread, since briefing composition takes 5–10 s);
+    the scheduler poll stays snappy. Plain reminders ride the synchronous
+    _fire_text path unchanged."""
     print("[reminders] scheduler thread started", file=sys.stderr)
     while not stop_event.is_set():
         try:
             now = datetime.now()
             for rec in pop_due(now):
-                print(f"[reminders] firing {rec.get('id')}: {rec.get('message')}",
+                rid = rec.get("id")
+                action = rec.get("action")
+                print(f"[reminders] firing {rid}: "
+                      f"{rec.get('message')} (action={action or '-'})",
                       file=sys.stderr)
-                announce(_fire_text(rec, now))
+                if action == "briefing":
+                    _fire_briefing(rec, announce, now)
+                else:
+                    announce(_fire_text(rec, now))
         except Exception as exc:  # noqa: BLE001 — keep the thread alive
             print(f"[reminders] scheduler poll failed: {exc}", file=sys.stderr)
         stop_event.wait(poll_sec)
