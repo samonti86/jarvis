@@ -31,7 +31,12 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VENV_PYTHONW = _PROJECT_ROOT / "venv" / "Scripts" / "pythonw.exe"
-_LAUNCHER = _PROJECT_ROOT / "jarvis.pyw"
+# M65 — the canonical launcher is now the crash watchdog. jarvis.pyw still
+# works standalone; choosing the watchdog here means the autostart shortcut,
+# the desktop shortcut, AND the tray-restart-when-not-under-watchdog path
+# all give you supervised mode by default. The watchdog spawns jarvis.pyw
+# internally, so the existing pythonw + stdout-redirect chain is preserved.
+_LAUNCHER = _PROJECT_ROOT / "jarvis_watchdog.pyw"
 _ICON_PATH = _PROJECT_ROOT / "assets" / "jarvis.ico"
 
 _STARTUP_DIR = (
