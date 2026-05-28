@@ -43,7 +43,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from src.audio import AudioSession
+from src.audio import AudioSession, resolve_input_device
 from src.config import Config, load
 from src.llm import TelemetryRecord, stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
@@ -246,6 +246,7 @@ def listen_loop(
     on_knowledge_reindex: "Callable[[], None] | None" = None,
     on_knowledge_remember: "Callable[[str], None] | None" = None,
     remote_server: object | None = None,
+    mic_device: int | None = None,
 ) -> None:
     """Daemon worker. Owns conversation history, persists turns + seals
     sessions on every memory boundary (manual reset / idle / app quit).
@@ -771,7 +772,7 @@ def listen_loop(
     text_thread.start()
 
     try:
-        with AudioSession(sample_rate=cfg.sample_rate) as session:
+        with AudioSession(sample_rate=cfg.sample_rate, device=mic_device) as session:
             # M51: True ⇒ the previous turn just ended; listen for a follow-up
             # WITHOUT requiring "Hey Jarvis" (a longer pre-speech window;
             # silence past it falls back to wake-word mode). Starts False —
@@ -1307,10 +1308,21 @@ def main() -> None:
     # during listening, M52 barge-in during TTS — so M58 captures
     # independently). Reuses the M38 Discord webhook; tagged 🔔 on the
     # Announcer so alerts read distinctly from 🚨 / 🖥 / ⏰.
+    # Mic device pin (JARVIS_MIC_DEVICE). Resolve ONCE here so the main
+    # capture and acoustic awareness bind the same physical input and we log
+    # the chosen device a single time. None ⇒ Windows default (legacy).
+    mic_device_index = resolve_input_device(cfg.mic_device)
+
     from src.sound_detector import SoundDetector
     sound_detector = SoundDetector(
         announce=lambda t: _announce(t, label="🔔"),
         discord_webhook_url=cfg.discord_webhook_url,
+        device=mic_device_index,
+        # Cooperative speech gate (same Event the SecurityWatcher uses): the
+        # PANNs inference loop defers while a proactive announce plays so it
+        # can't starve the TTS path. M58 coupled acoustic to armed mode but
+        # left this loop ungated — the 2026-05-28 armed-stutter regression.
+        speaking_event=announce_speaking,
     )
     if cfg.acoustic_monitor_enabled:
         sound_detector.activate()
@@ -1554,6 +1566,7 @@ def main() -> None:
             "on_knowledge_reindex": _trigger_knowledge_reindex,
             "on_knowledge_remember": _trigger_knowledge_remember,
             "remote_server": remote_server,
+            "mic_device": mic_device_index,
         },
         daemon=True,
     )

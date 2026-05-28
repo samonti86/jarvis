@@ -1176,9 +1176,11 @@ class SecurityWatcher:
         # cores and starve the real-time audio threads (the armed-only TTS
         # stutter). Lazy import for the same reason ultralytics is: torch is
         # already in-process by here (YOLO pulled it), so this is cheap.
-        # set_num_threads is process-global, but YOLO is the only torch
-        # consumer (STT is ctranslate2/GPU-offloaded), so global == scoped
-        # in practice. <= 0 leaves torch's default (debug/parity escape).
+        # set_num_threads is process-global. NOTE: since M58, PANNs (acoustic
+        # awareness) is ALSO a torch consumer — it caps itself the same way
+        # (JARVIS_ACOUSTIC_THREADS in sound_detector.py), so when both are
+        # armed they set the same value and the cap holds either way. (STT is
+        # ctranslate2/GPU-offloaded, not torch.) <= 0 leaves torch's default.
         threads_note = "uncapped"
         if _YOLO_THREADS >= 1:
             try:

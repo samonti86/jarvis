@@ -113,6 +113,14 @@ def _env_set(name: str) -> set[str]:
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
 _DISABLED = _env_set("JARVIS_ACOUSTIC_DISABLE")  # per-class kill switch
 # Running-water volume floor. Below this RMS the class can't fire — keeps the
 # always-on pet fountain (a soft trickle, well below room speech levels) from
@@ -121,6 +129,16 @@ _DISABLED = _env_set("JARVIS_ACOUSTIC_DISABLE")  # per-class kill switch
 # first live test (the M44.1 lesson — guess loose, calibrate from a real
 # measurement). The other six classes ignore this floor.
 _RUNNING_WATER_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_WATER_RMS_FLOOR", 0.025)
+
+# Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
+# armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
+# uncapped torch inference pins all cores and starves the real-time audio
+# threads → `input overflow` → TTS stutter. set_num_threads is process-global;
+# when security is ALSO armed, YOLO sets it too (same value) — but acoustic can
+# run alone (the independent tray toggle / armed-while-home), so PANNs must cap
+# it independently. The old "YOLO is the only torch consumer" assumption in
+# security.py is FALSE since M58. <= 0 leaves torch's default (debug/parity).
+_TORCH_THREADS = _env_int("JARVIS_ACOUSTIC_THREADS", 1)
 
 
 # --- Per-class rules -------------------------------------------------------
@@ -345,12 +363,21 @@ class SoundDetector:
         discord_webhook_url: str = "",
         rules: tuple[ClassRule, ...] = _DEFAULT_RULES,
         device: int | None = None,
+        speaking_event: "threading.Event | None" = None,
     ) -> None:
         self._announce = announce
         self._discord = (discord_webhook_url or "").strip()
         # Honour the per-class kill switch at construction (reads env once).
         self._rules = tuple(r for r in rules if r.name not in _DISABLED)
         self._device = device              # sounddevice device index; None = default
+        # Cooperative speech gate (the 2026-05-19 post-mortem, extended to
+        # acoustic in this session). Set by the Announcer thread WHILE a
+        # proactive announce is playing. The inference worker SKIPS the heavy
+        # PANNs burst whenever this is set, so it never overlaps the Python-fed
+        # TTS path and stutters the announce — the same fix SecurityWatcher
+        # applies to its vision bursts. None → gate disabled (degrades to
+        # pre-fix behaviour; never breaks the loop).
+        self._speaking_event = speaking_event
         self._active = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -509,6 +536,19 @@ class SoundDetector:
             return False
         self._labels = list(labels)
 
+        # 2b. Cap torch's thread pool so a PANNs inference can't pin all cores
+        # and starve the real-time audio threads (see _TORCH_THREADS above).
+        # Process-global, but harmless if YOLO sets it again to the same value.
+        if _TORCH_THREADS >= 1:
+            try:
+                import torch  # type: ignore  # noqa: PLC0415
+                torch.set_num_threads(_TORCH_THREADS)
+                print(f"[acoustic] torch capped to {_TORCH_THREADS} thread(s)",
+                      file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 — never block on this
+                print(f"[acoustic] could not cap torch threads: {exc}",
+                      file=sys.stderr)
+
         # 3. Resolve aliases → model output indices. Case-insensitive match
         # against the labels list. An alias that doesn't match is logged
         # but not fatal — a rule with at least one match still works.
@@ -582,12 +622,27 @@ class SoundDetector:
     # Inference worker
     # ---------------------------------------------------------------------
 
+    def _is_announcing(self) -> bool:
+        """True while a proactive announce is on the wire. The cooperative
+        speech gate: the heavy PANNs inference must not overlap this (it
+        starves the Python-fed TTS path → audio stutter). None event → always
+        False, i.e. gate disabled, never breaks the loop."""
+        return self._speaking_event is not None and self._speaking_event.is_set()
+
     def _infer_loop(self) -> None:
         print("[acoustic] inference loop started", file=sys.stderr)
         while not self._stop.is_set() and self._active.is_set():
             try:
                 window = self._chunks.get(timeout=0.5)
             except queue.Empty:
+                continue
+            # Cooperative speech gate: while a proactive announce plays, DROP
+            # this window instead of classifying it — a PANNs inference burst
+            # overlapping the TTS path underruns the audio buffer and stutters
+            # the announce. We're "deaf" for the ~1-3 s an announce lasts, the
+            # same bounded tradeoff the security watcher accepts; the bounded
+            # input queue means we resume on recent audio, not a stale backlog.
+            if self._is_announcing():
                 continue
             try:
                 self._classify_window(window)

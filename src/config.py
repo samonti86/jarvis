@@ -43,6 +43,7 @@ class Config:
     tls_key_file: str          # M48.3 prereq — absolute path to the matching TLS private key. Same on/off semantics as tls_cert_file. Keep out of git.
     homelab_monitor_enabled: bool  # M56 — start the proactive homelab monitor at launch. Default off (opt-in via this flag or the tray toggle). Poll/threshold/disk tunables live in src/homelab_monitor.py.
     acoustic_monitor_enabled: bool  # M58 — start acoustic awareness at launch. Default off (opt-in via this flag or the tray toggle). Per-class kill switch + volume floor live in src/sound_detector.py.
+    mic_device: str            # Mic pin: a device-name substring (e.g. "MC1000") or an integer index. Blank = Windows default input. Resolved to an index at startup; both the main capture and acoustic awareness use it. For a dedicated Jarvis-only mic, pin by name so a USB re-enumeration / default-device change can't silently steal capture.
 
 
 def load() -> Config:
@@ -109,4 +110,10 @@ def load() -> Config:
             os.getenv("JARVIS_ACOUSTIC_MONITOR", "").strip().lower()
             in ("1", "true", "yes", "on")
         ),
+        # Mic device pin. Blank ⇒ Windows default (legacy behaviour). A name
+        # substring (case-insensitive, e.g. "MC1000") or an integer index pins
+        # capture to a specific input — the right call for a dedicated mic so
+        # it need not be the system default and a USB shuffle can't reroute
+        # Jarvis. Resolved to an index at startup (see audio.resolve_input_device).
+        mic_device=os.getenv("JARVIS_MIC_DEVICE", "").strip(),
     )
