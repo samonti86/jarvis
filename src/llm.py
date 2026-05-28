@@ -58,6 +58,8 @@ from src.outlook_calendar import GET_CALENDAR_TOOL, execute_calendar_tool
 from src.memory import SummaryRecord, format_summaries_for_prompt
 from src.news import NEWS_TOOL, execute_news_tool
 from src.briefing import BRIEFING_TOOL, execute_briefing_tool
+from src.good_night import GOOD_NIGHT_TOOL, execute_good_night_tool
+from src.self_update import UPDATE_JARVIS_TOOL, execute_update_jarvis
 from src.homelab_monitor import HOMELAB_STATUS_TOOL, execute_homelab_status
 from src.self_status import STATUS_REPORT_TOOL, execute_status_report
 from src.reminders import (
@@ -82,7 +84,12 @@ from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.pc_shell import PC_SHELL_TOOL, execute_pc_shell
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
-from src.tmdb import TMDB_TOOL, execute_tmdb_tool
+from src.tmdb import (
+    GET_PERSON_INFO_TOOL,
+    TMDB_TOOL,
+    execute_person_info_tool,
+    execute_tmdb_tool,
+)
 from src.weather import WEATHER_TOOL, execute_weather_tool
 
 
@@ -171,7 +178,20 @@ Live information (you have six tools — pick the right one):
    get_game_info — don't infer from training which they meant. NOTE: reference
    data only — it cannot see the user's personal Plex library, watchlist, or
    ratings. For what the user actually owns or is watching, use the Plex tools,
-   not this.
+   not this. For questions ABOUT A PERSON (actor, director, writer) — "what
+   has X been in", "what's X's next film", "what has X directed" — use
+   get_person_info (tool 4b), not this. This tool's `query` is a TITLE.
+4b. get_person_info — actor/director/writer filmography lookup. Use it for
+   "what has Pedro Pascal been in", "what's Tom Hanks's next movie", "what
+   films has Wes Anderson directed", "who is X" (as a person). Returns the
+   person's credits across film + TV, sorted most-recent-first. The
+   department param defaults to 'acting' which is right for "what has X
+   been in"; use 'directing' for "what has X directed", 'writing' for "what
+   has X written", 'all' if the user explicitly wants everything. Distinct
+   from get_movie_tv_info: that's TITLES, this is PEOPLE. For "who directed
+   X" or "who starred in X" (a question ABOUT a specific title's cast/crew)
+   call get_movie_tv_info with mode=details — the answer is in the credits
+   field of THAT title, not in the director's filmography.
 5. web_fetch — retrieves the full contents of a SPECIFIC URL or PDF. Use this when
    the user names a particular site or document ("check ESPN for Giants news", "what
    does IGN say about Super Mario", "summarize this PDF at <url>"). You may chain
@@ -331,13 +351,16 @@ Reminders & timers (three tools):
     seconds) or `at` (absolute ISO 8601 datetime — you know today's date).
     Recurring: set `repeat` instead (kind = interval / weekly / monthly — see
     the tool schema). `message` is the task itself, phrased to be spoken back.
-    Confirm briefly once it's set. **Scheduled briefings (M59):** if the user
-    asks to be briefed on a schedule — "brief me every weekday at 7", "set up a
-    morning briefing at 7am", "every day at 7 give me my briefing" — call
-    set_reminder with `action="briefing"` AND a `repeat` spec. That makes the
-    reminder TRIGGER the get_briefing composition at fire time instead of just
-    speaking `message`; use a short label like "morning briefing" for the
-    message itself. The user can list / cancel it like any reminder.
+    Confirm briefly once it's set. **Scheduled compositions (M59 + M63):**
+    if the user asks to be briefed on a schedule — "brief me every weekday at
+    7", "set up a morning briefing at 7am" — call set_reminder with
+    `action="briefing"` AND a `repeat` spec. For the evening equivalent —
+    "wrap me up every night at 10", "evening wrap every weeknight at 10pm",
+    "good night every night at 10" — use `action="good_night"` AND a `repeat`
+    spec. Either action makes the reminder TRIGGER the matching composition
+    tool at fire time instead of just speaking `message`; use a short label
+    like "morning briefing" or "good night" for the message itself. The user
+    can list / cancel it like any reminder.
 19. list_reminders — read back the user's pending reminders ("what reminders
     do I have?", "what am I meant to do later?").
 20. cancel_reminder — cancel a pending reminder, by `id` or by a `query`
@@ -345,7 +368,7 @@ Reminders & timers (three tools):
     directly when the user names it; call list_reminders first only if the
     query would be ambiguous.
 
-The morning briefing (one tool):
+The morning briefing + evening wrap (two composition tools):
 21. get_briefing — the user's composed "good morning" briefing: today's
     weather, sports and gaming headlines, overnight security events, and the
     reminders due today, all gathered in one call. Use it when the user says
@@ -358,9 +381,20 @@ The morning briefing (one tool):
     already includes today's weather, so do NOT also call get_weather for a
     briefing. Voice the result as a natural, concise briefing — greet them,
     a sentence or two per section; don't recite it verbatim.
+22. get_good_night — the user's composed "good night" wrap: current
+    security state, tomorrow's first event, the reminders queued for
+    tomorrow, and tomorrow's weather. The symmetric counterpart to
+    get_briefing — morning sets up the day, this closes it out. Use it when
+    the user says "good night", "wrap up the day", "my evening wrap", "end
+    of day", or "shut down for the night". Like get_briefing, ALWAYS call
+    this for such a request — EVERY time, never reply "I already wrapped
+    up". A wrap is a fresh-state request; re-run the tool. It already
+    includes tomorrow's weather, so do NOT also call get_weather for a
+    wrap. Voice it as a calm spoken wrap-up — greet warmly ("Good evening,
+    sir"), then a sentence or two per section; don't recite verbatim.
 
 Homelab monitoring (one tool):
-22. homelab_status — the live health of the user's homelab: whether the Plex
+23. homelab_status — the live health of the user's homelab: whether the Plex
     laptop is reachable, whether Plex Media Server is responding, and its disk
     space. Use it for "how's the homelab?", "is Plex up?", "is the Plex box
     okay?", "check the homelab". It probes everything fresh — like asking the
@@ -371,7 +405,7 @@ Homelab monitoring (one tool):
     plex_laptop_health instead — homelab_status is the quick up/down view.
 
 Self-status (one tool):
-23. status_report — Jarvis's OWN subsystem roll-call: security mode, acoustic
+24. status_report — Jarvis's OWN subsystem roll-call: security mode, acoustic
     awareness, homelab monitor, Plex MCP, Plex laptop SSH, remote console,
     STT backend, reminders queue, process memory, recent log errors. Use it
     for "Jarvis, status report", "are you healthy?", "what's the state of
@@ -383,7 +417,7 @@ Self-status (one tool):
     homelab_status, this is a fresh-state question — re-run every time.
 
 Outlook calendar (one tool):
-24. get_calendar_events — read events from the user's Outlook calendar
+25. get_calendar_events — read events from the user's Outlook calendar
     (personal Microsoft account, read-only). Use it for "what's on my
     calendar", "do I have anything later", "what's my next meeting", "am I
     free at 3pm", "what's tomorrow looking like". Pick `timeframe` based on
@@ -395,6 +429,21 @@ Outlook calendar (one tool):
     relay that plainly and do NOT fabricate events. The user cannot create
     or modify events through Jarvis — read-only by design; if they ask to
     schedule something, say so.
+
+Self-maintenance (one tool):
+26. update_jarvis — pull the latest code from the Jarvis git repository
+    and restart Jarvis. Use it when the user says "update yourself", "pull
+    the latest", "self-update", "check for updates", "are there any
+    updates". CONFIRMATION-GATED: call FIRST without `confirm` to get a
+    description of what will happen, relay that to the user as a question
+    ("Updating will pull and restart me — shall I proceed?"), and ONLY
+    call again with `confirm=true` after the user explicitly says yes.
+    If the working tree is dirty, the tool refuses and surfaces the
+    porcelain status; relay that plainly and stop — do NOT try to
+    stash/commit/clean (those are user decisions). If already up to date,
+    say so once and don't loop. On a successful pull, voice the
+    confirmation immediately — Jarvis restarts ~5 s later. Do NOT recite
+    individual commits / changed files; one sentence summary only.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -674,6 +723,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
+    "get_person_info":              _ClientTool(execute_person_info_tool, "tmdb_person"),
     "get_news":                     _ClientTool(execute_news_tool, "news"),
     "wolfram_query":                _ClientTool(execute_wolfram_tool, "wolfram"),
     "run_code":                     _ClientTool(execute_code_tool, "code"),
@@ -684,6 +734,8 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
     "cancel_reminder":              _ClientTool(execute_cancel_reminder, "reminder_cancel"),
     "get_briefing":                 _ClientTool(execute_briefing_tool, "briefing"),
+    "get_good_night":               _ClientTool(execute_good_night_tool, "good_night"),
+    "update_jarvis":                _ClientTool(execute_update_jarvis, "self_update"),
     "homelab_status":               _ClientTool(execute_homelab_status, "homelab"),
     "status_report":                _ClientTool(execute_status_report, "self_status"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
@@ -713,6 +765,12 @@ _RESTRICTED_DENY: frozenset[str] = frozenset({
     # phone-origin turn must never be able to make Jarvis run code at all —
     # the principle holds regardless of the isolation.
     "run_code",
+    # BLOCK — self-update (M64). The phone PWA must never be able to pull
+    # code into the user's machine + force a restart; that's the M48.2a
+    # least-privilege boundary at the most extreme (the update could be
+    # anything — a phone-driven self-update IS arbitrary code execution
+    # by another name).
+    "update_jarvis",
     # EXCLUDE — read-only but sensitive from a remote
     "read_local_file", "screen_snapshot", "camera_snapshot",
 })
@@ -841,11 +899,12 @@ def stream_response(
     ]
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
-        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL,
+        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL, GET_PERSON_INFO_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
         KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
-        BRIEFING_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
+        BRIEFING_TOOL, GOOD_NIGHT_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
+        UPDATE_JARVIS_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
         CAMERA_SNAPSHOT_TOOL, SCREEN_SNAPSHOT_TOOL,

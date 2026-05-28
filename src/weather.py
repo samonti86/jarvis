@@ -307,3 +307,38 @@ def execute_weather_tool(params: dict) -> str:
         return _format_forecast(data, place, units)
     # Default and explicit "current" both fall here.
     return _format_current(data, place, units)
+
+
+def tomorrow_forecast(location: str, units: str = "imperial") -> str:
+    """One-line text forecast for TOMORROW at `location`. Helper for the
+    M63 'good night' wrap — the morning briefing has `mode="today"`, this
+    is the symmetric tomorrow lookahead. Never raises; failure modes match
+    `execute_weather_tool` (location missing, unreachable, etc.)."""
+    units = (units or "imperial").lower().strip()
+    if units not in ("imperial", "metric"):
+        units = "imperial"
+    if not location:
+        return "Location is required for weather queries."
+    geocoded = _geocode(location)
+    if geocoded is None:
+        return f"Could not find a location matching '{location}'."
+    lat, lon, place = geocoded
+    # Reuse the existing 5-day forecast fetch and pull day index 1
+    # (index 0 is today). One round-trip; we discard the other days.
+    data = _fetch_forecast(lat, lon, units, "forecast")
+    if not data:
+        return f"Weather service unreachable for {place}."
+    daily = data.get("daily") or {}
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    codes = daily.get("weather_code") or []
+    pops = daily.get("precipitation_probability_max") or []
+    if len(highs) < 2 or len(lows) < 2:
+        return f"No tomorrow forecast data available for {place}."
+    u = _temp_unit(units)
+    phrase = _wmo_phrase(codes[1] if len(codes) > 1 else None)
+    out = (f"Tomorrow in {place}: high {round(highs[1])}{u}, "
+           f"low {round(lows[1])}{u}, {phrase}")
+    if len(pops) > 1 and pops[1] is not None and pops[1] > 0:
+        out += f", {int(pops[1])}% chance of precipitation"
+    return out + "."

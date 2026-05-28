@@ -473,3 +473,229 @@ def execute_tmdb_tool(params: dict) -> str:
     if mode == "similar":
         return _do_similar(query, key, media)
     return f"Unknown mode '{mode}'. Use search, details, popular, or similar."
+
+
+# --- M66 — get_person_info (sibling tool, same module) ---------------------
+# Companion to the title-centric tool above. Schemes are deliberately separate:
+# the title tool's `query` means "a title", a person tool's `name` means "a
+# person" — collapsing them into one polymorphic `query` would force Claude
+# to pick the right mode/medium every time. Two tools, one description each,
+# zero ambiguity in routing. Shares the module-level _api_key(), HTTP retry
+# helper, and never-raises contract.
+
+GET_PERSON_INFO_TOOL = {
+    "name": "get_person_info",
+    "description": (
+        "Look up an actor / director / writer / creator and their "
+        "filmography. Use this for 'what has Pedro Pascal been in', "
+        "'what's Tom Hanks's next movie', 'what films has Wes Anderson "
+        "directed', 'list X's TV shows', 'who is X' (as a person). "
+        "Returns the person's credits across film AND TV, sorted by "
+        "release date with the most recent first. Distinct from "
+        "get_movie_tv_info: that tool is for TITLES; this tool is for "
+        "PEOPLE. For 'who directed X' or 'who was in X' (a question "
+        "ABOUT a specific title's cast/crew) use get_movie_tv_info with "
+        "mode=details instead. Read the result back conversationally — "
+        "mention the highlight credits, don't recite every line."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The person's name. Required.",
+            },
+            "department": {
+                "type": "string",
+                "enum": ["acting", "directing", "writing", "all"],
+                "description": (
+                    "Filter the credits. 'acting' (default) = acting roles "
+                    "only — best for 'what has X been in'. 'directing' = "
+                    "directing credits — for 'what has X directed'. "
+                    "'writing' = writing credits. 'all' = everything they're "
+                    "credited on (mixes departments; use sparingly)."
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+
+# How many credits to render. Voice replies should be short — Claude
+# editorializes — but a working actor has dozens of credits and 8 lets
+# Claude pick a representative span.
+_MAX_PERSON_CREDITS = 8
+
+
+def _search_person(name: str, key: str) -> tuple[int, str] | None:
+    """Resolve a name to (tmdb_id, canonical_name) via the top /search/person
+    result. Returns None on no match or transport failure. Pre-sorts by
+    `popularity` since TMDB's search already does, but explicit is safer
+    if their default ever changes."""
+    r = _http_get_with_retry(
+        f"{_TMDB_BASE}/search/person",
+        params={"query": name, "page": 1, "api_key": key},
+    )
+    if r is None:
+        return None
+    try:
+        data = r.json()
+    except ValueError as exc:
+        print(f"[tmdb] person search JSON parse failed ({name}): {exc}",
+              file=sys.stderr)
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    # Sort by popularity desc so a famous "Tom Hanks" wins over a homonym.
+    results.sort(key=lambda p: p.get("popularity") or 0, reverse=True)
+    top = results[0]
+    tid = top.get("id")
+    canonical = top.get("name") or name
+    if tid is None:
+        return None
+    return (int(tid), canonical)
+
+
+def _credit_year(item: dict) -> str:
+    """TMDB credits carry `release_date` (movies) or `first_air_date` (TV).
+    Either may be empty for unreleased / TBA — render as 'TBA' in that case
+    so the sort stays stable. Returns the year only (4 chars) for terse
+    voice lines."""
+    raw = item.get("release_date") or item.get("first_air_date") or ""
+    return raw[:4] if raw else "TBA"
+
+
+def _credit_sort_key(item: dict) -> str:
+    """Sort key for credits — full release date so within-year ordering is
+    preserved. Empty dates (TBA) sort LAST when we reverse, which is
+    correct: "upcoming, no date set" reads better after the dated entries."""
+    return item.get("release_date") or item.get("first_air_date") or ""
+
+
+def _format_acting_credit(item: dict) -> str:
+    """'(2023) The Last of Us (TV) — as Joel'. The character is what makes
+    an actor's filmography legible — without it, a list of titles is just
+    titles."""
+    year = _credit_year(item)
+    title = _title(item)
+    label = _media_label(item)
+    role = (item.get("character") or "").strip()
+    base = f"({year}) {title} ({label})"
+    if role:
+        base += f" — as {role}"
+    return base
+
+
+def _format_crew_credit(item: dict) -> str:
+    """'(2024) The Phoenician Scheme (Movie) — Director'. Crew credits carry
+    a `job` (and a broader `department`); we surface the job, since 'Director'
+    or 'Writer' is what the user asked about."""
+    year = _credit_year(item)
+    title = _title(item)
+    label = _media_label(item)
+    job = (item.get("job") or "").strip()
+    base = f"({year}) {title} ({label})"
+    if job:
+        base += f" — {job}"
+    return base
+
+
+def _do_person(name: str, department: str, key: str) -> str:
+    """Two-hop: search → resolve top (id, canonical name) → fetch combined
+    credits → filter by department → format."""
+    resolved = _search_person(name, key)
+    if resolved is None:
+        return f"I couldn't find anyone named '{name}', sir."
+    pid, canonical = resolved
+
+    r = _http_get_with_retry(
+        f"{_TMDB_BASE}/person/{pid}/combined_credits",
+        params={"api_key": key},
+    )
+    if r is None:
+        return f"Filmography unavailable for {canonical}."
+    try:
+        data = r.json()
+    except ValueError:
+        return f"Filmography returned malformed data for {canonical}."
+
+    cast = data.get("cast") or []
+    crew = data.get("crew") or []
+
+    if department == "acting":
+        items = cast
+        formatter = _format_acting_credit
+        descriptor = "acting credits"
+    elif department == "directing":
+        items = [c for c in crew if (c.get("job") or "").lower() == "director"]
+        formatter = _format_crew_credit
+        descriptor = "directing credits"
+    elif department == "writing":
+        items = [c for c in crew
+                 if (c.get("department") or "").lower() == "writing"]
+        formatter = _format_crew_credit
+        descriptor = "writing credits"
+    else:  # "all"
+        # Tag each crew entry as such; cast stays first since acting is the
+        # most-asked-about department. De-duplicate by (title, year) so a
+        # film someone wrote+directed doesn't appear twice. Cast formatter
+        # used for cast, crew formatter for crew.
+        items = []
+        formatter = None  # we format per-item below to keep cast vs crew
+        descriptor = "credits"
+        seen: set[tuple] = set()
+        merged: list[tuple[str, dict]] = []
+        for c in cast:
+            key_t = (_title(c), _credit_year(c), "cast")
+            if key_t in seen:
+                continue
+            seen.add(key_t)
+            merged.append(("cast", c))
+        for c in crew:
+            key_t = (_title(c), _credit_year(c), c.get("job", ""))
+            if key_t in seen:
+                continue
+            seen.add(key_t)
+            merged.append(("crew", c))
+        merged.sort(key=lambda pair: _credit_sort_key(pair[1]), reverse=True)
+        if not merged:
+            return f"I couldn't find any credits for {canonical}, sir."
+        lines = [f"{canonical} — credits:"]
+        for kind, c in merged[:_MAX_PERSON_CREDITS]:
+            if kind == "cast":
+                lines.append("  - " + _format_acting_credit(c))
+            else:
+                lines.append("  - " + _format_crew_credit(c))
+        return "\n".join(lines)
+
+    if not items:
+        return (f"I couldn't find any {descriptor} for {canonical}, sir.")
+    items.sort(key=_credit_sort_key, reverse=True)
+    visible = items[:_MAX_PERSON_CREDITS]
+    lines = [f"{canonical} — {descriptor}:"]
+    for c in visible:
+        lines.append("  - " + formatter(c))
+    if len(items) > _MAX_PERSON_CREDITS:
+        lines.append(f"  - (+ {len(items) - _MAX_PERSON_CREDITS} more)")
+    return "\n".join(lines)
+
+
+def execute_person_info_tool(params: dict) -> str:
+    """Run the M66 person tool. Always returns a string for Claude — never
+    raises. Same shape as `execute_tmdb_tool`: key check, validate args,
+    dispatch, fail-soft strings throughout."""
+    key = _api_key()
+    if not key:
+        return (
+            "Person lookups require a TMDB API key. Set TMDB_API_KEY in "
+            ".env (get a free key at themoviedb.org/settings/api)."
+        )
+    name = (params.get("name") or "").strip()
+    if not name:
+        return "A person's name is required, sir."
+    department = (params.get("department") or "acting").lower().strip()
+    if department not in ("acting", "directing", "writing", "all"):
+        department = "acting"
+    return _do_person(name, department, key)

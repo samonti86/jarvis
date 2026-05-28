@@ -440,6 +440,19 @@ def today_events() -> tuple[list[CalendarEvent] | None, str]:
                          end_local.astimezone(timezone.utc))
 
 
+def fetch_events_in_window(
+    start_local: datetime, end_local: datetime,
+) -> tuple[list[CalendarEvent] | None, str]:
+    """Backend-agnostic event fetch in a LOCAL-time window. Wraps the
+    internal dispatcher (which speaks UTC) for callers — like the M62.2
+    proactive monitor — that think in wall-clock time. Returns the same
+    `(events|None, err_msg)` contract as the rest of this module."""
+    return _fetch_events(
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
+
+
 # --- Anthropic tool -------------------------------------------------------
 
 GET_CALENDAR_TOOL = {

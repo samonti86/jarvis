@@ -24,8 +24,8 @@ from src.reminders import (
 
 schema_props = SET_REMINDER_TOOL["input_schema"]["properties"]
 assert "action" in schema_props, "action field missing from schema"
-assert schema_props["action"]["enum"] == ["briefing"]
-print("schema: action field present, enum=[briefing]")
+assert schema_props["action"]["enum"] == ["briefing", "good_night"]
+print("schema: action field present, enum=[briefing, good_night]")
 
 rec = add("test briefing", datetime.now() + timedelta(seconds=3600),
           action="briefing")
@@ -40,7 +40,7 @@ assert _greeting_for(20) == "Good evening, sir."
 print("greeting: morning/afternoon/evening OK")
 
 res = execute_set_reminder({"message": "x", "delay_seconds": 10, "action": "xxx"})
-assert "xxx" in res and "briefing" in res, res
+assert "xxx" in res and "briefing" in res and "good_night" in res, res
 print(f"unknown action rejected: {res!r}")
 
 print("ALL OK")

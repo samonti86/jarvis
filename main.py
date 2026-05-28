@@ -1320,6 +1320,42 @@ def main() -> None:
         is_active=sound_detector.is_active,
     )
 
+    # M62.2 — pre-event proactive calendar reminders. Watches the Outlook
+    # calendar in the background and announces an event a fixed lead time
+    # (default 15 min) before it starts: "Sir — your 2 pm standup in 15
+    # minutes." The proactive layer on top of the M62 read tool — same
+    # reactive→proactive jump M56 made for the homelab. Constructed ALWAYS
+    # (so the status registration always has a target); activate() is a
+    # logged no-op when calendar isn't configured or the env kill switch is
+    # set. Unlike M56/M58 (default off, opt-in) this is DEFAULT ON when
+    # calendar is configured — the user already opted in by setting up
+    # OUTLOOK_ICAL_URL / OUTLOOK_CLIENT_ID, the proactive layer IS the
+    # value-add. Kill via JARVIS_CALENDAR_REMINDERS=0. Spoken alerts ride
+    # _announce (the WASAPI-safe Announcer path), tagged 📅 so they read
+    # distinctly from 🚨 / 🖥 / 🔔 / ⏰ in the console.
+    from src.calendar_monitor import CalendarMonitor
+    calendar_monitor = CalendarMonitor(
+        announce=lambda t: _announce(t, label="📅"),
+        discord_webhook_url=cfg.discord_webhook_url,
+    )
+    calendar_monitor.activate()  # internally a no-op when not configured / disabled
+
+    # M63 — "good night" wrap. Wire the security-state getter so the
+    # composition tool can report current armed/standing-down state without
+    # needing security_watcher threaded through stream_response. Same
+    # decoupling pattern as homelab_monitor's _set_active_monitor — the tool
+    # finds the live state through a module-level singleton.
+    from src.good_night import register_security_getter as _register_gn_security
+    _register_gn_security(security_watcher.is_armed)
+
+    # M64 — self-update tool. Wire the restart trigger so a successful
+    # `update_jarvis` (after the confirmation gate) can drive the standard
+    # M32 restart path. `ui._handle_restart` sets relaunch_mode + signals
+    # shutdown — the same thing the tray's "Restart Jarvis" click does.
+    # Same decoupling pattern as the security-getter above.
+    from src.self_update import register_restart_callback as _register_su_restart
+    _register_su_restart(ui._handle_restart)
+
     # M58 follow-up — couple acoustic awareness to security mode. The user's
     # mental model is "armed = away from home, where Jarvis should also be
     # listening for non-speech events"; this chains sound_detector.activate
@@ -1478,6 +1514,10 @@ def main() -> None:
                     f"backend={cfg.stt_backend}")
         return f"STT: local CPU only — backend={cfg.stt_backend}"
 
+    def _status_calendar() -> str:
+        return (f"Calendar reminders: "
+                f"{'active' if calendar_monitor.is_active() else 'off'}")
+
     def _status_reminders() -> str:
         from src.reminders import list_pending  # noqa: PLC0415 — lazy
         items = list_pending()
@@ -1502,6 +1542,7 @@ def main() -> None:
     _ss_register("Remote console", _status_remote)
     _ss_register("STT backend", _status_stt)
     _ss_register("Reminders", _status_reminders)
+    _ss_register("Calendar reminders", _status_calendar)
     _ss_register("Process memory", _status_memory)
     _ss_register("Log errors", _status_errors)
 
@@ -1532,6 +1573,10 @@ def main() -> None:
     # M58: stop acoustic awareness. Closes the InputStream + signals the
     # inference loop to exit. Daemon-threaded so this is just clean wind-down.
     sound_detector.shutdown()
+
+    # M62.2: stop the calendar reminder monitor. Daemon thread; the event
+    # lets it exit its poll-wait cleanly without log noise.
+    calendar_monitor.shutdown()
 
     # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
     # _announcer_loop so it can check the stop flag and exit cleanly,
@@ -1579,6 +1624,17 @@ def main() -> None:
     # this process still exits (acceptable "occasional sudo" UX).
     mode = ui.relaunch_mode
     if mode is not None:
+        # M65 — watchdog cooperation. When `jarvis_watchdog.pyw` is the
+        # parent process, it sets `JARVIS_WATCHDOG=1` in our env; on a
+        # NORMAL restart we exit with code 42 ("please respawn me") and
+        # let the watchdog handle the spawn. This keeps the watchdog as
+        # the sole spawner of main.py — if we ALSO spawned, two instances
+        # would race for the audio device. Elevated restart goes through
+        # ShellExecuteW("runas") regardless, since the watchdog can't
+        # spawn an elevated child; the elevated instance becomes
+        # un-watched (documented limitation, acceptable for "occasional
+        # sudo" UX). See [[project-m65-crash-watchdog]].
+        under_watchdog = os.environ.get("JARVIS_WATCHDOG", "").strip() == "1"
         try:
             from src import autostart
             if mode == "elevated":
@@ -1591,9 +1647,18 @@ def main() -> None:
                         "Jarvis will not restart",
                         file=sys.stderr,
                     )
-            else:  # "normal"
+                # Either way the watchdog should NOT respawn — the
+                # elevated child takes over (success) or the user
+                # cancelled (no relaunch wanted). Exit 0.
+            elif under_watchdog:
+                # The watchdog parent will see exit code 42 and respawn.
+                print("[main] under watchdog — exiting 42 for respawn")
+                sys.exit(42)
+            else:  # "normal", no watchdog
                 autostart.relaunch()
                 print("[main] relaunched detached Jarvis instance")
+        except SystemExit:
+            raise  # the sys.exit(42) path above; don't swallow it
         except Exception as exc:
             print(f"[main] relaunch failed: {exc}", file=sys.stderr)
 

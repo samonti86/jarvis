@@ -444,18 +444,23 @@ SET_REMINDER_TOOL = {
             },
             "action": {
                 "type": "string",
-                "enum": ["briefing"],
+                "enum": ["briefing", "good_night"],
                 "description": (
-                    "M59 — OPTIONAL. When set to 'briefing', the reminder "
-                    "TRIGGERS the morning briefing composition (weather + "
+                    "M59 + M63 — OPTIONAL. When set, the reminder TRIGGERS a "
+                    "composition tool at fire time instead of just speaking "
+                    "the `message` text. "
+                    "'briefing' fires the M55 MORNING briefing (weather + "
                     "sports / gaming news + overnight security events + "
-                    "today's reminders) instead of just speaking the "
-                    "`message` text. Use this for 'brief me every weekday at "
-                    "7am' / 'set up a scheduled morning briefing' / 'every "
-                    "morning at 7 give me the briefing'. `message` becomes a "
-                    "short label shown in list_reminders (e.g. 'morning "
-                    "briefing'). Combine with `repeat` to schedule a "
-                    "recurring briefing — the canonical use."
+                    "today's reminders) — use for 'brief me every weekday at "
+                    "7am' / 'every morning at 7 give me the briefing'. "
+                    "'good_night' fires the M63 EVENING wrap (security state + "
+                    "tomorrow's first event + tomorrow's reminders + "
+                    "tomorrow's weather) — use for 'wrap me up every night at "
+                    "10pm' / 'every weeknight at 10 give me the good night'. "
+                    "`message` becomes a short label shown in list_reminders "
+                    "(e.g. 'morning briefing' or 'good night'). Combine with "
+                    "`repeat` to schedule a recurring composition — the "
+                    "canonical use for both actions."
                 ),
             },
         },
@@ -511,13 +516,14 @@ def execute_set_reminder(params: dict) -> str:
     if len(message) > _MAX_MESSAGE_LEN:
         message = message[:_MAX_MESSAGE_LEN]
 
-    # M59 — optional action on fire. Currently only "briefing" is supported.
-    # Unknown values are rejected here (vs. silently stored) so a typo gives
-    # the user a clear error instead of a silent never-firing-as-expected.
+    # M59 + M63 — optional action on fire. Supported: "briefing" (M55
+    # morning composition), "good_night" (M63 evening wrap). Unknown values
+    # are rejected here (vs. silently stored) so a typo gives the user a
+    # clear error instead of a silent never-firing-as-expected.
     action = (params.get("action") or "").strip().lower() or None
-    if action and action not in {"briefing"}:
+    if action and action not in {"briefing", "good_night"}:
         return (f"I don't know the '{action}' action, sir — only "
-                f"'briefing' is supported right now.")
+                f"'briefing' and 'good_night' are supported right now.")
 
     # M54: a recurring reminder. The first occurrence is derived from the
     # recurrence itself, so delay_seconds/at are intentionally ignored here.
@@ -530,7 +536,7 @@ def execute_set_reminder(params: dict) -> str:
         if fire_at is None:
             return "I couldn't work out when that should recur, sir."
         rec = add(message, fire_at, repeat=spec, action=action)
-        kind_label = "briefing" if action == "briefing" else "reminder"
+        kind_label = _action_label(action, capitalised=False)
         return (
             f"Recurring {kind_label} set — \"{message}\", {_describe_repeat(spec)}. "
             f"First one at {_human_dt(fire_at)}. id: {rec['id']}."
@@ -567,7 +573,7 @@ def execute_set_reminder(params: dict) -> str:
         return "That's further out than I can schedule, sir."
 
     rec = add(message, fire_at, action=action)
-    kind_label = "Briefing" if action == "briefing" else "Reminder"
+    kind_label = _action_label(action, capitalised=True)
     return (
         f"{kind_label} set — \"{message}\" — will fire at "
         f"{_human_dt(fire_at)}. id: {rec['id']}."
@@ -585,10 +591,10 @@ def execute_list_reminders(params: dict) -> str:  # noqa: ARG001 — no params
         when = _human_dt(dt) if dt else r.get("fire_at", "unknown time")
         msg, rid = r.get("message", "?"), r.get("id", "?")
         repeat = r.get("repeat")
-        # M59: a briefing-action reminder gets a "(briefing)" tag so the user
-        # hears that this one COMPOSES + speaks the morning briefing instead
-        # of just speaking its message. The action ride along the rec verbatim.
-        action_tag = " (briefing)" if r.get("action") == "briefing" else ""
+        # M59 + M63: an action-tagged reminder gets a "(briefing)" or
+        # "(good night)" tag so the user hears that this one COMPOSES the
+        # named composition at fire time, not just speaks its message.
+        action_tag = _action_listing_tag(r.get("action"))
         if repeat:
             # M54: a recurring reminder — lead with the schedule, then the
             # next occurrence, so "what do I have" reads naturally.
@@ -661,29 +667,75 @@ def _greeting_for(hour: int) -> str:
     return "Good evening, sir."
 
 
-def _fire_briefing(rec: dict, announce: Callable[[str], None],
-                   now: datetime) -> None:
-    """M59 — a reminder with action='briefing' fires the M55 briefing
-    composition instead of speaking its static message. Runs on a throwaway
-    thread because the briefing composition fetches weather/news/etc. and
-    can take 5–10 s — we don't want to block the scheduler poll loop. The
+def _compose_briefing() -> str:
+    from src.briefing import execute_briefing_tool  # noqa: PLC0415 — lazy
+    return execute_briefing_tool({})
+
+
+def _compose_good_night() -> str:
+    from src.good_night import execute_good_night_tool  # noqa: PLC0415 — lazy
+    return execute_good_night_tool({})
+
+
+# Dispatch table for composition actions (M59 briefing, M63 good-night). Each
+# entry maps `action` → (composer, spoken-noun, listing-tag, "failed" phrase).
+# Adding a new composition (e.g. a "weekly review") is a one-line entry here
+# plus an entry in the set in `execute_set_reminder`. The structure scales.
+_COMPOSITION_ACTIONS: dict[str, tuple[Callable[[], str], str, str, str]] = {
+    "briefing":   (_compose_briefing,   "scheduled briefing", " (briefing)",
+                   "Sir, the scheduled briefing failed to compile."),
+    "good_night": (_compose_good_night, "evening wrap",       " (good night)",
+                   "Sir, the evening wrap failed to compile."),
+}
+
+
+def _action_label(action: str | None, *, capitalised: bool) -> str:
+    """Spoken noun for the set-reminder confirmation. Plain 'reminder' for
+    a no-action reminder; action-specific noun otherwise."""
+    if action in _COMPOSITION_ACTIONS:
+        noun = _COMPOSITION_ACTIONS[action][1]
+        return noun.capitalize() if capitalised else noun
+    return "Reminder" if capitalised else "reminder"
+
+
+def _action_listing_tag(action: str | None) -> str:
+    """Tag suffix for list_reminders ('(briefing)' / '(good night)' / '')."""
+    if action in _COMPOSITION_ACTIONS:
+        return _COMPOSITION_ACTIONS[action][2]
+    return ""
+
+
+def _fire_composition(rec: dict, announce: Callable[[str], None],
+                      now: datetime) -> None:
+    """M59 + M63 — a reminder with an action in _COMPOSITION_ACTIONS fires
+    that composition tool instead of speaking its static message. Runs on a
+    throwaway thread because composition fetches weather/news/etc. and can
+    take 5–10 s — we don't want to block the scheduler poll loop. The
     `_fire_text` path stays synchronous (cheap; just a string)."""
     rid = rec.get("id", "?")
+    action = rec.get("action") or ""
+    entry = _COMPOSITION_ACTIONS.get(action)
+    if entry is None:
+        # Shouldn't happen — caller checks the dispatch dict — but defensive:
+        # an unknown action degrades to the plain-text fire path so the user
+        # at least hears the reminder's message.
+        announce(_fire_text(rec, now))
+        return
+    composer, noun, _, failed_phrase = entry
 
     def _worker() -> None:
         try:
-            from src.briefing import execute_briefing_tool  # noqa: PLC0415 — lazy
-            text = execute_briefing_tool({})
+            text = composer()
         except Exception as exc:  # noqa: BLE001 — never propagate to the thread top
-            print(f"[reminders] briefing composition failed: {exc}",
+            print(f"[reminders] {action} composition failed: {exc}",
                   file=sys.stderr)
-            announce("Sir, the scheduled briefing failed to compile.")
+            announce(failed_phrase)
             return
         greeting = _greeting_for(now.hour)
-        announce(f"{greeting} Your scheduled briefing:\n\n{text}")
+        announce(f"{greeting} Your {noun}:\n\n{text}")
 
     threading.Thread(
-        target=_worker, name=f"BriefingFire-{rid}", daemon=True,
+        target=_worker, name=f"{action}-fire-{rid}", daemon=True,
     ).start()
 
 
@@ -698,10 +750,11 @@ def run_scheduler(
     Wrapped so a single bad poll can never kill the thread — a dead scheduler
     would silently drop every future reminder.
 
-    M59: a reminder with action='briefing' is dispatched via _fire_briefing
-    (on its own worker thread, since briefing composition takes 5–10 s);
-    the scheduler poll stays snappy. Plain reminders ride the synchronous
-    _fire_text path unchanged."""
+    M59 + M63: a reminder with an action in `_COMPOSITION_ACTIONS`
+    (briefing / good_night) is dispatched via `_fire_composition` on its
+    own worker thread, since composition takes 5–10 s; the scheduler poll
+    stays snappy. Plain reminders ride the synchronous _fire_text path
+    unchanged."""
     print("[reminders] scheduler thread started", file=sys.stderr)
     while not stop_event.is_set():
         try:
@@ -712,8 +765,8 @@ def run_scheduler(
                 print(f"[reminders] firing {rid}: "
                       f"{rec.get('message')} (action={action or '-'})",
                       file=sys.stderr)
-                if action == "briefing":
-                    _fire_briefing(rec, announce, now)
+                if action in _COMPOSITION_ACTIONS:
+                    _fire_composition(rec, announce, now)
                 else:
                     announce(_fire_text(rec, now))
         except Exception as exc:  # noqa: BLE001 — keep the thread alive
