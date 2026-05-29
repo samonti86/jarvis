@@ -15,9 +15,9 @@ entirely a recombination:
                          stop Event, every poll wrapped so a single bad fetch
                          can never kill the thread.
   - fetch              = outlook_calendar.fetch_events_in_window — the
-                         backend-agnostic dispatcher (iCal URL or Graph),
-                         called with a tight `[now, now+lead+5m]` window so
-                         we don't pull a full day every minute.
+                         published-iCal dispatcher, called with a tight
+                         `[now, now+lead+5m]` window so we don't pull a full
+                         day every minute.
   - voice out          = main.py's _announce (the WASAPI-safe Announcer
                          path), tagged 📅 so reminders read distinctly from
                          🚨 security / 🖥 homelab / 🔔 acoustic / ⏰ M53.
@@ -48,8 +48,8 @@ Configuration / defaults
 ------------------------
 Unlike M56 (homelab) and M58 (acoustic), this is DEFAULT ON when calendar is
 configured — because the user already opted in to calendar awareness by
-setting OUTLOOK_ICAL_URL or OUTLOOK_CLIENT_ID, and the proactive layer is
-the *whole point* of having it. Kill switch: `JARVIS_CALENDAR_REMINDERS=0`.
+setting OUTLOOK_ICAL_URL, and the proactive layer is the *whole point* of
+having it. Kill switch: `JARVIS_CALENDAR_REMINDERS=0`.
 
 Tunables (all env-knobs, read once at import):
   - JARVIS_CALENDAR_LEAD_MIN       — minutes before start to announce (15)
@@ -100,13 +100,10 @@ _DEDUPE_RETAIN_HOURS = 24
 # --- Configuration discovery ------------------------------------------------
 
 def _calendar_configured() -> bool:
-    """True if at least one calendar backend is set (iCal URL or Graph
-    client ID). Reads the env live so the monitor's activate() reflects the
-    current .env without re-importing outlook_calendar."""
-    return bool(
-        os.getenv("OUTLOOK_ICAL_URL", "").strip()
-        or os.getenv("OUTLOOK_CLIENT_ID", "").strip()
-    )
+    """True if the calendar is configured (published iCal URL). Reads the env
+    live so the monitor's activate() reflects the current .env without
+    re-importing outlook_calendar."""
+    return bool(os.getenv("OUTLOOK_ICAL_URL", "").strip())
 
 
 def _kill_switch_set() -> bool:
@@ -300,8 +297,8 @@ class CalendarMonitor:
                   file=sys.stderr)
             return
         if not _calendar_configured():
-            print("[calendar] no backend configured (set OUTLOOK_ICAL_URL or "
-                  "OUTLOOK_CLIENT_ID) — not starting", file=sys.stderr)
+            print("[calendar] not configured (set OUTLOOK_ICAL_URL) — "
+                  "not starting", file=sys.stderr)
             return
         self._active.set()
         self._stop.clear()
@@ -353,8 +350,8 @@ class CalendarMonitor:
 
     def _poll_once(self) -> None:
         # Lazy import — keeps src/calendar_monitor.py loadable on a fresh
-        # checkout before requirements.txt is installed (recurring-ical-
-        # events / msal might be missing; the fetch will report cleanly).
+        # checkout before requirements.txt is installed (recurring-ical-events
+        # might be missing; the fetch will report cleanly).
         from src.outlook_calendar import fetch_events_in_window  # noqa: PLC0415
 
         now_local = datetime.now().astimezone()

@@ -117,12 +117,12 @@ def _calendar_section() -> str:
     users' policy)."""
     try:
         from src.outlook_calendar import (  # noqa: PLC0415 — lazy
-            CLIENT_ID, ICAL_URL, fetch_events_in_window,
+            ICAL_URL, fetch_events_in_window,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[good_night] calendar import failed: {exc}", file=sys.stderr)
         return ""
-    if not (CLIENT_ID or ICAL_URL):
+    if not ICAL_URL:
         return ""
     try:
         now_local = datetime.now().astimezone()

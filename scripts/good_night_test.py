@@ -160,25 +160,19 @@ print("\n_calendar_section:")
 
 # Save + clear backend env so the test is independent of the user's setup.
 saved_ical = os.environ.pop("OUTLOOK_ICAL_URL", None)
-saved_cid = os.environ.pop("OUTLOOK_CLIENT_ID", None)
-# The outlook_calendar module reads these at IMPORT, so the constants are
-# already populated. We need to patch them on the module object.
+# The outlook_calendar module reads ICAL_URL at IMPORT, so the constant is
+# already populated. We patch it on the module object directly.
 from src import outlook_calendar  # noqa: E402
 saved_mod_ical = outlook_calendar.ICAL_URL
-saved_mod_cid = outlook_calendar.CLIENT_ID
 outlook_calendar.ICAL_URL = ""
-outlook_calendar.CLIENT_ID = ""
 
 out = _calendar_section()
 check("no calendar backend -> silent omit (empty string)", out == "")
 
-# Restore env + module constants.
+# Restore env + module constant.
 outlook_calendar.ICAL_URL = saved_mod_ical
-outlook_calendar.CLIENT_ID = saved_mod_cid
 if saved_ical is not None:
     os.environ["OUTLOOK_ICAL_URL"] = saved_ical
-if saved_cid is not None:
-    os.environ["OUTLOOK_CLIENT_ID"] = saved_cid
 
 
 # --- execute_good_night_tool: composes + never raises --------------------
@@ -189,7 +183,6 @@ print("\nexecute_good_night_tool:")
 for r in list(reminders.list_pending()):
     cancel(rid=r["id"])
 outlook_calendar.ICAL_URL = ""
-outlook_calendar.CLIENT_ID = ""
 # Force weather unconfigured so we don't hit the network in tests.
 saved_home = os.environ.pop("JARVIS_HOME_LOCATION", None)
 
