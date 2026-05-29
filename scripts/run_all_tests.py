@@ -16,9 +16,10 @@ picture, exit code reflects whether ANY failed):
 
 WHAT IT DELIBERATELY EXCLUDES:
   - leak_repro.py, barge_stutter_soak.py  -> long-running soaks (minutes/hours)
-  - outlook_auth.py                       -> interactive device-code OAuth
 These are instruments you reach for by hand, not gates. They're listed in
 _EXCLUDED so a future reader knows the omission is deliberate, not an oversight.
+(Note: _EXCLUDED only matters for files that DO end in `*_test.py`; other
+standalone scripts simply aren't globbed.)
 
 Each suite is run with THIS interpreter (sys.executable), so when you invoke
 it as `venv\Scripts\python.exe scripts\run_all_tests.py` the children inherit
@@ -40,7 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 
 # Standalone scripts that are NOT regression gates (see module docstring).
-_EXCLUDED = {"leak_repro.py", "barge_stutter_soak.py", "outlook_auth.py"}
+_EXCLUDED = {"leak_repro.py", "barge_stutter_soak.py"}
 
 # Per-suite hard timeout. Heavy suites import torch / sentence-transformers,
 # whose first import is slow but nowhere near this; a suite hitting this is hung.
@@ -89,6 +90,15 @@ def main() -> int:
     ]
     ok, out = _run("py_compile", [py, "-m", "py_compile", *compile_targets])
     results.append(("py_compile (syntax gate)", ok, out))
+
+    # --- Gate 1b: import main.py -----------------------------------------
+    # py_compile only checks syntax. `import main` additionally executes all
+    # module-level wiring (top-level imports + any import-time side effects)
+    # WITHOUT running main() (guarded by __main__). This is the cheapest net
+    # for a main.py refactor: a botched extraction that leaves a NameError or
+    # a broken import fails here loudly, and main() has no other test coverage.
+    ok, out = _run("import_main", [py, "-c", "import main"])
+    results.append(("import main (module-level wiring)", ok, out))
 
     # --- Gate 2: structural JS check on the PWA ---------------------------
     js_gate = SCRIPTS / "js_parse_gate.py"

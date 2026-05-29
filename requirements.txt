@@ -72,25 +72,15 @@ opencv-python-headless>=4.8
 # polling rate at <10% one-core utilization. MIT licensed.
 ultralytics>=8.4
 
-# Outlook calendar awareness (M62 + M62.1) — two backends, one tool surface.
+# Outlook calendar awareness (M62.1) — read-only, via published iCal URL.
+# recurring-ical-events does ICS parsing + RRULE recurrence expansion (the
+# client-side analog of Graph's /calendarView). Pulls icalendar + dateutil +
+# tzdata as transitive deps. Zero auth — Outlook.com's calendar-publishing
+# feature gives a secret .ics URL; Jarvis fetches it with httpx.
 #
-# M62 path (Microsoft Graph): msal handles the device-code OAuth flow
-# (one-time, via scripts/outlook_auth.py), token cache, silent refresh.
-# Pure Python; cryptography is its only notable transitive dep (already
-# pulled by paramiko M24). Requires a one-time Azure app registration
-# (~10 min user task).
-#
-# M62.1 path (published iCal URL): recurring-ical-events does ICS parsing +
-# RRULE recurrence expansion (the client-side analog of Graph's
-# /calendarView). Pulls icalendar + dateutil + tzdata as transitive deps.
-# Zero auth — Outlook.com's calendar-publishing feature gives a secret
-# .ics URL; Jarvis fetches it with httpx. This path was the M62.1 pivot
-# when the user's Microsoft Entra tenant was auto-suspended for inactivity,
-# blocking the Graph path's required Azure app registration.
-#
-# Either backend works — the dispatcher in src/outlook_calendar.py picks
-# iCal when set, falls back to Graph otherwise.
-msal>=1.30
+# (M62 originally also shipped a Microsoft Graph backend via `msal`; it was
+# removed in the 2026-05-29 QoL pass — unreachable on this machine because
+# the user's Entra tenant is suspended. Git history has it if ever needed.)
 recurring-ical-events>=3.0
 
 # Acoustic awareness (M58) — proactive ambient-sound detection. PANNs Cnn14

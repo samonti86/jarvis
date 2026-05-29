@@ -138,22 +138,20 @@ def _security_section() -> str:
 
 
 def _calendar_section() -> str:
-    """Today's Outlook calendar events (M62). Silently omitted when
-    OUTLOOK_CLIENT_ID isn't set — we don't want to nag a user who never
-    configured the integration. Configured-but-unauthorised / configured-
-    but-Graph-erroring states ARE surfaced so the user knows to re-auth
-    (silent failure here would mean a missed meeting)."""
+    """Today's Outlook calendar events (M62.1). Silently omitted when
+    OUTLOOK_ICAL_URL isn't set — we don't want to nag a user who never
+    configured the integration. Configured-but-erroring states ARE surfaced
+    so the user knows something's wrong (silent failure here would mean a
+    missed meeting)."""
     try:
         from src.outlook_calendar import (  # noqa: PLC0415 — lazy
-            CLIENT_ID, ICAL_URL, today_events,
+            ICAL_URL, today_events,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[briefing] calendar import failed: {exc}", file=sys.stderr)
         return ""
-    if not (CLIENT_ID or ICAL_URL):
-        # Silently omit when neither backend is configured. M62.1 added the
-        # iCal path — the original CLIENT_ID-only check would have silently
-        # skipped the section for users who configured iCal but not Graph.
+    if not ICAL_URL:
+        # Silently omit when the calendar isn't configured.
         return ""
     events, err = today_events()
     if err:

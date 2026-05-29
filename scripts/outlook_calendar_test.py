@@ -1,34 +1,27 @@
-"""Regression test for M62 Outlook calendar awareness.
+"""Regression test for M62.1 Outlook calendar awareness (iCal backend).
 
-Exercises everything that doesn't require a live Microsoft Graph round-trip:
-schema shape, the no-token-cached error path, timeframe → window resolution,
-Graph dict → CalendarEvent normalisation (handles fractional seconds, UTC
-conversion, missing fields), and the event formatter (empty / single /
-multi-event, all-day, with-and-without location).
+Exercises everything that doesn't require a live HTTP round-trip: schema
+shape, the unconfigured error path, timeframe → window resolution, the
+event formatter (empty / single / multi-event, all-day, with-and-without
+location), ICS parsing + RRULE expansion via icalendar /
+recurring-ical-events, and the dispatcher's configured/unconfigured branches.
 
-What it INTENTIONALLY does NOT test: the live Graph HTTP call (would need a
-test tenant + token) and the interactive MSAL device-code flow (manual by
-nature; that's `scripts/outlook_auth.py`'s job).
+What it INTENTIONALLY does NOT test: the live iCal HTTP fetch (would need a
+real published URL).
+
+(The Microsoft Graph backend was removed in the 2026-05-29 QoL pass; the
+former parse_graph_dt / _normalise / Graph-dispatcher tests went with it.)
 
     python scripts/outlook_calendar_test.py     # exit 0 = pass
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-# NB: outlook_calendar calls load_dotenv() at import and reads CLIENT_ID /
-# ICAL_URL at import time, so we can NOT achieve "unconfigured" by popping
-# the env var here — load_dotenv(override=False) repopulates a popped var
-# from the developer's real .env. The "unconfigured" tests below instead set
-# the module attributes (oc.CLIENT_ID / oc.ICAL_URL) directly, which the
-# dotenv load can't touch. (msal isn't needed unless we instantiate a client.)
-_OLD_CLIENT_ID = os.environ.pop("OUTLOOK_CLIENT_ID", None)
 
 from src import outlook_calendar as oc  # noqa: E402
 
@@ -57,23 +50,23 @@ check("schema: `timeframe` enum has the 4 expected values",
       set(props["timeframe"]["enum"]) == {"today", "tomorrow", "this_week", "next_24h"})
 
 
-# --- Test 2: neither backend configured -> voice-friendly setup msg ------
-# Force BOTH backends empty so this is deterministic regardless of the
-# developer's real .env (which may have a live OUTLOOK_ICAL_URL). This is the
-# same explicit-attr control the dispatcher's "neither configured" test uses.
-oc.CLIENT_ID = ""
+# --- Test 2: not configured -> voice-friendly setup msg ------------------
+# Force ICAL_URL empty so this is deterministic regardless of the developer's
+# real .env (which may have a live OUTLOOK_ICAL_URL). Setting the module attr
+# directly is immune to the import-time load_dotenv().
+_orig_url = oc.ICAL_URL
 oc.ICAL_URL = ""
 out = oc.execute_calendar_tool({"timeframe": "today"})
-check("neither backend configured -> tool says 'isn't configured'",
-      "configured" in out.lower() and "OUTLOOK_CLIENT_ID" in out)
+check("not configured -> tool says 'isn't configured' + names OUTLOOK_ICAL_URL",
+      "configured" in out.lower() and "OUTLOOK_ICAL_URL" in out)
 
 
 # --- Test 3: invalid timeframe is rejected with a voice-friendly error ---
-oc.CLIENT_ID = "dummy"  # bypass the not-configured branch for THIS test
+oc.ICAL_URL = "https://example.com/calendar.ics"  # bypass not-configured branch
 out = oc.execute_calendar_tool({"timeframe": "yesterday"})
 check("invalid timeframe -> voice-friendly error mentions valid options",
       "yesterday" in out and "today" in out and "tomorrow" in out)
-oc.CLIENT_ID = ""  # restore
+oc.ICAL_URL = _orig_url  # restore
 
 
 # --- Test 4: _window_for resolves each enum correctly ---------------------
@@ -101,59 +94,7 @@ check("_window_for('this_week') -> window of 1-7 days",
 check("_window_for('nonsense') -> None", oc._window_for("nonsense") is None)
 
 
-# --- Test 5: _parse_graph_dt handles Graph's quirky ISO formats ----------
-# Standard ISO with no TZ -> treated as UTC.
-dt = oc._parse_graph_dt("2026-05-26T13:30:00")
-check("parse_graph_dt naive ISO -> UTC-tagged datetime",
-      dt is not None and dt.tzinfo == timezone.utc and dt.hour == 13)
-
-# Trailing 'Z' for UTC.
-dt = oc._parse_graph_dt("2026-05-26T13:30:00Z")
-check("parse_graph_dt 'Z' suffix -> UTC", dt is not None and dt.tzinfo is not None)
-
-# Graph sometimes sends 7 fractional-second digits — Python's
-# fromisoformat handles 6 (microseconds) but Graph's ".0000000" can choke.
-dt = oc._parse_graph_dt("2026-05-26T13:30:00.0000000")
-check("parse_graph_dt fractional-second fallback handles Graph's '.0000000'",
-      dt is not None and dt.hour == 13)
-
-# Empty string -> None.
-check("parse_graph_dt empty string -> None", oc._parse_graph_dt("") is None)
-
-
-# --- Test 6: _normalise handles a typical Graph event ---------------------
-ev_dict = {
-    "subject": "Engineering standup",
-    "start": {"dateTime": "2026-05-26T13:30:00.0000000", "timeZone": "UTC"},
-    "end": {"dateTime": "2026-05-26T14:00:00.0000000", "timeZone": "UTC"},
-    "location": {"displayName": "Conference Room A"},
-    "isAllDay": False,
-}
-ev = oc._normalise(ev_dict)
-check("_normalise typical event -> CalendarEvent",
-      ev is not None
-      and ev.subject == "Engineering standup"
-      and ev.location == "Conference Room A"
-      and not ev.is_all_day)
-
-# Missing optional fields shouldn't crash.
-ev_min = oc._normalise({
-    "subject": "",
-    "start": {"dateTime": "2026-05-26T15:00:00"},
-    "end": {"dateTime": "2026-05-26T16:00:00"},
-})
-check("_normalise missing fields -> defaults applied",
-      ev_min is not None
-      and ev_min.subject == "(no subject)"
-      and ev_min.location == "")
-
-# Truly malformed -> None (logged + skipped).
-check("_normalise garbage -> None",
-      oc._normalise({"start": {"dateTime": "not-a-date"},
-                      "end": {"dateTime": "also-not"}}) is None)
-
-
-# --- Test 7: _format_events handles the various cases --------------------
+# --- Test 5: _format_events handles the various cases --------------------
 check("format empty -> 'Nothing on your calendar today, sir.'",
       "Nothing" in oc._format_events([], "today"))
 
@@ -194,9 +135,7 @@ check("format all-day event -> says 'all day'",
       "all day" in out.lower())
 
 
-# --- M62.1 — iCal backend + dispatcher precedence ------------------------
-
-# Test 8: _normalise_ical_event on a real icalendar VEVENT
+# --- Test 6: _normalise_ical_event on a real icalendar VEVENT ------------
 # (build the .ics in memory and let icalendar parse it — exercises the same
 # code path the live fetch does, minus the httpx round-trip).
 import icalendar  # noqa: E402
@@ -231,7 +170,7 @@ check("_normalise_ical_event: tz-aware datetimes returned",
       and ev.end_local.tzinfo is not None)
 
 
-# Test 9: an all-day event — Microsoft / icalendar use VALUE=DATE (no time)
+# --- Test 7: an all-day event — Microsoft / icalendar use VALUE=DATE ------
 ICS_ALLDAY = (
     "BEGIN:VCALENDAR\r\n"
     "PRODID:-//Test//EN\r\n"
@@ -253,7 +192,7 @@ check("_normalise_ical_event: all-day subject still parses",
       ev is not None and ev.subject == "Memorial Day holiday")
 
 
-# Test 10: recurring-ical-events expands RRULE into instances inside window
+# --- Test 8: recurring-ical-events expands RRULE into instances ----------
 import recurring_ical_events  # noqa: E402
 
 ICS_WEEKLY = (
@@ -282,74 +221,43 @@ check("all 4 expanded VEVENTs normalise cleanly",
       normalised_count == 4)
 
 
-# Test 11: dispatcher precedence — iCal wins when both configured
-# We mock _fetch_events_ical and _fetch_events_graph to verify which one
-# the dispatcher actually calls under each env combination.
-_ical_calls = []
-_graph_calls = []
+# --- Test 9: dispatcher branches (configured vs not) ---------------------
+# Mock _fetch_events_ical to verify the dispatcher routes to it when ICAL_URL
+# is set, and returns the setup message when it isn't.
+_ical_calls: list = []
+
 
 def _fake_ical(start, end):
     _ical_calls.append((start, end))
     return ([], "")
 
-def _fake_graph(start, end):
-    _graph_calls.append((start, end))
-    return ([], "")
 
 _orig_ical = oc._fetch_events_ical
-_orig_graph = oc._fetch_events_graph
 _orig_url = oc.ICAL_URL
-_orig_client_id = oc.CLIENT_ID
 oc._fetch_events_ical = _fake_ical
-oc._fetch_events_graph = _fake_graph
 try:
-    # (a) Both set ⇒ iCal wins
+    # (a) ICAL_URL set ⇒ iCal backend used
     oc.ICAL_URL = "https://example.com/calendar.ics"
-    oc.CLIENT_ID = "some-client-id"
-    _ical_calls.clear(); _graph_calls.clear()
+    _ical_calls.clear()
     oc._fetch_events(datetime.now(timezone.utc),
                      datetime.now(timezone.utc) + timedelta(hours=1))
-    check("dispatcher: both configured -> iCal wins",
-          len(_ical_calls) == 1 and len(_graph_calls) == 0)
+    check("dispatcher: ICAL_URL set -> iCal backend used",
+          len(_ical_calls) == 1)
 
-    # (b) Only Graph set ⇒ Graph used
+    # (b) ICAL_URL empty ⇒ voice-friendly setup message, backend not called
     oc.ICAL_URL = ""
-    oc.CLIENT_ID = "some-client-id"
-    _ical_calls.clear(); _graph_calls.clear()
-    oc._fetch_events(datetime.now(timezone.utc),
-                     datetime.now(timezone.utc) + timedelta(hours=1))
-    check("dispatcher: only CLIENT_ID -> Graph used",
-          len(_ical_calls) == 0 and len(_graph_calls) == 1)
-
-    # (c) Only iCal set ⇒ iCal used
-    oc.ICAL_URL = "https://example.com/calendar.ics"
-    oc.CLIENT_ID = ""
-    _ical_calls.clear(); _graph_calls.clear()
-    oc._fetch_events(datetime.now(timezone.utc),
-                     datetime.now(timezone.utc) + timedelta(hours=1))
-    check("dispatcher: only ICAL_URL -> iCal used",
-          len(_ical_calls) == 1 and len(_graph_calls) == 0)
-
-    # (d) Neither set ⇒ voice-friendly setup message
-    oc.ICAL_URL = ""
-    oc.CLIENT_ID = ""
+    _ical_calls.clear()
     events, err = oc._fetch_events(datetime.now(timezone.utc),
                                    datetime.now(timezone.utc) + timedelta(hours=1))
-    check("dispatcher: neither configured -> setup message",
+    check("dispatcher: not configured -> setup message, backend not called",
           events is None
           and "OUTLOOK_ICAL_URL" in err
-          and "OUTLOOK_CLIENT_ID" in err)
+          and len(_ical_calls) == 0)
 finally:
     oc._fetch_events_ical = _orig_ical
-    oc._fetch_events_graph = _orig_graph
     oc.ICAL_URL = _orig_url
-    oc.CLIENT_ID = _orig_client_id
 
 
 # --- summary --------------------------------------------------------------
-# Restore env state so subsequent imports in the same session see the
-# original value.
-if _OLD_CLIENT_ID is not None:
-    os.environ["OUTLOOK_CLIENT_ID"] = _OLD_CLIENT_ID
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)

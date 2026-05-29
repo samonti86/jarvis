@@ -41,7 +41,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from src.audio import AudioSession, resolve_input_device
 from src.config import Config, load
@@ -1016,6 +1016,363 @@ def _try_connect_plex_laptop(cfg: Config) -> PlexLaptopClient | None:
     return client
 
 
+class _Announcer(NamedTuple):
+    """Handle returned by _build_announcer: the public announce fn, the
+    cooperative speech-gate Event, and a shutdown callable."""
+    announce: "Callable[..., None]"
+    speaking_event: threading.Event
+    shutdown: "Callable[[], None]"
+
+
+def _build_announcer(ui: JarvisUI) -> _Announcer:
+    """Construct the dedicated proactive-speech subsystem (M34).
+
+    Speech is marshaled through a single dedicated Announcer thread because
+    sd.play() on Windows WASAPI silently no-ops when called from worker
+    threads that haven't previously played audio (the SecurityWatcher thread
+    hits this exact case). Pinning all sd.play() calls to one thread sidesteps
+    it — see the project_wasapi_thread_audio_owner memory.
+
+    Returns an _Announcer with `announce(text, on_done=None, label="🚨")` (the
+    non-blocking entry every proactive caller uses), `speaking_event` (the
+    cooperative speech gate the SecurityWatcher + SoundDetector defer their
+    heavy CPU bursts against), and `shutdown()` for the wind-down sequence.
+    """
+    # Queue items are (text, on_done, label) tuples; on_done fires after
+    # playback so callers can defer state until the user has actually heard
+    # the prompt (SecurityWatcher's 15s challenge timer uses this); label is
+    # the console emoji tag (🚨 alert / ⏰ reminder). maxsize caps memory
+    # growth if TTS wedges + announces pile up.
+    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None, str] | None] = (
+        queue.Queue(maxsize=16)
+    )
+    announce_stop = threading.Event()
+    # Set WHILE a proactive announce is actually playing. The SecurityWatcher
+    # reads this to defer its heavy vision bursts (camera grab, YOLO + the
+    # per-tick gc.collect, face encode) so they never overlap speech — the
+    # cooperative speech gate that fixes the armed-only TTS stutter
+    # (diagnosed 2026-05-19: any GIL/CPU burst overlapping the Python-fed
+    # TTS path underruns the audio buffer). Owned by the Announcer thread.
+    announce_speaking = threading.Event()
+
+    def _announcer_loop() -> None:
+        """Dedicated proactive-speech thread (see docstring above for why).
+
+        Each queued item is (text, on_done, label). on_done is fired in
+        `finally` after playback so it runs even if TTS itself failed — a
+        failed announce shouldn't strand the caller's state machine."""
+        print("[announcer] worker thread started", file=sys.stderr)
+        while not announce_stop.is_set():
+            item = announce_queue.get()
+            if item is None or announce_stop.is_set():
+                break
+            text, on_done, label = item
+            print(f"[announce] {text}")
+            ui.add_system_text(f"{label} {text}")
+            # Bracket actual playback so the watcher's cooperative gate
+            # (security._is_announcing) defers heavy bursts for exactly the
+            # window speech is on the wire. Cleared in finally so a TTS
+            # failure can't leave the watcher permanently throttled.
+            announce_speaking.set()
+            try:
+                speak_streaming(
+                    iter([text]),
+                    "en",
+                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                    on_amplitude=ui.set_amplitude,
+                )
+            except Exception as exc:
+                print(f"[announce] TTS failed: {exc}", file=sys.stderr)
+            finally:
+                announce_speaking.clear()
+                ui.set_state(State.IDLE)
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception as exc:
+                        print(f"[announce] on_done callback raised: {exc}", file=sys.stderr)
+        print("[announcer] worker thread exited", file=sys.stderr)
+
+    threading.Thread(
+        target=_announcer_loop, name="Announcer", daemon=True
+    ).start()
+
+    def _announce(
+        text: str,
+        on_done: Callable[[], None] | None = None,
+        label: str = "🚨",
+    ) -> None:
+        """Public entry: enqueue a proactive announcement. Non-blocking —
+        returns immediately and the Announcer thread plays it. Bypasses
+        the mute check (security alerts override quiet mode by design).
+        Multiple announcements queue FIFO so they don't overlap.
+
+        on_done (optional) fires AFTER the playback completes (or fails) —
+        used by SecurityWatcher's challenge path to defer the 15s timer
+        start until the user has actually heard the prompt, otherwise
+        prompt-playback time eats into the response budget.
+
+        label (optional) tags the console line — 🚨 for the default
+        (security) announce, ⏰ for an M53 reminder firing."""
+        if not text:
+            return
+        try:
+            announce_queue.put_nowait((text, on_done, label))
+        except queue.Full:
+            # Queue is wedged (TTS playback stuck?). Log + drop newest so
+            # callers don't block. on_done won't fire — callers using it
+            # for timing must handle a None return, but currently the only
+            # caller is SecurityWatcher's challenge path which has its
+            # own defensive immediate-arm fallback.
+            print(
+                f"[announce] queue full (TTS wedged?) — dropping: {text!r}",
+                file=sys.stderr,
+            )
+
+    def _shutdown() -> None:
+        # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
+        # _announcer_loop so it can check the stop flag and exit cleanly,
+        # instead of being killed mid-playback as a daemon.
+        announce_stop.set()
+        # Non-blocking: announce_stop already guarantees the loop exits on its
+        # next iteration; the sentinel only needs to wake a *blocked* get(), and
+        # a full queue (maxsize 16) means get() ISN'T blocked. A plain blocking
+        # put() here could hang shutdown forever if the queue is full and TTS is
+        # wedged in speak_streaming — the case _announce already guards with
+        # put_nowait.
+        try:
+            announce_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    return _Announcer(_announce, announce_speaking, _shutdown)
+
+
+def _build_remote_console(cfg: Config, ui: JarvisUI, security_watcher) -> object | None:
+    """M48.1 LAN remote console. Returns the started RemoteConsoleServer, or
+    None when disabled (no token) or on any startup failure.
+
+    Gated on the token — blank ⇒ the server is NEVER constructed (a surface
+    that can disarm security must not exist unless deliberately configured
+    with a secret; [[feedback-jarvis-least-privilege]]). on_control is wired
+    here (SecurityWatcher is in scope); on_text is wired later in listen_loop
+    once the text_queue exists. Optional + defensive: a failure to start logs
+    and returns None — never blocks the assistant."""
+    if not cfg.remote_token:
+        print("[remote] JARVIS_REMOTE_TOKEN unset — remote console disabled",
+              file=sys.stderr)
+        return None
+
+    def _remote_control(action: str) -> dict:
+        try:
+            if action == "arm":
+                security_watcher.activate()
+            elif action == "disarm":
+                security_watcher.deactivate()
+            # "status" is read-only — just report below.
+        except Exception as exc:  # noqa: BLE001 — never break on a remote ask
+            print(f"[remote] control {action!r} failed: {exc}", file=sys.stderr)
+        return {"armed": bool(security_watcher.is_armed())}
+
+    try:
+        # Import is INSIDE the try: a missing `websockets` (or any
+        # import error in remote_console/remote_pwa) must degrade to
+        # "no remote console", never an unhandled ImportError that
+        # breaks startup — the project's optional-component contract.
+        import ssl as _ssl  # noqa: PLC0415 — lazy: only needed when TLS configured
+        from src.remote_console import RemoteConsoleServer  # noqa: PLC0415
+
+        # M48.3 prereq — opportunistic TLS: build an SSLContext ONLY if
+        # both .env paths are set AND both files exist on disk. Either
+        # missing or unreadable ⇒ log loudly and fall back to plain
+        # HTTP/WS (LAN-mode dev path). A misconfigured cert MUST NOT
+        # crash Jarvis — same optional-component contract as the rest of
+        # the remote console. Stays defensively quiet about secret
+        # values: only the *paths* (not contents) ever reach the log.
+        ssl_ctx = None
+        cf, kf = cfg.tls_cert_file, cfg.tls_key_file
+        if cf or kf:
+            if not (cf and kf):
+                print(
+                    "[remote] TLS half-configured (only one of "
+                    "JARVIS_TLS_CERT_FILE/JARVIS_TLS_KEY_FILE set) — "
+                    "falling back to plain HTTP/WS",
+                    file=sys.stderr,
+                )
+            elif not (os.path.isfile(cf) and os.path.isfile(kf)):
+                print(
+                    f"[remote] TLS files not found "
+                    f"(cert={cf!r}, key={kf!r}) — falling back to "
+                    f"plain HTTP/WS",
+                    file=sys.stderr,
+                )
+            else:
+                try:
+                    ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+                    ssl_ctx.load_cert_chain(certfile=cf, keyfile=kf)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[remote] TLS load failed ({exc!r}) — "
+                        f"falling back to plain HTTP/WS",
+                        file=sys.stderr,
+                    )
+                    ssl_ctx = None
+
+        remote_server = RemoteConsoleServer(
+            token=cfg.remote_token,
+            host=cfg.remote_bind,
+            port=cfg.remote_port,
+            on_control=_remote_control,
+            ssl_context=ssl_ctx,
+        )
+        ui.set_remote(remote_server)
+        remote_server.start()
+        return remote_server
+    except Exception as exc:  # noqa: BLE001 — optional; must not block startup
+        print(f"[remote] failed to start (continuing without it): {exc}",
+              file=sys.stderr)
+        return None
+
+
+def _register_status(
+    cfg: Config, security_watcher, sound_detector, homelab_monitor,
+    plex_client, plex_laptop_client, remote_server, calendar_monitor,
+) -> None:
+    """M60 — self-status registry. Each subsystem reports a one-line status
+    via the `status_report` tool ("Jarvis, are you healthy?"). Order is
+    display order in the report. Last-write-wins on a re-register. Cheap —
+    the getters only run when status_report is called, not on every turn."""
+    from src.self_status import (
+        count_session_errors as _ss_errors,
+        process_private_mb as _ss_mem,
+        register as _ss_register,
+    )
+
+    def _status_security() -> str:
+        if security_watcher.is_locked():
+            return "Security: LOCKED (post-deterrent — awaiting passphrase)"
+        if security_watcher.is_armed():
+            return "Security: ARMED"
+        return "Security: standing down"
+
+    def _status_acoustic() -> str:
+        return (f"Acoustic awareness: "
+                f"{'active' if sound_detector.is_active() else 'off'}")
+
+    def _status_homelab() -> str:
+        return (f"Homelab monitor: "
+                f"{'active' if homelab_monitor.is_active() else 'off'}")
+
+    def _status_plex_mcp() -> str:
+        if plex_client is None:
+            return "Plex MCP: unavailable"
+        try:
+            n: object = len(plex_client.tool_names)
+        except Exception:
+            n = "?"
+        return f"Plex MCP: connected ({n} tools)"
+
+    def _status_plex_laptop() -> str:
+        if plex_laptop_client is None:
+            return "Plex laptop SSH: unconfigured"
+        return f"Plex laptop SSH: configured ({cfg.plex_laptop_host})"
+
+    def _status_remote() -> str:
+        if remote_server is None:
+            return "Remote console: off"
+        tls = bool(cfg.tls_cert_file and cfg.tls_key_file)
+        proto = "HTTPS/WSS" if tls else "HTTP/WS"
+        return f"Remote console: listening on port {cfg.remote_port} ({proto})"
+
+    def _status_stt() -> str:
+        if cfg.stt_server_url:
+            return (f"STT: GPU server ({cfg.stt_server_url}) — "
+                    f"backend={cfg.stt_backend}")
+        return f"STT: local CPU only — backend={cfg.stt_backend}"
+
+    def _status_calendar() -> str:
+        return (f"Calendar reminders: "
+                f"{'active' if calendar_monitor.is_active() else 'off'}")
+
+    def _status_reminders() -> str:
+        from src.reminders import list_pending  # noqa: PLC0415 — lazy
+        items = list_pending()
+        n = len(items)
+        briefings = sum(1 for r in items if r.get("action") == "briefing")
+        if briefings:
+            return f"Reminders: {n} pending ({briefings} scheduled briefing(s))"
+        return f"Reminders: {n} pending"
+
+    def _status_memory() -> str:
+        return f"Process memory: {_ss_mem():.0f} MB private bytes"
+
+    def _status_errors() -> str:
+        n, ctx = _ss_errors()
+        return f"Log errors: {n} concerning lines ({ctx})"
+
+    _ss_register("Security", _status_security)
+    _ss_register("Acoustic awareness", _status_acoustic)
+    _ss_register("Homelab monitor", _status_homelab)
+    _ss_register("Plex MCP", _status_plex_mcp)
+    _ss_register("Plex laptop", _status_plex_laptop)
+    _ss_register("Remote console", _status_remote)
+    _ss_register("STT backend", _status_stt)
+    _ss_register("Reminders", _status_reminders)
+    _ss_register("Calendar reminders", _status_calendar)
+    _ss_register("Process memory", _status_memory)
+    _ss_register("Log errors", _status_errors)
+
+
+def _shutdown_subsystems(
+    *, security_watcher, homelab_monitor, sound_detector, calendar_monitor,
+    announcer: _Announcer, reminder_stop: threading.Event,
+    worker: threading.Thread, plex_client, plex_laptop_client,
+) -> None:
+    """Wind down all background subsystems in order, join the listen loop (so
+    it seals the active session to disk), then close the Plex connections.
+    Does NOT handle relaunch — that's control flow (sys.exit) and stays in
+    main(). Every daemon thread dies with the process regardless; the explicit
+    shutdowns let in-flight work finish cleanly without log noise."""
+    # M34: signal the security watcher to wind down.
+    security_watcher.shutdown()
+    # M56: stop the homelab monitor's poll loop.
+    homelab_monitor.shutdown()
+    # M58: stop acoustic awareness (closes the InputStream + inference loop).
+    sound_detector.shutdown()
+    # M62.2: stop the calendar reminder monitor.
+    calendar_monitor.shutdown()
+    # M34: stop the Announcer thread (sets stop + wakes its blocked get()).
+    announcer.shutdown()
+    # M53: stop the reminder scheduler.
+    reminder_stop.set()
+
+    # Give listen_loop time to see the shutdown event, exit its loop cleanly,
+    # and run its try/finally — which seals the active session to disk. Worst
+    # case: user quit mid-recording and we wait up to ~15s for max-recording
+    # to time out, then a summarize call. M16 hardening: bumped from 20s → 30s
+    # so the summarize round-trip (capped at 8s in memory.py, no SDK retries)
+    # plus any tail TTS playback comfortably fits before we give up.
+    worker.join(timeout=30.0)
+    if worker.is_alive():
+        print("[main] listen_loop didn't exit in time — session may not be sealed", file=sys.stderr)
+
+    # M21: clean up MCP subprocess. Done after worker.join so any in-flight
+    # tool call inside listen_loop has a chance to complete first.
+    if plex_client is not None:
+        try:
+            plex_client.close()
+        except Exception as exc:
+            print(f"[plex-mcp] close failed: {exc}", file=sys.stderr)
+
+    # M24: tear down the persistent SSH connection. Idempotent + non-blocking;
+    # paramiko handles the channel cleanup internally.
+    if plex_laptop_client is not None:
+        try:
+            plex_laptop_client.close()
+        except Exception as exc:
+            print(f"[plex-laptop] close failed: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     log_path = setup_logging()
 
@@ -1066,105 +1423,18 @@ def main() -> None:
     ui.set_integration("plex", plex_client is not None)
     ui.set_integration("laptop", plex_laptop_client is not None)
 
-    # SecurityWatcher with a proactive-speech callback. Speech is marshaled
-    # through a single dedicated Announcer thread because sd.play() on
-    # Windows WASAPI silently no-ops when called from worker threads that
-    # haven't previously played audio (the SecurityWatcher thread hits this
-    # exact case). Pinning all sd.play() calls to one thread sidesteps it.
+    # SecurityWatcher is constructed below; import it here (lazy — heavy
+    # transitive deps via ultralytics/cv2).
     from src.security import SecurityWatcher
-    from src.text_to_speech import speak_streaming
 
-    # Queue items are (text, on_done, label) tuples; on_done fires after
-    # playback so callers can defer state until the user has actually heard
-    # the prompt (SecurityWatcher's 15s challenge timer uses this); label is
-    # the console emoji tag (🚨 alert / ⏰ reminder). maxsize caps memory
-    # growth if TTS wedges + announces pile up.
-    announce_queue: queue.Queue[tuple[str, Callable[[], None] | None, str] | None] = (
-        queue.Queue(maxsize=16)
-    )
-    announce_stop = threading.Event()
-    # Set WHILE a proactive announce is actually playing. The SecurityWatcher
-    # reads this to defer its heavy vision bursts (camera grab, YOLO + the
-    # per-tick gc.collect, face encode) so they never overlap speech — the
-    # cooperative speech gate that fixes the armed-only TTS stutter
-    # (diagnosed 2026-05-19: any GIL/CPU burst overlapping the Python-fed
-    # TTS path underruns the audio buffer). Owned by the Announcer thread.
-    announce_speaking = threading.Event()
-
-    def _announcer_loop() -> None:
-        """Dedicated proactive-speech thread (see comment above for why).
-
-        Each queued item is (text, on_done, label). on_done is fired in
-        `finally` after playback so it runs even if TTS itself failed — a
-        failed announce shouldn't strand the caller's state machine."""
-        print("[announcer] worker thread started", file=sys.stderr)
-        while not announce_stop.is_set():
-            item = announce_queue.get()
-            if item is None or announce_stop.is_set():
-                break
-            text, on_done, label = item
-            print(f"[announce] {text}")
-            ui.add_system_text(f"{label} {text}")
-            # Bracket actual playback so the watcher's cooperative gate
-            # (security._is_announcing) defers heavy bursts for exactly the
-            # window speech is on the wire. Cleared in finally so a TTS
-            # failure can't leave the watcher permanently throttled.
-            announce_speaking.set()
-            try:
-                speak_streaming(
-                    iter([text]),
-                    "en",
-                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                    on_amplitude=ui.set_amplitude,
-                )
-            except Exception as exc:
-                print(f"[announce] TTS failed: {exc}", file=sys.stderr)
-            finally:
-                announce_speaking.clear()
-                ui.set_state(State.IDLE)
-                if on_done is not None:
-                    try:
-                        on_done()
-                    except Exception as exc:
-                        print(f"[announce] on_done callback raised: {exc}", file=sys.stderr)
-        print("[announcer] worker thread exited", file=sys.stderr)
-
-    announcer_thread = threading.Thread(
-        target=_announcer_loop, name="Announcer", daemon=True
-    )
-    announcer_thread.start()
-
-    def _announce(
-        text: str,
-        on_done: Callable[[], None] | None = None,
-        label: str = "🚨",
-    ) -> None:
-        """Public entry: enqueue a proactive announcement. Non-blocking —
-        returns immediately and the Announcer thread plays it. Bypasses
-        the mute check (security alerts override quiet mode by design).
-        Multiple announcements queue FIFO so they don't overlap.
-
-        on_done (optional) fires AFTER the playback completes (or fails) —
-        used by SecurityWatcher's challenge path to defer the 15s timer
-        start until the user has actually heard the prompt, otherwise
-        prompt-playback time eats into the response budget.
-
-        label (optional) tags the console line — 🚨 for the default
-        (security) announce, ⏰ for an M53 reminder firing."""
-        if not text:
-            return
-        try:
-            announce_queue.put_nowait((text, on_done, label))
-        except queue.Full:
-            # Queue is wedged (TTS playback stuck?). Log + drop newest so
-            # callers don't block. on_done won't fire — callers using it
-            # for timing must handle a None return, but currently the only
-            # caller is SecurityWatcher's challenge path which has its
-            # own defensive immediate-arm fallback.
-            print(
-                f"[announce] queue full (TTS wedged?) — dropping: {text!r}",
-                file=sys.stderr,
-            )
+    # Proactive-speech subsystem: a dedicated WASAPI-safe Announcer thread.
+    # _build_announcer returns the non-blocking announce() entry every
+    # proactive caller uses, the cooperative speech-gate Event (the
+    # SecurityWatcher + SoundDetector defer heavy CPU bursts against it), and
+    # a shutdown() callable for the wind-down. See _build_announcer.
+    _ann = _build_announcer(ui)
+    _announce = _ann.announce
+    announce_speaking = _ann.speaking_event
 
     # M53: reminders & timers. The scheduler thread polls reminders.json and
     # fires due reminders through _announce — a reminder is a proactive
@@ -1341,7 +1611,7 @@ def main() -> None:
     # logged no-op when calendar isn't configured or the env kill switch is
     # set. Unlike M56/M58 (default off, opt-in) this is DEFAULT ON when
     # calendar is configured — the user already opted in by setting up
-    # OUTLOOK_ICAL_URL / OUTLOOK_CLIENT_ID, the proactive layer IS the
+    # OUTLOOK_ICAL_URL, the proactive layer IS the
     # value-add. Kill via JARVIS_CALENDAR_REMINDERS=0. Spoken alerts ride
     # _announce (the WASAPI-safe Announcer path), tagged 📅 so they read
     # distinctly from 🚨 / 🖥 / 🔔 / ⏰ in the console.
@@ -1388,174 +1658,17 @@ def main() -> None:
                   file=sys.stderr)
     security_watcher.set_on_armed_changed(_security_armed_changed)
 
-    # M48.1: LAN remote console. Gated on the token — blank ⇒ the server is
-    # NEVER constructed (a surface that can disarm security must not exist
-    # unless deliberately configured with a secret;
-    # [[feedback-jarvis-least-privilege]]). on_control is wired here
-    # (SecurityWatcher is in scope); on_text is wired later in listen_loop
-    # once the text_queue exists (the on_enroll_face / on_knowledge_*
-    # late-injection pattern). Optional + defensive: a failure to start
-    # logs and continues — never blocks the assistant.
-    remote_server = None
-    if cfg.remote_token:
+    # M48.1: LAN remote console (token-gated, optional). Returns the started
+    # server or None. on_text is wired later in listen_loop once the
+    # text_queue exists (the late-injection pattern).
+    remote_server = _build_remote_console(cfg, ui, security_watcher)
 
-        def _remote_control(action: str) -> dict:
-            try:
-                if action == "arm":
-                    security_watcher.activate()
-                elif action == "disarm":
-                    security_watcher.deactivate()
-                # "status" is read-only — just report below.
-            except Exception as exc:  # noqa: BLE001 — never break on a remote ask
-                print(f"[remote] control {action!r} failed: {exc}", file=sys.stderr)
-            return {"armed": bool(security_watcher.is_armed())}
-
-        try:
-            # Import is INSIDE the try: a missing `websockets` (or any
-            # import error in remote_console/remote_pwa) must degrade to
-            # "no remote console", never an unhandled ImportError that
-            # breaks startup — the project's optional-component contract.
-            import ssl as _ssl  # noqa: PLC0415 — lazy: only needed when TLS configured
-            from src.remote_console import RemoteConsoleServer  # noqa: PLC0415
-
-            # M48.3 prereq — opportunistic TLS: build an SSLContext ONLY if
-            # both .env paths are set AND both files exist on disk. Either
-            # missing or unreadable ⇒ log loudly and fall back to plain
-            # HTTP/WS (LAN-mode dev path). A misconfigured cert MUST NOT
-            # crash Jarvis — same optional-component contract as the rest of
-            # the remote console. Stays defensively quiet about secret
-            # values: only the *paths* (not contents) ever reach the log.
-            ssl_ctx = None
-            cf, kf = cfg.tls_cert_file, cfg.tls_key_file
-            if cf or kf:
-                if not (cf and kf):
-                    print(
-                        "[remote] TLS half-configured (only one of "
-                        "JARVIS_TLS_CERT_FILE/JARVIS_TLS_KEY_FILE set) — "
-                        "falling back to plain HTTP/WS",
-                        file=sys.stderr,
-                    )
-                elif not (os.path.isfile(cf) and os.path.isfile(kf)):
-                    print(
-                        f"[remote] TLS files not found "
-                        f"(cert={cf!r}, key={kf!r}) — falling back to "
-                        f"plain HTTP/WS",
-                        file=sys.stderr,
-                    )
-                else:
-                    try:
-                        ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-                        ssl_ctx.load_cert_chain(certfile=cf, keyfile=kf)
-                    except Exception as exc:  # noqa: BLE001
-                        print(
-                            f"[remote] TLS load failed ({exc!r}) — "
-                            f"falling back to plain HTTP/WS",
-                            file=sys.stderr,
-                        )
-                        ssl_ctx = None
-
-            remote_server = RemoteConsoleServer(
-                token=cfg.remote_token,
-                host=cfg.remote_bind,
-                port=cfg.remote_port,
-                on_control=_remote_control,
-                ssl_context=ssl_ctx,
-            )
-            ui.set_remote(remote_server)
-            remote_server.start()
-        except Exception as exc:  # noqa: BLE001 — optional; must not block startup
-            print(f"[remote] failed to start (continuing without it): {exc}",
-                  file=sys.stderr)
-            remote_server = None
-    else:
-        print("[remote] JARVIS_REMOTE_TOKEN unset — remote console disabled",
-              file=sys.stderr)
-
-    # M60 — self-status registry. Each subsystem reports a one-line status
-    # via the `status_report` tool ("Jarvis, are you healthy?"). Registered
-    # HERE so every closure captures the live locals; order is display order
-    # in the report. Last-write-wins on a re-register (safe under any future
-    # re-construction). Cheap — the getters only run when status_report is
-    # called, not on every turn.
-    from src.self_status import (
-        count_session_errors as _ss_errors,
-        process_private_mb as _ss_mem,
-        register as _ss_register,
+    # M60 — self-status registry: each subsystem reports a one-line status via
+    # the `status_report` tool. Registered with the live subsystem handles.
+    _register_status(
+        cfg, security_watcher, sound_detector, homelab_monitor,
+        plex_client, plex_laptop_client, remote_server, calendar_monitor,
     )
-
-    def _status_security() -> str:
-        if security_watcher.is_locked():
-            return "Security: LOCKED (post-deterrent — awaiting passphrase)"
-        if security_watcher.is_armed():
-            return "Security: ARMED"
-        return "Security: standing down"
-
-    def _status_acoustic() -> str:
-        return (f"Acoustic awareness: "
-                f"{'active' if sound_detector.is_active() else 'off'}")
-
-    def _status_homelab() -> str:
-        return (f"Homelab monitor: "
-                f"{'active' if homelab_monitor.is_active() else 'off'}")
-
-    def _status_plex_mcp() -> str:
-        if plex_client is None:
-            return "Plex MCP: unavailable"
-        try:
-            n: object = len(plex_client.tool_names)
-        except Exception:
-            n = "?"
-        return f"Plex MCP: connected ({n} tools)"
-
-    def _status_plex_laptop() -> str:
-        if plex_laptop_client is None:
-            return "Plex laptop SSH: unconfigured"
-        return f"Plex laptop SSH: configured ({cfg.plex_laptop_host})"
-
-    def _status_remote() -> str:
-        if remote_server is None:
-            return "Remote console: off"
-        tls = bool(cfg.tls_cert_file and cfg.tls_key_file)
-        proto = "HTTPS/WSS" if tls else "HTTP/WS"
-        return f"Remote console: listening on port {cfg.remote_port} ({proto})"
-
-    def _status_stt() -> str:
-        if cfg.stt_server_url:
-            return (f"STT: GPU server ({cfg.stt_server_url}) — "
-                    f"backend={cfg.stt_backend}")
-        return f"STT: local CPU only — backend={cfg.stt_backend}"
-
-    def _status_calendar() -> str:
-        return (f"Calendar reminders: "
-                f"{'active' if calendar_monitor.is_active() else 'off'}")
-
-    def _status_reminders() -> str:
-        from src.reminders import list_pending  # noqa: PLC0415 — lazy
-        items = list_pending()
-        n = len(items)
-        briefings = sum(1 for r in items if r.get("action") == "briefing")
-        if briefings:
-            return f"Reminders: {n} pending ({briefings} scheduled briefing(s))"
-        return f"Reminders: {n} pending"
-
-    def _status_memory() -> str:
-        return f"Process memory: {_ss_mem():.0f} MB private bytes"
-
-    def _status_errors() -> str:
-        n, ctx = _ss_errors()
-        return f"Log errors: {n} concerning lines ({ctx})"
-
-    _ss_register("Security", _status_security)
-    _ss_register("Acoustic awareness", _status_acoustic)
-    _ss_register("Homelab monitor", _status_homelab)
-    _ss_register("Plex MCP", _status_plex_mcp)
-    _ss_register("Plex laptop", _status_plex_laptop)
-    _ss_register("Remote console", _status_remote)
-    _ss_register("STT backend", _status_stt)
-    _ss_register("Reminders", _status_reminders)
-    _ss_register("Calendar reminders", _status_calendar)
-    _ss_register("Process memory", _status_memory)
-    _ss_register("Log errors", _status_errors)
 
     worker = threading.Thread(
         target=listen_loop,
@@ -1573,67 +1686,20 @@ def main() -> None:
 
     ui.run()  # blocks main thread on Tk's mainloop until Quit is clicked
 
-    # M34: signal the security watcher to wind down. It's a daemon thread
-    # so it dies with the process either way, but explicit shutdown lets
-    # any in-flight inference complete cleanly without log noise.
-    security_watcher.shutdown()
-
-    # M56: stop the homelab monitor's poll loop. Daemon thread, so it dies
-    # with the process anyway; the event lets it exit its poll-wait cleanly.
-    homelab_monitor.shutdown()
-
-    # M58: stop acoustic awareness. Closes the InputStream + signals the
-    # inference loop to exit. Daemon-threaded so this is just clean wind-down.
-    sound_detector.shutdown()
-
-    # M62.2: stop the calendar reminder monitor. Daemon thread; the event
-    # lets it exit its poll-wait cleanly without log noise.
-    calendar_monitor.shutdown()
-
-    # M34: stop the Announcer thread. Sentinel-None wakes the .get() in
-    # _announcer_loop so it can check the stop flag and exit cleanly,
-    # instead of being killed mid-playback as a daemon.
-    announce_stop.set()
-    # Non-blocking: announce_stop already guarantees the loop exits on its
-    # next iteration; the sentinel only needs to wake a *blocked* get(), and
-    # a full queue (maxsize 16) means get() ISN'T blocked. A plain blocking
-    # put() here could hang shutdown forever if the queue is full and TTS is
-    # wedged in speak_streaming — the same "TTS wedged" case _announce already
-    # guards against with put_nowait.
-    try:
-        announce_queue.put_nowait(None)
-    except queue.Full:
-        pass
-
-    # M53: stop the reminder scheduler. Daemon thread, so it dies with the
-    # process either way; the event lets it exit its poll-wait cleanly.
-    reminder_stop.set()
-
-    # Give listen_loop time to see the shutdown event, exit its loop cleanly,
-    # and run its try/finally — which seals the active session to disk. Worst
-    # case: user quit mid-recording and we wait up to ~15s for max-recording
-    # to time out, then a summarize call. M16 hardening: bumped from 20s → 30s
-    # so the summarize round-trip (capped at 8s in memory.py, no SDK retries)
-    # plus any tail TTS playback comfortably fits before we give up.
-    worker.join(timeout=30.0)
-    if worker.is_alive():
-        print("[main] listen_loop didn't exit in time — session may not be sealed", file=sys.stderr)
-
-    # M21: clean up MCP subprocess. Done after worker.join so any in-flight
-    # tool call inside listen_loop has a chance to complete first.
-    if plex_client is not None:
-        try:
-            plex_client.close()
-        except Exception as exc:
-            print(f"[plex-mcp] close failed: {exc}", file=sys.stderr)
-
-    # M24: tear down the persistent SSH connection. Idempotent + non-blocking;
-    # paramiko handles the channel cleanup internally.
-    if plex_laptop_client is not None:
-        try:
-            plex_laptop_client.close()
-        except Exception as exc:
-            print(f"[plex-laptop] close failed: {exc}", file=sys.stderr)
+    # Wind down all background subsystems, join the listen loop (so it seals
+    # the active session to disk), and close the Plex connections. Relaunch is
+    # handled below — it's control flow (sys.exit), not subsystem teardown.
+    _shutdown_subsystems(
+        security_watcher=security_watcher,
+        homelab_monitor=homelab_monitor,
+        sound_detector=sound_detector,
+        calendar_monitor=calendar_monitor,
+        announcer=_ann,
+        reminder_stop=reminder_stop,
+        worker=worker,
+        plex_client=plex_client,
+        plex_laptop_client=plex_laptop_client,
+    )
 
     # Restart-Jarvis tray click sets ui.relaunch_mode. We defer the actual
     # respawn until here so the mic + Plex MCP + SSH have all released
