@@ -22,8 +22,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Ensure OUTLOOK_CLIENT_ID is unset for the "not configured" test paths.
-# (msal install isn't needed unless we actually instantiate the client.)
+# NB: outlook_calendar calls load_dotenv() at import and reads CLIENT_ID /
+# ICAL_URL at import time, so we can NOT achieve "unconfigured" by popping
+# the env var here — load_dotenv(override=False) repopulates a popped var
+# from the developer's real .env. The "unconfigured" tests below instead set
+# the module attributes (oc.CLIENT_ID / oc.ICAL_URL) directly, which the
+# dotenv load can't touch. (msal isn't needed unless we instantiate a client.)
 _OLD_CLIENT_ID = os.environ.pop("OUTLOOK_CLIENT_ID", None)
 
 from src import outlook_calendar as oc  # noqa: E402
@@ -53,12 +57,14 @@ check("schema: `timeframe` enum has the 4 expected values",
       set(props["timeframe"]["enum"]) == {"today", "tomorrow", "this_week", "next_24h"})
 
 
-# --- Test 2: CLIENT_ID unset -> tool returns voice-friendly setup msg ----
-# (We popped OUTLOOK_CLIENT_ID above; the module read it at import time and
-# is now stuck with the empty value — perfect for this test. Reload would
-# reset it; we want to verify the unconfigured path triggers cleanly.)
+# --- Test 2: neither backend configured -> voice-friendly setup msg ------
+# Force BOTH backends empty so this is deterministic regardless of the
+# developer's real .env (which may have a live OUTLOOK_ICAL_URL). This is the
+# same explicit-attr control the dispatcher's "neither configured" test uses.
+oc.CLIENT_ID = ""
+oc.ICAL_URL = ""
 out = oc.execute_calendar_tool({"timeframe": "today"})
-check("CLIENT_ID unset -> tool says 'isn't configured'",
+check("neither backend configured -> tool says 'isn't configured'",
       "configured" in out.lower() and "OUTLOOK_CLIENT_ID" in out)
 
 

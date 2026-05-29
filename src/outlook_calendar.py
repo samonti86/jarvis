@@ -68,9 +68,18 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
+from dotenv import load_dotenv
 
 
 # --- Configuration ---------------------------------------------------------
+
+# These are read at IMPORT time and re-exported (briefing.py / good_night.py
+# import the VALUES directly), so .env MUST already be loaded when this module
+# is first imported. config.py is the canonical dotenv owner, but this module
+# can be imported before config in a standalone script or a reordered import —
+# so call load_dotenv() here too. It's idempotent and cheap, and it makes this
+# module correct in isolation rather than dependent on import ordering.
+load_dotenv()
 
 CLIENT_ID = os.getenv("OUTLOOK_CLIENT_ID", "").strip()
 

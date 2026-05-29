@@ -1415,8 +1415,7 @@ def main() -> None:
             # import error in remote_console/remote_pwa) must degrade to
             # "no remote console", never an unhandled ImportError that
             # breaks startup — the project's optional-component contract.
-            import os as _os  # noqa: PLC0415
-            import ssl as _ssl  # noqa: PLC0415
+            import ssl as _ssl  # noqa: PLC0415 — lazy: only needed when TLS configured
             from src.remote_console import RemoteConsoleServer  # noqa: PLC0415
 
             # M48.3 prereq — opportunistic TLS: build an SSLContext ONLY if
@@ -1436,7 +1435,7 @@ def main() -> None:
                         "falling back to plain HTTP/WS",
                         file=sys.stderr,
                     )
-                elif not (_os.path.isfile(cf) and _os.path.isfile(kf)):
+                elif not (os.path.isfile(cf) and os.path.isfile(kf)):
                     print(
                         f"[remote] TLS files not found "
                         f"(cert={cf!r}, key={kf!r}) — falling back to "
@@ -1595,7 +1594,16 @@ def main() -> None:
     # _announcer_loop so it can check the stop flag and exit cleanly,
     # instead of being killed mid-playback as a daemon.
     announce_stop.set()
-    announce_queue.put(None)
+    # Non-blocking: announce_stop already guarantees the loop exits on its
+    # next iteration; the sentinel only needs to wake a *blocked* get(), and
+    # a full queue (maxsize 16) means get() ISN'T blocked. A plain blocking
+    # put() here could hang shutdown forever if the queue is full and TTS is
+    # wedged in speak_streaming — the same "TTS wedged" case _announce already
+    # guards against with put_nowait.
+    try:
+        announce_queue.put_nowait(None)
+    except queue.Full:
+        pass
 
     # M53: stop the reminder scheduler. Daemon thread, so it dies with the
     # process either way; the event lets it exit its poll-wait cleanly.
