@@ -154,15 +154,25 @@ _speak_calls: list = []
 main.speak = lambda *a, **k: _speak_calls.append((a, k))
 
 
+_speak_streaming_calls: list = []
+# Observation slots for the pc_speaking gate (echo fix). The test sets
+# _pc_event_ref[0] to a runner's _pc_speaking before a speak-path call; the
+# fake records whether it was set at the moment "audio" was playing.
+_pc_event_ref: list = [None]
+_pc_observed: dict = {"set_during_speak": None}
+
+
 def _consuming_speak_streaming(gen, *a, **k):
     """The speak path: real speak_streaming would play audio while pulling the
-    generator. We just pull it (to populate response_chunks) and record."""
+    generator. We just pull it (to populate response_chunks) and record — and
+    snapshot the pc_speaking gate, which MUST be set while we 'play'."""
+    if _pc_event_ref[0] is not None:
+        _pc_observed["set_during_speak"] = _pc_event_ref[0].is_set()
     for _ in gen:
         pass
     _speak_streaming_calls.append((a, k))
 
 
-_speak_streaming_calls: list = []
 main.speak_streaming = _consuming_speak_streaming
 
 
@@ -222,6 +232,34 @@ check("console+unmuted -> speak_streaming WAS called (speak path)",
       len(_speak_streaming_calls) == 1)
 check("speak path -> history still grew by 2 + assembled",
       len(runner._history) == 2 and runner._history[1]["content"] == "spoken reply")
+
+
+# --- Test 4b: pc_speaking gate (omni-mic echo fix) ------------------------
+# An AUDIBLE turn must SET pc_speaking while it plays (so the voice-capture
+# loop suppresses self-audio) and CLEAR it after. A SILENT turn never sets it.
+import threading as _threading  # noqa: E402
+
+ui = FakeUI(); ui.muted = False
+pc_ev = _threading.Event()
+runner = main.TurnRunner(_fake_cfg(), ui, _threading.Event(), pc_speaking=pc_ev)
+stream = FakeStream(); stream.chunks = ["hi"]
+main.stream_response = stream
+_pc_event_ref[0] = pc_ev
+_pc_observed["set_during_speak"] = None
+runner.process_question("speak up", "en", origin="console")
+check("audible turn -> pc_speaking SET while speaking",
+      _pc_observed["set_during_speak"] is True)
+check("audible turn -> pc_speaking CLEARED after the turn", not pc_ev.is_set())
+_pc_event_ref[0] = None
+
+pc_ev_silent = _threading.Event()
+runner_s = main.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
+                           pc_speaking=pc_ev_silent)
+stream = FakeStream(); stream.chunks = ["hi"]
+main.stream_response = stream
+runner_s.process_question("quietly", "en", origin="phone_text")
+check("silent (phone_text) turn -> pc_speaking never set",
+      not pc_ev_silent.is_set())
 
 
 # --- Test 5: empty response pops the orphan user message ------------------

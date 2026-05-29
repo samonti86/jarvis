@@ -257,12 +257,18 @@ class TurnRunner:
         reset_event: threading.Event,
         plex_client: PlexMCPClient | None = None,
         plex_laptop_client: PlexLaptopClient | None = None,
+        pc_speaking: "threading.Event | None" = None,
     ) -> None:
         self._cfg = cfg
         self._ui = ui
         self._reset_event = reset_event
         self._plex_client = plex_client
         self._plex_laptop_client = plex_laptop_client
+        # "PC is speaking out loud" gate — SET while this turn plays audio so
+        # the always-on voice-capture loop discards self-audio (omni-mic echo
+        # fix). Shared with the Announcer (announces set it too); a fresh local
+        # Event if unwired (tests / standalone) so it's never None.
+        self._pc_speaking = pc_speaking if pc_speaking is not None else threading.Event()
 
         self._history: list[dict] = []
         self._last_turn_time = 0.0
@@ -490,6 +496,16 @@ class TurnRunner:
             monitor_stop = threading.Event()
             monitor_thread: threading.Thread | None = None
 
+            # Mark "PC is speaking out loud" for the audible portion of this
+            # turn so the always-on voice-capture loop (esp. the M51 follow-up
+            # window) discards anything it picks up while we talk — that's how
+            # the mic stops self-capturing our own reply (the omni-mic echo,
+            # 2026-05-29). Silent turns (mute / phone) never set it; cleared in
+            # `finally` the instant our audio ends.
+            speaking_aloud = not pc_silent
+            if speaking_aloud:
+                self._pc_speaking.set()
+
             try:
                 if pc_silent:
                     # Drain the LLM stream silently. response_chunks gets
@@ -551,6 +567,9 @@ class TurnRunner:
                 self._ui.add_jarvis_text(apology)
                 return False
             finally:
+                # Stop suppressing voice capture the instant our audio ends.
+                if speaking_aloud:
+                    self._pc_speaking.clear()
                 # M52: always wind the barge-in monitor down — normal end,
                 # exception, OR barge-in. monitor_stop makes its next
                 # session.read() (≤80ms away) the last; the join is instant
@@ -618,6 +637,7 @@ def listen_loop(
     on_knowledge_remember: "Callable[[str], None] | None" = None,
     remote_server: object | None = None,
     mic_device: int | None = None,
+    pc_speaking: threading.Event | None = None,
 ) -> None:
     """Daemon worker. Owns the input loops; delegates each turn to a shared
     TurnRunner (which owns the conversation state, persists turns, and seals
@@ -633,7 +653,8 @@ def listen_loop(
     # The conversation engine: owns history/summaries/session state + the
     # MemoryStore and runs each turn end-to-end. Voice + text share this ONE
     # instance (its lock keeps them from overlapping). See the TurnRunner class.
-    runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client)
+    runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client,
+                        pc_speaking)
 
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
@@ -899,6 +920,12 @@ def listen_loop(
                         max_pre_speech_sec=(
                             _FOLLOWUP_WINDOW_SEC if followup else None
                         ),
+                        # 2026-05-29 omni-mic echo fix: abort + discard the
+                        # capture if the PC starts speaking (a console-turn
+                        # reply or a proactive announce) mid-window — so the
+                        # no-wake-word follow-up window can't transcribe
+                        # Jarvis's own voice as a question.
+                        suppress_event=pc_speaking,
                     )
                 except Exception as exc:
                     print(f"[main] STT failed: {exc}")
@@ -1069,8 +1096,14 @@ class _Announcer(NamedTuple):
     shutdown: "Callable[[], None]"
 
 
-def _build_announcer(ui: JarvisUI) -> _Announcer:
+def _build_announcer(ui: JarvisUI, pc_speaking: threading.Event) -> _Announcer:
     """Construct the dedicated proactive-speech subsystem (M34).
+
+    `pc_speaking` (2026-05-29) is the "PC is speaking out loud" gate shared
+    with TurnRunner — set here too while an announce plays, so the always-on
+    voice-capture loop discards self-audio (the omni-mic echo fix). Distinct
+    from `speaking_event` below (that gates security/sound CPU bursts; this
+    gates mic capture).
 
     Speech is marshaled through a single dedicated Announcer thread because
     sd.play() on Windows WASAPI silently no-ops when called from worker
@@ -1138,6 +1171,7 @@ def _build_announcer(ui: JarvisUI) -> _Announcer:
             # window speech is on the wire. Cleared in finally so a TTS
             # failure can't leave the watcher permanently throttled.
             announce_speaking.set()
+            pc_speaking.set()  # suppress voice-capture self-hearing of the announce
             try:
                 speak_streaming(
                     iter([text]),
@@ -1149,6 +1183,7 @@ def _build_announcer(ui: JarvisUI) -> _Announcer:
                 print(f"[announce] TTS failed: {exc}", file=sys.stderr)
             finally:
                 announce_speaking.clear()
+                pc_speaking.clear()
                 ui.set_state(State.IDLE)
                 if on_done is not None:
                     try:
@@ -1491,12 +1526,20 @@ def main() -> None:
     # transitive deps via ultralytics/cv2).
     from src.security import SecurityWatcher
 
+    # "PC is speaking out loud" gate (2026-05-29 omni-mic echo fix). SET while
+    # ANY PC TTS plays — proactive announces (Announcer) AND turn replies
+    # (TurnRunner) — so the always-on voice-capture loop discards self-audio
+    # instead of transcribing Jarvis's own reply. Distinct from
+    # `announce_speaking` (which gates security/sound CPU bursts): this gates
+    # mic capture, and covers turn replies too, not just announces.
+    pc_speaking = threading.Event()
+
     # Proactive-speech subsystem: a dedicated WASAPI-safe Announcer thread.
     # _build_announcer returns the non-blocking announce() entry every
     # proactive caller uses, the cooperative speech-gate Event (the
     # SecurityWatcher + SoundDetector defer heavy CPU bursts against it), and
     # a shutdown() callable for the wind-down. See _build_announcer.
-    _ann = _build_announcer(ui)
+    _ann = _build_announcer(ui, pc_speaking)
     _announce = _ann.announce
     announce_speaking = _ann.speaking_event
 
@@ -1743,6 +1786,7 @@ def main() -> None:
             "on_knowledge_remember": _trigger_knowledge_remember,
             "remote_server": remote_server,
             "mic_device": mic_device_index,
+            "pc_speaking": pc_speaking,
         },
         daemon=True,
     )

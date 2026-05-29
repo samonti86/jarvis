@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import sys
+import threading
 import time
 import wave
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ def _record_until_silence(
     session: AudioSession,
     on_amplitude: "Callable[[float], None] | None" = None,
     max_pre_speech_sec: float | None = None,
+    suppress_event: "threading.Event | None" = None,
 ) -> np.ndarray:
     """State-machine VAD: wait for speech start, then stop on sustained silence.
 
@@ -78,6 +80,12 @@ def _record_until_silence(
     before giving up. None ⇒ the normal post-wake-word value (MAX_PRE_SPEECH_
     SEC); the conversational follow-up window passes a longer value so the
     user has time to gather a follow-up without re-saying "Hey Jarvis".
+
+    `suppress_event` (2026-05-29 omni-mic echo fix) — if this Event becomes
+    set DURING capture (the PC started speaking a reply or a proactive
+    announce), abort immediately and return an empty array. The caller treats
+    that like "no speech," so the no-wake-word follow-up window can never
+    transcribe Jarvis's own voice as a question. None ⇒ no suppression.
 
     Silence threshold is computed adaptively from pre-speech ambient noise:
     track the loudest pre-speech chunk (excluding any chunk loud enough to be
@@ -121,6 +129,14 @@ def _record_until_silence(
 
     print("[stt] listening for question...", file=sys.stderr)
     while len(chunks) < max_chunks:
+        # Omni-mic echo fix: if the PC started speaking (a reply or announce)
+        # while we're capturing, abort + discard — never transcribe our own
+        # audio. Checked before each read so it also short-circuits on entry
+        # if the PC is already speaking.
+        if suppress_event is not None and suppress_event.is_set():
+            print("[stt] capture aborted — PC is speaking (avoiding self-capture)",
+                  file=sys.stderr)
+            return np.array([], dtype=np.int16)
         chunk = session.read()
         chunks.append(chunk)
         level = _rms(chunk)
@@ -199,8 +215,13 @@ def transcribe_after_wake(
     server_url: str = "",
     backend: str = "auto",
     max_pre_speech_sec: float | None = None,
+    suppress_event: "threading.Event | None" = None,
 ) -> Transcript:
     """Record from `session` until silence, then transcribe.
+
+    `suppress_event` (2026-05-29) — if set during capture, abort + return an
+    empty Transcript (the PC is speaking; don't self-capture). See
+    `_record_until_silence`.
 
     `max_pre_speech_sec` (M51) — how long to wait for the user to START
     speaking before returning an empty Transcript. None ⇒ the normal
@@ -232,6 +253,7 @@ def transcribe_after_wake(
     audio_i16 = _record_until_silence(
         session, on_amplitude=on_amplitude,
         max_pre_speech_sec=max_pre_speech_sec,
+        suppress_event=suppress_event,
     )
 
     if audio_i16.size == 0:
