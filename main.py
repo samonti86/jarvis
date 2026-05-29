@@ -235,78 +235,72 @@ def _is_dismissal(text: str) -> bool:
     return False
 
 
-def listen_loop(
-    cfg: Config,
-    ui: JarvisUI,
-    reset_event: threading.Event,
-    plex_client: PlexMCPClient | None = None,
-    plex_laptop_client: PlexLaptopClient | None = None,
-    security_watcher: "SecurityWatcher | None" = None,
-    on_enroll_face: "Callable[[], None] | None" = None,
-    on_knowledge_reindex: "Callable[[], None] | None" = None,
-    on_knowledge_remember: "Callable[[str], None] | None" = None,
-    remote_server: object | None = None,
-    mic_device: int | None = None,
-) -> None:
-    """Daemon worker. Owns conversation history, persists turns + seals
-    sessions on every memory boundary (manual reset / idle / app quit).
+class TurnRunner:
+    """Runs one conversation turn end-to-end and owns the session state.
 
-    Two input paths share state through closures:
-      - voice path: this function's main loop (wake-word → STT → process_question)
-      - text path: text_input_loop spawned below (queue → process_question)
+    Owns the conversation `history`, the recalled `summaries`, the active
+    session's language / start-time / last-turn-time, the `MemoryStore`, and a
+    processing lock. The PC-voice path and the text/phone path share ONE
+    TurnRunner; both call `process_question`, which holds the lock for the
+    whole LLM-stream + TTS duration — so a typed message that lands while
+    Jarvis is answering a spoken one waits its turn (no overlapping responses).
 
-    Both call process_question, which holds processing_lock for the duration of
-    the LLM stream + TTS. That means a typed message that lands while Jarvis is
-    answering a spoken one waits its turn — no overlapping responses.
+    This is the unit that used to be the `process_question` closure inside
+    `listen_loop`; pulled out so it has a testable surface
+    (scripts/turn_runner_test.py) and listen_loop stays a readable loop.
     """
-    history: list[dict] = []
-    last_turn_time = 0.0
 
-    memory = MemoryStore()
-    memory.prune(retain_raw_days=cfg.retain_raw_days)
-    summaries = memory.recent_summaries(cfg.memory_recall_count)
-    print(f"[memory] loaded {len(summaries)} prior session summaries", file=sys.stderr)
+    def __init__(
+        self,
+        cfg: Config,
+        ui: JarvisUI,
+        reset_event: threading.Event,
+        plex_client: PlexMCPClient | None = None,
+        plex_laptop_client: PlexLaptopClient | None = None,
+    ) -> None:
+        self._cfg = cfg
+        self._ui = ui
+        self._reset_event = reset_event
+        self._plex_client = plex_client
+        self._plex_laptop_client = plex_laptop_client
 
-    # Tracks the language and start-time of the *currently active* session
-    # (i.e., the one being built up in `history`). Reset on every seal.
-    session_language = "en"
-    session_started_at = datetime.now().isoformat(timespec="seconds")
+        self._history: list[dict] = []
+        self._last_turn_time = 0.0
+        self._memory = MemoryStore()
+        self._memory.prune(retain_raw_days=cfg.retain_raw_days)
+        self._summaries = self._memory.recent_summaries(cfg.memory_recall_count)
+        print(f"[memory] loaded {len(self._summaries)} prior session summaries",
+              file=sys.stderr)
+        # Language + start-time of the *currently active* session (the one
+        # being built up in `history`). Reset on every seal.
+        self._session_language = "en"
+        self._session_started_at = datetime.now().isoformat(timespec="seconds")
+        # Serializes process_question so voice and text paths never run together.
+        self._lock = threading.Lock()
 
-    # Serializes process_question so voice and text paths never run together.
-    processing_lock = threading.Lock()
+    def has_active_conversation(self) -> bool:
+        """True if there's an unsealed conversation in memory — the reset
+        handler + shutdown seal use this to decide whether there's anything to
+        seal/log."""
+        return bool(self._history)
 
-    # Text-submission queue. Tk's submit handler puts (text, attachments)
-    # tuples here; the text_input_loop worker pops them and calls
-    # process_question. attachments is list[tuple[str, dict]] (filename + block).
-    # M48.2/M48.2b/M48.3: item is (text, attachments, origin, reply_audio, lang).
-    # origin ∈ {"console","phone_text","phone_voice"} — derives PC-TTS gating
-    # (phone_text/phone_voice don't speak on the PC) AND restricted tool
-    # surface (phone origins lose system/shell/file/etc.).
-    # reply_audio: None (console — PC behaviour) or a conn-bound sink (phone)
-    # — its presence routes this reply's audio to THAT phone instead of PC.
-    # lang: M48.3 — whisper-detected ISO-639-1 for phone_voice (so Spanish-
-    # spoken into the phone gets a Spanish reply + a Spanish voice); "en"
-    # for typed inputs where we have no detection. Voice path on the PC
-    # mic calls process_question directly (not via this queue), unaffected.
-    text_queue: queue.Queue[
-        tuple[
-            str,
-            list[tuple[str, dict]],
-            str,
-            "Callable[[bytes], None] | None",
-            str,
-        ]
-    ] = queue.Queue()
-
-    def seal_and_refresh() -> None:
+    def seal_and_refresh(self) -> None:
         """Seal the active session (if any) and reload summaries for the next one."""
-        nonlocal summaries, session_started_at
-        _seal_session(memory, history, session_language, session_started_at, cfg)
-        history.clear()
-        summaries = memory.recent_summaries(cfg.memory_recall_count)
-        session_started_at = datetime.now().isoformat(timespec="seconds")
+        _seal_session(self._memory, self._history, self._session_language,
+                      self._session_started_at, self._cfg)
+        self._history.clear()
+        self._summaries = self._memory.recent_summaries(
+            self._cfg.memory_recall_count)
+        self._session_started_at = datetime.now().isoformat(timespec="seconds")
+
+    def seal_on_shutdown(self) -> None:
+        """Final seal at app quit — persist whatever's still in memory. No
+        reload (we're shutting down)."""
+        _seal_session(self._memory, self._history, self._session_language,
+                      self._session_started_at, self._cfg)
 
     def process_question(
+        self,
         text: str,
         language: str,
         attachments: list[dict] | None = None,
@@ -352,8 +346,6 @@ def listen_loop(
         plain string. History keeps that structure verbatim, so multi-turn
         Q&A about an attached document works naturally until reset/trim.
         """
-        nonlocal session_language, session_started_at, last_turn_time
-
         # M48.2/M48.2a — the two per-turn concerns, derived from one origin.
         # text_only: phone-text is text-only (M48.2); everything else speaks
         # (subject to mute). restricted: any phone origin gets the reduced
@@ -364,29 +356,29 @@ def listen_loop(
         text_only = origin == "phone_text"
         restricted = origin in ("phone_text", "phone_voice")
 
-        with processing_lock:
+        with self._lock:
             # Apply any pending reset/idle boundary BEFORE this turn — so the
             # user's question starts a fresh session rather than tacking onto
             # a stale one.
-            if reset_event.is_set():
-                if history:
-                    print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
-                    ui.add_system_text("conversation reset.")
-                seal_and_refresh()
-                reset_event.clear()
-            elif history and (time.time() - last_turn_time) > IDLE_RESET_SEC:
+            if self._reset_event.is_set():
+                if self._history:
+                    print(f"[main] conversation reset (manual; sealing {len(self._history)} msgs)")
+                    self._ui.add_system_text("conversation reset.")
+                self.seal_and_refresh()
+                self._reset_event.clear()
+            elif self._history and (time.time() - self._last_turn_time) > IDLE_RESET_SEC:
                 print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
-                ui.add_system_text("conversation reset (idle).")
-                seal_and_refresh()
+                self._ui.add_system_text("conversation reset (idle).")
+                self.seal_and_refresh()
 
             # First turn of a (possibly new) session — capture its language.
-            if not history:
-                session_language = language or "en"
-                session_started_at = datetime.now().isoformat(timespec="seconds")
+            if not self._history:
+                self._session_language = language or "en"
+                self._session_started_at = datetime.now().isoformat(timespec="seconds")
 
             print(f"\n[user, {language}] {text}")
             print("[jarvis] ", end="", flush=True)
-            ui.add_user_text(text, language)
+            self._ui.add_user_text(text, language)
 
             # Build user-message content. With attachments: list of blocks
             # (each attachment first so Claude has the doc/image in context
@@ -398,14 +390,14 @@ def listen_loop(
             else:
                 content = text
 
-            history.append({"role": "user", "content": content})
+            self._history.append({"role": "user", "content": content})
 
             response_chunks: list[str] = []
 
             # Snapshot engineer-mode state once per turn — same discipline as
             # mute. Mid-turn toggle applies to the next turn (changing thinking
             # budget mid-stream isn't supported).
-            engineer = ui.is_engineer_mode()
+            engineer = self._ui.is_engineer_mode()
 
             def on_telemetry(rec: TelemetryRecord) -> None:
                 """Called by stream_response at the end of each turn. Surfaces
@@ -415,7 +407,7 @@ def listen_loop(
                 then how much it cost. The 'thinking' marker calls out
                 engineer-mode turns since their token cost is meaningfully
                 higher."""
-                ui.add_session_tokens(rec.total_tokens)
+                self._ui.add_session_tokens(rec.total_tokens)
                 bits: list[str] = []
                 if rec.tools_used:
                     bits.append(", ".join(rec.tools_used))
@@ -427,7 +419,7 @@ def listen_loop(
                 bits.append(f"{rec.total_tokens:,} tok")
                 if rec.paused:
                     bits.append("PAUSED(10-iter cap)")
-                ui.add_telemetry_chip(" · ".join(bits))
+                self._ui.add_telemetry_chip(" · ".join(bits))
 
             def on_image_captured(image_bytes: bytes, media_type: str, tool_name: str) -> None:  # noqa: ARG001 — media_type unused for now
                 """Called by stream_response when a vision tool returns an
@@ -439,7 +431,7 @@ def listen_loop(
                     "camera_snapshot": "📷 webcam snapshot",
                     "screen_snapshot": "🖥 screen snapshot",
                 }.get(tool_name, f"🖼 {tool_name}")
-                ui.add_image_thumbnail(image_bytes, label)
+                self._ui.add_image_thumbnail(image_bytes, label)
 
             def llm_stream():
                 # `interrupt_event` is a free variable bound just below (before
@@ -447,12 +439,12 @@ def listen_loop(
                 # active for this turn, in which case stream_response polls it
                 # and closes the HTTP stream when the user cuts in.
                 for chunk in stream_response(
-                    api_key=cfg.anthropic_api_key,
-                    messages=history,
-                    model=cfg.claude_model,
-                    summaries=summaries,
-                    plex_client=plex_client,
-                    plex_laptop_client=plex_laptop_client,
+                    api_key=self._cfg.anthropic_api_key,
+                    messages=self._history,
+                    model=self._cfg.claude_model,
+                    summaries=self._summaries,
+                    plex_client=self._plex_client,
+                    plex_laptop_client=self._plex_laptop_client,
                     on_complete=on_telemetry,
                     on_image_captured=on_image_captured,
                     engineer_mode=engineer,
@@ -467,7 +459,7 @@ def listen_loop(
             # toggles mid-response, the change applies to the NEXT turn —
             # mid-stream stop would be jarring and the streamed text is
             # already visible in the console regardless.
-            muted = ui.is_muted()
+            muted = self._ui.is_muted()
 
             # M48.2: phone-text turns are text-only by origin (text_only),
             # independent of the global mute toggle. Folded into the same
@@ -518,7 +510,7 @@ def listen_loop(
                         monitor_thread = threading.Thread(
                             target=monitor_for_wake_word,
                             args=(session, interrupt_event, monitor_stop),
-                            kwargs={"threshold": cfg.wake_word_threshold},
+                            kwargs={"threshold": self._cfg.wake_word_threshold},
                             name="BargeInMonitor",
                             daemon=True,
                         )
@@ -526,12 +518,12 @@ def listen_loop(
                     speak_streaming(
                         llm_stream(),
                         language=language,
-                        on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                        on_amplitude=ui.set_amplitude,
+                        on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
+                        on_amplitude=self._ui.set_amplitude,
                         interrupt_event=interrupt_event,
                     )
             except Exception as exc:
-                history.pop()  # keep history alternating user/assistant cleanly
+                self._history.pop()  # keep history alternating user/assistant cleanly
                 print(f"\n[main] LLM/TTS failed: {exc}")
                 # M20: don't leave the user in silence after a partial reply.
                 # Speak a brief apology in their language via the simpler Tier
@@ -547,7 +539,7 @@ def listen_loop(
                     else "Apologies, a technical hiccup. Could you try that again?"
                 )
                 if not pc_silent:
-                    ui.set_state(State.SPEAKING)
+                    self._ui.set_state(State.SPEAKING)
                     try:
                         speak(apology, language=language)
                     except Exception as apology_exc:
@@ -556,7 +548,7 @@ def listen_loop(
                 # via the fan-out below; we deliberately don't synth audio on
                 # the error path (extra failure surface for little gain — the
                 # text is enough to convey the hiccup).
-                ui.add_jarvis_text(apology)
+                self._ui.add_jarvis_text(apology)
                 return False
             finally:
                 # M52: always wind the barge-in monitor down — normal end,
@@ -579,17 +571,17 @@ def listen_loop(
 
             full_response = "".join(response_chunks).strip()
             if not full_response:
-                history.pop()  # nothing came back; drop the orphan user message
+                self._history.pop()  # nothing came back; drop the orphan user message
                 return interrupted
 
-            history.append({"role": "assistant", "content": full_response})
-            _trim_history(history)
-            last_turn_time = time.time()
+            self._history.append({"role": "assistant", "content": full_response})
+            _trim_history(self._history)
+            self._last_turn_time = time.time()
 
             # Persist the completed exchange to today's transcript file.
-            memory.record_turn(text, full_response, language)
+            self._memory.record_turn(text, full_response, language)
 
-            ui.add_jarvis_text(full_response)
+            self._ui.add_jarvis_text(full_response)
 
             # M48.2b: speak the reply to the phone that asked (UNICAST,
             # mute-independent). Whole-reply-at-completion v1 — matches the
@@ -612,6 +604,59 @@ def listen_loop(
                           file=sys.stderr)
             print()
             return interrupted
+
+
+def listen_loop(
+    cfg: Config,
+    ui: JarvisUI,
+    reset_event: threading.Event,
+    plex_client: PlexMCPClient | None = None,
+    plex_laptop_client: PlexLaptopClient | None = None,
+    security_watcher: "SecurityWatcher | None" = None,
+    on_enroll_face: "Callable[[], None] | None" = None,
+    on_knowledge_reindex: "Callable[[], None] | None" = None,
+    on_knowledge_remember: "Callable[[str], None] | None" = None,
+    remote_server: object | None = None,
+    mic_device: int | None = None,
+) -> None:
+    """Daemon worker. Owns the input loops; delegates each turn to a shared
+    TurnRunner (which owns the conversation state, persists turns, and seals
+    sessions on every memory boundary — manual reset / idle / app quit).
+
+    Two input paths share ONE TurnRunner:
+      - voice path: this function's main loop (wake-word → STT → runner.process_question)
+      - text path: text_input_loop spawned below (queue → runner.process_question)
+
+    The runner's lock serializes the two, so a typed message that lands while
+    Jarvis is answering a spoken one waits its turn — no overlapping responses.
+    """
+    # The conversation engine: owns history/summaries/session state + the
+    # MemoryStore and runs each turn end-to-end. Voice + text share this ONE
+    # instance (its lock keeps them from overlapping). See the TurnRunner class.
+    runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client)
+
+    # Text-submission queue. Tk's submit handler puts (text, attachments)
+    # tuples here; the text_input_loop worker pops them and calls
+    # process_question. attachments is list[tuple[str, dict]] (filename + block).
+    # M48.2/M48.2b/M48.3: item is (text, attachments, origin, reply_audio, lang).
+    # origin ∈ {"console","phone_text","phone_voice"} — derives PC-TTS gating
+    # (phone_text/phone_voice don't speak on the PC) AND restricted tool
+    # surface (phone origins lose system/shell/file/etc.).
+    # reply_audio: None (console — PC behaviour) or a conn-bound sink (phone)
+    # — its presence routes this reply's audio to THAT phone instead of PC.
+    # lang: M48.3 — whisper-detected ISO-639-1 for phone_voice (so Spanish-
+    # spoken into the phone gets a Spanish reply + a Spanish voice); "en"
+    # for typed inputs where we have no detection. Voice path on the PC
+    # mic calls process_question directly (not via this queue), unaffected.
+    text_queue: queue.Queue[
+        tuple[
+            str,
+            list[tuple[str, dict]],
+            str,
+            "Callable[[bytes], None] | None",
+            str,
+        ]
+    ] = queue.Queue()
 
     def text_input_loop() -> None:
         """Consume typed questions from the queue. Short timeout so we notice
@@ -690,7 +735,7 @@ def listen_loop(
                 # gets a Spanish reply with a Spanish voice. Claude still
                 # follows the input's language via the system prompt; the
                 # `language` arg drives TTS voice selection downstream.
-                process_question(
+                runner.process_question(
                     text, lang, attachments=blocks, origin=origin,
                     reply_audio=reply_audio,
                 )
@@ -823,12 +868,12 @@ def listen_loop(
                     # Reset clicked while we were idle-listening. Seal+clear
                     # now, without forcing another question first.
                     if reset_event.is_set():
-                        if history:
-                            print(f"[main] conversation reset (manual; sealing {len(history)} msgs)")
+                        if runner.has_active_conversation():
+                            print("[main] conversation reset (manual; sealing active session)")
                             ui.add_system_text("conversation reset.")
                         else:
                             print("[main] reset clicked, but no active conversation to seal")
-                        seal_and_refresh()
+                        runner.seal_and_refresh()
                         reset_event.clear()
                         continue  # back to top — listen for next wake
 
@@ -929,7 +974,7 @@ def listen_loop(
                 # barge-in monitor — only the voice path has the mic, so only
                 # the voice path can be interrupted. Returns True iff the user
                 # cut Jarvis off mid-reply with "Hey Jarvis".
-                interrupted = process_question(
+                interrupted = runner.process_question(
                     transcript.text, transcript.language, session=session,
                 )
                 # M51/M52: open the follow-up window so the next utterance
@@ -953,9 +998,9 @@ def listen_loop(
                     followup = True
     finally:
         # Quit / shutdown: seal whatever's still in memory so we don't lose it.
-        if history:
+        if runner.has_active_conversation():
             print("[memory] sealing in-progress session on shutdown...", file=sys.stderr)
-            _seal_session(memory, history, session_language, session_started_at, cfg)
+            runner.seal_on_shutdown()
 
 
 def _try_connect_plex(cfg: Config) -> PlexMCPClient | None:
