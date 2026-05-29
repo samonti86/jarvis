@@ -1037,6 +1037,25 @@ def _build_announcer(ui: JarvisUI) -> _Announcer:
     non-blocking entry every proactive caller uses), `speaking_event` (the
     cooperative speech gate the SecurityWatcher + SoundDetector defer their
     heavy CPU bursts against), and `shutdown()` for the wind-down sequence.
+
+    ─────────────────────────────────────────────────────────────────────
+    CONTRACT — `speaking_event` is the cooperative speech gate. It is SET
+    while a proactive announce is on the wire and CLEARED when it finishes.
+
+    Any background thread that does a sustained CPU/GIL burst (ML inference,
+    a tight encode loop, a per-tick gc) MUST consume this Event and yield
+    (defer or drop its work) while it is set — otherwise the burst starves
+    the Python-fed TTS path, the audio buffer underruns, and the announce
+    stutters. Treat it like a lock you must respect, not an optional hint.
+
+    Current consumers: SecurityWatcher (defers grab/YOLO/encode — see
+    `_is_announcing`/`_wait_for_quiet`) and SoundDetector (drops the PANNs
+    inference window). A NEW continuous-CPU subsystem is not done until it is
+    wired in here too — that omission is exactly the 2026-05-28 M67
+    regression (M58's acoustic loop shipped outside the gate). See the
+    stutter-gate post-mortem in docs/MILESTONES.md +
+    project_security_audio_stutter_gate memory.
+    ─────────────────────────────────────────────────────────────────────
     """
     # Queue items are (text, on_done, label) tuples; on_done fires after
     # playback so callers can defer state until the user has actually heard
