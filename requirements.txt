@@ -102,3 +102,18 @@ panns_inference>=0.1
 # package is absent, knowledge_search degrades cleanly to M45 keyword-only.
 sentence-transformers>=3.0
 
+# Speaker identification (M69) — per-turn "who is speaking" via Resemblyzer
+# d-vectors (256-dim, L2-normalized → cosine similarity). Powers an opt-in
+# "respond only to enrolled voices" gate (filters background media from the
+# open omni-mic) + multi-user language hints. Deps are NEARLY FREE here: torch
+# is already pulled by ultralytics, and librosa/numba by panns_inference above
+# — only resemblyzer + webrtcvad (its VAD trimmer) are new. Steady-state embed
+# ~30ms; the ~5-15s first-call JIT is paid once by speaker_id.warm(). Measured
+# de-risk (scripts/speaker_id_probe.py): you-vs-you ~0.895 vs you-vs-media
+# ~0.566 on this mic → clean separation. LOCAL — audio never leaves the box;
+# absent package degrades cleanly (speaker_id.AVAILABLE False, gate disabled).
+# NOTE: resemblyzer lists the legacy `typing` backport as a dep — pip installs
+# it, but it SHADOWS stdlib typing on 3.12, so after `pip install -r` run
+# `pip uninstall -y typing`. See the M69 entry.
+resemblyzer>=0.1.4
+

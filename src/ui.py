@@ -78,6 +78,9 @@ class JarvisUI:
         # face_auth / cameras / announce are available in main.py) so the
         # tray menu can render before the dependency graph is complete.
         self._on_enroll_face: Callable[[], None] | None = None
+        # M69: voice-enrollment trigger (speaker ID). Same post-construction
+        # lifecycle as _on_enroll_face — wired once announce + speaker_id exist.
+        self._on_enroll_voice: Callable[[], None] | None = None
         # M45: knowledge-reindex trigger. Wired post-construction (after the
         # announce path exists in main.py), same lifecycle as _on_enroll_face.
         self._on_reindex_knowledge: Callable[[], None] | None = None
@@ -278,6 +281,18 @@ class JarvisUI:
         if self._on_enroll_face is not None:
             self._on_enroll_face()
 
+    def set_on_enroll_voice(self, callback: Callable[[], None]) -> None:
+        """Wire the tray's 'Enroll my voice' menu callback (M69). main.py calls
+        this after the announce path + speaker_id are available."""
+        self._on_enroll_voice = callback
+
+    def _handle_enroll_voice(self) -> None:
+        """Tray callback (M69). Same non-blocking shape as _handle_enroll_face:
+        the announce → record → enroll → announce flow runs on the Announcer
+        thread via on_done."""
+        if self._on_enroll_voice is not None:
+            self._on_enroll_voice()
+
     def set_on_reindex_knowledge(self, callback: Callable[[], None]) -> None:
         """Wire the tray's 'Reindex knowledge' callback (M45). main.py calls
         this after the announce path is available — same as enroll-face."""
@@ -406,6 +421,7 @@ class JarvisUI:
             acoustic_enabled=self._acoustic_is_active_or_false,
             on_acoustic_toggle=self._handle_toggle_acoustic,
             on_enroll_face=self._handle_enroll_face,
+            on_enroll_voice=self._handle_enroll_voice,
             on_reindex_knowledge=self._handle_reindex_knowledge,
             on_restart=self._handle_restart,
             on_restart_elevated=self._handle_restart_elevated,

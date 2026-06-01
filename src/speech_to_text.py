@@ -50,6 +50,11 @@ MAX_RECORDING_SEC = 15.0   # absolute cap
 class Transcript:
     text: str
     language: str  # ISO-639-1, e.g. 'en', 'es'
+    # The int16 mono 16 kHz audio this transcript was produced from (M69).
+    # Carried so the caller can run speaker identification on the SAME audio
+    # without a second capture. None on the empty/no-speech paths and on the
+    # blob path (phone audio, where speaker ID doesn't apply).
+    audio: "np.ndarray | None" = None
 
 
 _model: WhisperModel | None = None
@@ -265,7 +270,11 @@ def transcribe_after_wake(
         except Exception:
             pass  # never let a UI callback break STT
 
-    return _dispatch_transcription(audio_i16, model_name, server_url, backend)
+    result = _dispatch_transcription(audio_i16, model_name, server_url, backend)
+    # Attach the source audio so the caller can run speaker ID on it (M69)
+    # without re-capturing. Cheap (a reference, not a copy).
+    result.audio = audio_i16
+    return result
 
 
 # --- M36: backend dispatch + helpers --------------------------------------

@@ -44,6 +44,9 @@ class Config:
     homelab_monitor_enabled: bool  # M56 — start the proactive homelab monitor at launch. Default off (opt-in via this flag or the tray toggle). Poll/threshold/disk tunables live in src/homelab_monitor.py.
     acoustic_monitor_enabled: bool  # M58 — start acoustic awareness at launch. Default off (opt-in via this flag or the tray toggle). Per-class kill switch + volume floor live in src/sound_detector.py.
     mic_device: str            # Mic pin: a device-name substring (e.g. "MC1000") or an integer index. Blank = Windows default input. Resolved to an index at startup; both the main capture and acoustic awareness use it. For a dedicated Jarvis-only mic, pin by name so a USB re-enumeration / default-device change can't silently steal capture.
+    speaker_threshold: float   # M69 — min cosine similarity for a recognized speaker. 0.70 default (you-vs-you measured ~0.895, you-vs-media ~0.566). Lower = more permissive (fail-open). Identification is active only once at least one voice is enrolled.
+    speaker_gate_enabled: bool  # M69 — opt-in "respond only to enrolled voices" gate. Default off. When on AND a voice is enrolled, a confidently-unrecognized turn (e.g. background TV) is dropped. Fail-open: borderline still responds.
+    user_name: str             # M69 — the name the primary user is enrolled under (via "enroll my voice" / the tray). Shows in [speaker] logs. Default "you"; set JARVIS_USER_NAME to your name.
 
 
 def load() -> Config:
@@ -116,4 +119,15 @@ def load() -> Config:
         # it need not be the system default and a USB shuffle can't reroute
         # Jarvis. Resolved to an index at startup (see audio.resolve_input_device).
         mic_device=os.getenv("JARVIS_MIC_DEVICE", "").strip(),
+        # M69 — speaker identification. The recognize-threshold is tuned
+        # fail-open (below the measured you-vs-you/you-vs-media midpoint) so a
+        # degraded clip of the real user still passes. The gate is opt-in and
+        # OFF unless explicitly truthy — identification itself activates simply
+        # by enrolling a voice (no flag), since labeling who spoke is harmless.
+        speaker_threshold=float(os.getenv("JARVIS_SPEAKER_THRESHOLD", "0.70")),
+        speaker_gate_enabled=(
+            os.getenv("JARVIS_SPEAKER_GATE", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        user_name=os.getenv("JARVIS_USER_NAME", "you").strip() or "you",
     )
