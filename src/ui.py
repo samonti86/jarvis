@@ -80,7 +80,12 @@ class JarvisUI:
         self._on_enroll_face: Callable[[], None] | None = None
         # M69: voice-enrollment trigger (speaker ID). Same post-construction
         # lifecycle as _on_enroll_face — wired once announce + speaker_id exist.
-        self._on_enroll_voice: Callable[[], None] | None = None
+        self._on_enroll_voice: Callable[..., None] | None = None
+        # M69 Phase 4: "voice lock" gate toggle (respond only to enrolled
+        # voices). Simple on/off, like a mute — a toggle fn + an is-active
+        # getter, both wired post-construction by main().
+        self._speaker_gate_toggle: Callable[[], None] | None = None
+        self._speaker_gate_is_active: Callable[[], bool] | None = None
         # M45: knowledge-reindex trigger. Wired post-construction (after the
         # announce path exists in main.py), same lifecycle as _on_enroll_face.
         self._on_reindex_knowledge: Callable[[], None] | None = None
@@ -289,9 +294,25 @@ class JarvisUI:
     def _handle_enroll_voice(self) -> None:
         """Tray callback (M69). Same non-blocking shape as _handle_enroll_face:
         the announce → record → enroll → announce flow runs on the Announcer
-        thread via on_done."""
+        thread via on_done. No-arg ⇒ enrolls the primary user."""
         if self._on_enroll_voice is not None:
             self._on_enroll_voice()
+
+    def set_on_speaker_gate_toggle(
+        self, toggle: Callable[[], None], is_active: Callable[[], bool],
+    ) -> None:
+        """Wire the tray's 'voice lock' toggle (M69 Phase 4). main.py passes a
+        flip fn + an is-set getter over the shared speaker_gate Event."""
+        self._speaker_gate_toggle = toggle
+        self._speaker_gate_is_active = is_active
+
+    def _handle_toggle_speaker_gate(self) -> None:
+        if self._speaker_gate_toggle is not None:
+            self._speaker_gate_toggle()
+
+    def _speaker_gate_is_active_or_false(self) -> bool:
+        """Tray-checkbox safe wrapper: False before the gate is wired."""
+        return bool(self._speaker_gate_is_active and self._speaker_gate_is_active())
 
     def set_on_reindex_knowledge(self, callback: Callable[[], None]) -> None:
         """Wire the tray's 'Reindex knowledge' callback (M45). main.py calls
@@ -422,6 +443,8 @@ class JarvisUI:
             on_acoustic_toggle=self._handle_toggle_acoustic,
             on_enroll_face=self._handle_enroll_face,
             on_enroll_voice=self._handle_enroll_voice,
+            speaker_gate_enabled=self._speaker_gate_is_active_or_false,
+            on_speaker_gate_toggle=self._handle_toggle_speaker_gate,
             on_reindex_knowledge=self._handle_reindex_knowledge,
             on_restart=self._handle_restart,
             on_restart_elevated=self._handle_restart_elevated,

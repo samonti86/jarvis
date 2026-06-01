@@ -174,5 +174,31 @@ check("load_registry missing dir -> []",
       sid.load_registry(Path(tempfile.gettempdir()) / "no-such-jarvis-dir-xyz") == [])
 
 
+# --- Test 6: parse_named_enroll_intent (M69 Phase 4) -----------------------
+# Named household enrollment, checked BEFORE the primary 'enroll my voice'.
+def _pn(t):
+    return sid.parse_named_enroll_intent(t)
+
+
+check("named: \"enroll Alice's voice\" -> (Alice, en)", _pn("enroll Alice's voice") == ("Alice", "en"))
+check("named: 'enroll voice Alice' -> (Alice, en)", _pn("enroll voice Alice") == ("Alice", "en"))
+check("named: 'enroll voice Bob in Spanish' -> (Bob, es)",
+      _pn("enroll voice Bob in Spanish") == ("Bob", "es"))
+check("named: \"enroll Bob's voice in spanish\" -> (Bob, es)",
+      _pn("enroll Bob's voice in spanish") == ("Bob", "es"))
+check("named: lowercase name capitalized", _pn("enroll voice alice") == ("Alice", "en"))
+check("named: english keyword -> en", _pn("enroll voice Bob in english") == ("Bob", "en"))
+# 'my'/'your' are the PRIMARY user, not a named target -> None
+check("named: 'enroll my voice' -> None (primary)", _pn("enroll my voice") is None)
+check("named: 'enroll your voice' -> None (primary)", _pn("enroll your voice") is None)
+check("named: non-enroll text -> None", _pn("remember the milk") is None)
+check("named: empty -> None", _pn("") is None)
+# The disjointness that makes ordering work: a named utterance that the
+# PRIMARY regex ALSO matches ('enroll voice Alice') must be caught by named.
+check("named beats primary on 'enroll voice Alice'",
+      _pn("enroll voice Alice") is not None
+      and sid.matches_enroll_intent("enroll voice Alice"))
+
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)

@@ -317,6 +317,36 @@ def matches_enroll_intent(transcript: str) -> bool:
     return bool(_ENROLL_INTENT_RE.search(transcript or ""))
 
 
+# Named enrollment of OTHER household members (M69 Phase 4) — "enroll Alice's
+# voice", "enroll voice Bob in Spanish". The reliable path is the typed
+# console command (Whisper mangles names); voice works too but expect retries.
+# Two shapes: "voice <name>" and "<name>'s voice", plus an optional language.
+_NAMED_ENROLL_RE = re.compile(
+    r"\benroll\b\s+(?:the\s+)?"
+    r"(?:voice\s+(?:of\s+|for\s+)?(?P<n1>[\w'-]+)"
+    r"|(?P<n2>[\w'-]+)(?:'s|s')\s+voice)"
+    r"(?:\s+(?:in\s+)?(?P<lang>spanish|english|español|inglés))?",
+    re.IGNORECASE,
+)
+
+
+def parse_named_enroll_intent(transcript: str) -> "tuple[str, str] | None":
+    """Parse 'enroll <name>'s voice' / 'enroll voice <name>' [in Spanish] →
+    (Name, lang). Returns None when there's no named target — in particular
+    'my'/'your' map to None (that's the PRIMARY user, handled by
+    matches_enroll_intent). Check this BEFORE matches_enroll_intent, since
+    'enroll voice Alice' also matches the primary pattern's bare 'voice'."""
+    m = _NAMED_ENROLL_RE.search(transcript or "")
+    if not m:
+        return None
+    name = (m.group("n1") or m.group("n2") or "").strip()
+    if not name or name.lower() in ("my", "your", "the", "a"):
+        return None
+    raw = (m.group("lang") or "").lower()
+    lang = "es" if raw in ("spanish", "español") else "en"
+    return (name[:1].upper() + name[1:], lang)
+
+
 def run_voice_enrollment(
     announce_fn: Callable[..., None],
     capture_fn: Callable[[int, float], list | None],
