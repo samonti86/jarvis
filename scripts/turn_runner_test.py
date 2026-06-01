@@ -160,14 +160,22 @@ _speak_streaming_calls: list = []
 # fake records whether it was set at the moment "audio" was playing.
 _pc_event_ref: list = [None]
 _pc_observed: dict = {"set_during_speak": None}
+# Same observation pattern for the announce_speaking CPU gate (the 2026-06-01
+# turn-reply stutter fix): it MUST be set while a spoken reply 'plays' so the
+# armed PANNs/YOLO loops defer.
+_ann_event_ref: list = [None]
+_ann_observed: dict = {"set_during_speak": None}
 
 
 def _consuming_speak_streaming(gen, *a, **k):
     """The speak path: real speak_streaming would play audio while pulling the
     generator. We just pull it (to populate response_chunks) and record — and
-    snapshot the pc_speaking gate, which MUST be set while we 'play'."""
+    snapshot the pc_speaking + announce_speaking gates, which MUST be set while
+    we 'play'."""
     if _pc_event_ref[0] is not None:
         _pc_observed["set_during_speak"] = _pc_event_ref[0].is_set()
+    if _ann_event_ref[0] is not None:
+        _ann_observed["set_during_speak"] = _ann_event_ref[0].is_set()
     for _ in gen:
         pass
     _speak_streaming_calls.append((a, k))
@@ -260,6 +268,36 @@ main.stream_response = stream
 runner_s.process_question("quietly", "en", origin="phone_text")
 check("silent (phone_text) turn -> pc_speaking never set",
       not pc_ev_silent.is_set())
+
+
+# --- Test 4c: announce_speaking CPU gate (2026-06-01 turn-reply stutter) ---
+# An AUDIBLE turn must SET announce_speaking while it plays so the armed PANNs
+# (SoundDetector) + YOLO (SecurityWatcher) loops DEFER and don't starve the
+# Python-fed TTS path (the live-found stutter: only proactive announces were
+# gated, turn replies were not). A SILENT turn never sets it.
+ui = FakeUI(); ui.muted = False
+ann_ev = _threading.Event()
+runner = main.TurnRunner(_fake_cfg(), ui, _threading.Event(),
+                         announce_speaking=ann_ev)
+stream = FakeStream(); stream.chunks = ["hi"]
+main.stream_response = stream
+_ann_event_ref[0] = ann_ev
+_ann_observed["set_during_speak"] = None
+runner.process_question("speak up", "en", origin="console")
+check("audible turn -> announce_speaking SET while speaking (CPU loops defer)",
+      _ann_observed["set_during_speak"] is True)
+check("audible turn -> announce_speaking CLEARED after the turn",
+      not ann_ev.is_set())
+_ann_event_ref[0] = None
+
+ann_ev_silent = _threading.Event()
+runner_s = main.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
+                           announce_speaking=ann_ev_silent)
+stream = FakeStream(); stream.chunks = ["hi"]
+main.stream_response = stream
+runner_s.process_question("quietly", "en", origin="phone_text")
+check("silent (phone_text) turn -> announce_speaking never set",
+      not ann_ev_silent.is_set())
 
 
 # --- Test 5: empty response pops the orphan user message ------------------

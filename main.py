@@ -258,6 +258,7 @@ class TurnRunner:
         plex_client: PlexMCPClient | None = None,
         plex_laptop_client: PlexLaptopClient | None = None,
         pc_speaking: "threading.Event | None" = None,
+        announce_speaking: "threading.Event | None" = None,
     ) -> None:
         self._cfg = cfg
         self._ui = ui
@@ -269,6 +270,17 @@ class TurnRunner:
         # fix). Shared with the Announcer (announces set it too); a fresh local
         # Event if unwired (tests / standalone) so it's never None.
         self._pc_speaking = pc_speaking if pc_speaking is not None else threading.Event()
+        # Cooperative SPEECH gate (the 2026-05-19 stutter post-mortem) — SET
+        # while this turn plays audio so the armed CPU loops (SoundDetector's
+        # PANNs inference, SecurityWatcher's YOLO/grab/gc bursts) DEFER and
+        # don't starve the Python-fed TTS path. Same Event the Announcer sets
+        # for proactive announces; extending it to TURN replies here closes the
+        # 2026-06-01 gap where a reply spoken while armed stuttered because only
+        # announces were gated (see _build_announcer's CONTRACT). Distinct from
+        # `pc_speaking` (mic-capture echo) — different failure, same lifetime.
+        self._announce_speaking = (
+            announce_speaking if announce_speaking is not None else threading.Event()
+        )
 
         self._history: list[dict] = []
         self._last_turn_time = 0.0
@@ -505,6 +517,12 @@ class TurnRunner:
             speaking_aloud = not pc_silent
             if speaking_aloud:
                 self._pc_speaking.set()
+                # Make the armed CPU loops (PANNs inference, YOLO watcher) defer
+                # for the spoken portion of this turn, exactly as they do for a
+                # proactive announce — otherwise a reply spoken while armed
+                # stutters (2026-06-01: only announces were gated). Mirrors the
+                # pc_speaking lifetime; cleared in the same `finally`.
+                self._announce_speaking.set()
 
             try:
                 if pc_silent:
@@ -567,9 +585,11 @@ class TurnRunner:
                 self._ui.add_jarvis_text(apology)
                 return False
             finally:
-                # Stop suppressing voice capture the instant our audio ends.
+                # Stop suppressing voice capture + release the speech gate the
+                # instant our audio ends (so the armed loops resume promptly).
                 if speaking_aloud:
                     self._pc_speaking.clear()
+                    self._announce_speaking.clear()
                 # M52: always wind the barge-in monitor down — normal end,
                 # exception, OR barge-in. monitor_stop makes its next
                 # session.read() (≤80ms away) the last; the join is instant
@@ -638,6 +658,7 @@ def listen_loop(
     remote_server: object | None = None,
     mic_device: int | None = None,
     pc_speaking: threading.Event | None = None,
+    announce_speaking: threading.Event | None = None,
 ) -> None:
     """Daemon worker. Owns the input loops; delegates each turn to a shared
     TurnRunner (which owns the conversation state, persists turns, and seals
@@ -654,7 +675,7 @@ def listen_loop(
     # MemoryStore and runs each turn end-to-end. Voice + text share this ONE
     # instance (its lock keeps them from overlapping). See the TurnRunner class.
     runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client,
-                        pc_speaking)
+                        pc_speaking, announce_speaking)
 
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
@@ -1787,6 +1808,7 @@ def main() -> None:
             "remote_server": remote_server,
             "mic_device": mic_device_index,
             "pc_speaking": pc_speaking,
+            "announce_speaking": announce_speaking,
         },
         daemon=True,
     )
