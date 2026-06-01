@@ -68,6 +68,7 @@ class JarvisTray:
         acoustic_enabled: Callable[[], bool] | None = None,
         on_acoustic_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
+        on_enroll_voice: Callable[[], None] | None = None,
         on_reindex_knowledge: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
         on_restart_elevated: Callable[[], None] | None = None,
@@ -97,6 +98,7 @@ class JarvisTray:
         self._acoustic_enabled = acoustic_enabled
         self._on_acoustic_toggle = on_acoustic_toggle
         self._on_enroll_face = on_enroll_face
+        self._on_enroll_voice = on_enroll_voice
         self._on_reindex_knowledge = on_reindex_knowledge
         self._on_restart = on_restart
         self._on_restart_elevated = on_restart_elevated
@@ -179,6 +181,13 @@ class JarvisTray:
             # "Jarvis, enroll my face" via main.py's listen_loop.
             menu_items.append(pystray.MenuItem(
                 "Enroll my face", self._handle_enroll_face,
+            ))
+        if on_enroll_voice is not None:
+            # M69: enroll the user's voice for speaker ID. Same voice-first
+            # flow (Jarvis announces, records, announces result) and the same
+            # callback the "Jarvis, enroll my voice" intent fires.
+            menu_items.append(pystray.MenuItem(
+                "Enroll my voice", self._handle_enroll_voice,
             ))
         if on_reindex_knowledge is not None:
             # M45: rebuild the FTS5 knowledge index from the corpus folder.
@@ -272,6 +281,10 @@ class JarvisTray:
     def _handle_enroll_face(self) -> None:
         if self._on_enroll_face is not None:
             self._on_enroll_face()
+
+    def _handle_enroll_voice(self) -> None:
+        if self._on_enroll_voice is not None:
+            self._on_enroll_voice()
 
     def _handle_reindex_knowledge(self) -> None:
         if self._on_reindex_knowledge is not None:

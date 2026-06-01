@@ -49,6 +49,7 @@ from src.llm import TelemetryRecord, stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.plex_laptop import DEFAULT_LOG_PATH as DEFAULT_PLEX_LAPTOP_LOG, PlexLaptopClient
 from src.plex_mcp import PlexMCPClient
+from src import speaker_id
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
 from src.tray import State
@@ -653,6 +654,7 @@ def listen_loop(
     plex_laptop_client: PlexLaptopClient | None = None,
     security_watcher: "SecurityWatcher | None" = None,
     on_enroll_face: "Callable[[], None] | None" = None,
+    on_enroll_voice: "Callable[[], None] | None" = None,
     on_knowledge_reindex: "Callable[[], None] | None" = None,
     on_knowledge_remember: "Callable[[str], None] | None" = None,
     remote_server: object | None = None,
@@ -742,6 +744,14 @@ def listen_loop(
                 if matches_enroll_intent(text):
                     ui.add_user_text(text, lang)
                     on_enroll_face()
+                    ui.set_state(State.IDLE)
+                    continue
+
+            # M69: typed "enroll my voice" — same dispatch as the voice path.
+            if not attachments and on_enroll_voice is not None:
+                if speaker_id.matches_enroll_intent(text):
+                    ui.add_user_text(text, lang)
+                    on_enroll_voice()
                     ui.set_state(State.IDLE)
                     continue
 
@@ -964,6 +974,23 @@ def listen_loop(
                         print("[main] (no speech captured)\n")
                     continue
 
+                # M69 Phase 2: identify the speaker on the SAME audio STT just
+                # captured (read-only — logs WHO spoke; does not gate). Active
+                # only when at least one voice is enrolled. The per-turn
+                # registry reload is sub-ms at personal scale, so a fresh
+                # enrollment takes effect on the very next turn with no plumbing.
+                if transcript.audio is not None:
+                    _speakers = speaker_id.load_registry(default_base_dir() / "speakers")
+                    if _speakers:
+                        _who = speaker_id.identify(
+                            transcript.audio, _speakers, cfg.speaker_threshold)
+                        if _who.recognized:
+                            print(f"[speaker] recognized {_who.name} "
+                                  f"(score={_who.score:.2f})", file=sys.stderr)
+                        else:
+                            print(f"[speaker] unrecognized voice "
+                                  f"(best={_who.score:.2f})", file=sys.stderr)
+
                 # Hand the transcript to the security subsystem first. It
                 # consumes the turn (returns True) for both challenge
                 # authentication AND activate/disarm intents — claude
@@ -990,6 +1017,18 @@ def listen_loop(
                     if matches_enroll_intent(transcript.text):
                         ui.add_user_text(transcript.text, transcript.language)
                         on_enroll_face()
+                        ui.set_state(State.IDLE)
+                        followup = False
+                        continue
+
+                # M69: "enroll my voice" intent — same placement as face-enroll
+                # (after security, before Claude) so the LLM doesn't try to
+                # handle it. Disjoint from the face intent (anchored on "voice"
+                # vs "face"), so order between them is immaterial.
+                if on_enroll_voice is not None:
+                    if speaker_id.matches_enroll_intent(transcript.text):
+                        ui.add_user_text(transcript.text, transcript.language)
+                        on_enroll_voice()
                         ui.set_state(State.IDLE)
                         followup = False
                         continue
@@ -1630,6 +1669,39 @@ def main() -> None:
 
     ui.set_on_enroll_face(_trigger_face_enrollment)
 
+    # M69: voice-enrollment trigger (speaker ID). Mirrors face enrollment —
+    # shared by the tray "Enroll my voice" and the voice intent "Jarvis,
+    # enroll my voice". Records a few CONSECUTIVE clips from the pinned mic
+    # (the user talks continuously) which enroll_from_audio averages into one
+    # embedding. The capture opens its own short-lived recording stream — a
+    # second stream on the mic device, the same coexistence M58 relies on —
+    # so it doesn't race the listen loop's AudioSession.
+    def _capture_voice_clips(num_clips: int, clip_seconds: float):
+        import sounddevice as _sd  # noqa: PLC0415 — lazy
+        clips = []
+        try:
+            for _ in range(num_clips):
+                rec = _sd.rec(int(clip_seconds * cfg.sample_rate),
+                              samplerate=cfg.sample_rate, channels=1,
+                              dtype="int16", device=mic_device_index)
+                _sd.wait()
+                clips.append(rec[:, 0].copy())
+        except Exception as exc:  # noqa: BLE001 — defensive against mic errors
+            print(f"[speaker_id] enrollment capture failed: {exc}", file=sys.stderr)
+            return None
+        return clips
+
+    def _trigger_voice_enrollment() -> None:
+        speaker_id.run_voice_enrollment(
+            _announce,
+            _capture_voice_clips,
+            default_base_dir() / "speakers",
+            name=cfg.user_name,
+            lang="en",
+        )
+
+    ui.set_on_enroll_voice(_trigger_voice_enrollment)
+
     # M45: knowledge-base triggers. Shared by the tray ("Reindex knowledge")
     # AND the voice intents ("Jarvis, update your knowledge" / "remember this
     # permanently: ..."). Non-blocking: the reindex / file-write is pure
@@ -1798,11 +1870,20 @@ def main() -> None:
         plex_client, plex_laptop_client, remote_server, calendar_monitor,
     )
 
+    # M69 — if any voice is enrolled, warm the speaker-ID model in the
+    # background now so the first identified turn doesn't eat the ~5-15s
+    # first-call JIT (mirrors face_auth's cold-start warming). No enrolled
+    # voice ⇒ skip entirely (no torch load, no cost).
+    if speaker_id.load_registry(default_base_dir() / "speakers"):
+        threading.Thread(target=speaker_id.warm, name="SpeakerWarm",
+                         daemon=True).start()
+
     worker = threading.Thread(
         target=listen_loop,
         args=(cfg, ui, reset_event, plex_client, plex_laptop_client, security_watcher),
         kwargs={
             "on_enroll_face": _trigger_face_enrollment,
+            "on_enroll_voice": _trigger_voice_enrollment,
             "on_knowledge_reindex": _trigger_knowledge_reindex,
             "on_knowledge_remember": _trigger_knowledge_remember,
             "remote_server": remote_server,
