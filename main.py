@@ -661,6 +661,7 @@ def listen_loop(
     mic_device: int | None = None,
     pc_speaking: threading.Event | None = None,
     announce_speaking: threading.Event | None = None,
+    speaker_gate: threading.Event | None = None,
 ) -> None:
     """Daemon worker. Owns the input loops; delegates each turn to a shared
     TurnRunner (which owns the conversation state, persists turns, and seals
@@ -747,8 +748,17 @@ def listen_loop(
                     ui.set_state(State.IDLE)
                     continue
 
-            # M69: typed "enroll my voice" — same dispatch as the voice path.
+            # M69: typed voice-enrollment — the RELIABLE named path (typed
+            # names beat Whisper's guesses). Named ("enroll Alice's voice",
+            # "enroll voice Bob in Spanish") checked before the primary
+            # ("enroll my voice"). This text path is never voice-gated.
             if not attachments and on_enroll_voice is not None:
+                _named = speaker_id.parse_named_enroll_intent(text)
+                if _named is not None:
+                    ui.add_user_text(text, lang)
+                    on_enroll_voice(_named[0], _named[1])
+                    ui.set_state(State.IDLE)
+                    continue
                 if speaker_id.matches_enroll_intent(text):
                     ui.add_user_text(text, lang)
                     on_enroll_voice()
@@ -974,11 +984,18 @@ def listen_loop(
                         print("[main] (no speech captured)\n")
                     continue
 
-                # M69 Phase 2: identify the speaker on the SAME audio STT just
-                # captured (read-only — logs WHO spoke; does not gate). Active
-                # only when at least one voice is enrolled. The per-turn
+                # M69: identify the speaker on the SAME audio STT just captured.
+                # Active only when at least one voice is enrolled. The per-turn
                 # registry reload is sub-ms at personal scale, so a fresh
                 # enrollment takes effect on the very next turn with no plumbing.
+                # Phase 4: if the "voice lock" gate is ON and this is a
+                # CONFIDENTLY unrecognized voice, drop the turn — don't route
+                # background media / strangers to Claude. Fail-open by design:
+                # the threshold sits below the user's rough-voice floor, so a
+                # degraded real-user clip still 'recognizes' and never reaches
+                # the drop. (The typed/console path is never gated — placed
+                # BEFORE the security + enroll intents so a locked-out voice
+                # can't drive them either.)
                 if transcript.audio is not None:
                     _speakers = speaker_id.load_registry(default_base_dir() / "speakers")
                     if _speakers:
@@ -990,6 +1007,12 @@ def listen_loop(
                         else:
                             print(f"[speaker] unrecognized voice "
                                   f"(best={_who.score:.2f})", file=sys.stderr)
+                            if speaker_gate is not None and speaker_gate.is_set():
+                                print("[speaker] voice-lock active → ignoring "
+                                      "unrecognized turn", file=sys.stderr)
+                                ui.set_state(State.IDLE)
+                                followup = False
+                                continue
 
                 # Hand the transcript to the security subsystem first. It
                 # consumes the turn (returns True) for both challenge
@@ -1021,11 +1044,20 @@ def listen_loop(
                         followup = False
                         continue
 
-                # M69: "enroll my voice" intent — same placement as face-enroll
-                # (after security, before Claude) so the LLM doesn't try to
-                # handle it. Disjoint from the face intent (anchored on "voice"
-                # vs "face"), so order between them is immaterial.
+                # M69: voice-enrollment intents — same placement as face-enroll
+                # (after security, before Claude). NAMED ("enroll Alice's voice"
+                # → a household member) is checked BEFORE the primary ("enroll
+                # my voice"), because "enroll voice <name>" also matches the
+                # primary pattern's bare "voice". Spoken names are error-prone
+                # (Whisper) — the typed console path is the reliable one.
                 if on_enroll_voice is not None:
+                    _named = speaker_id.parse_named_enroll_intent(transcript.text)
+                    if _named is not None:
+                        ui.add_user_text(transcript.text, transcript.language)
+                        on_enroll_voice(_named[0], _named[1])
+                        ui.set_state(State.IDLE)
+                        followup = False
+                        continue
                     if speaker_id.matches_enroll_intent(transcript.text):
                         ui.add_user_text(transcript.text, transcript.language)
                         on_enroll_voice()
@@ -1691,16 +1723,37 @@ def main() -> None:
             return None
         return clips
 
-    def _trigger_voice_enrollment() -> None:
+    def _trigger_voice_enrollment(name: str | None = None, lang: str = "en") -> None:
+        # name=None ⇒ the primary user (the no-arg voice intent / tray item);
+        # a name ⇒ a named household member (the typed "enroll Alice's voice").
         speaker_id.run_voice_enrollment(
             _announce,
             _capture_voice_clips,
             default_base_dir() / "speakers",
-            name=cfg.user_name,
-            lang="en",
+            name=name or cfg.user_name,
+            lang=lang,
         )
 
     ui.set_on_enroll_voice(_trigger_voice_enrollment)
+
+    # M69 Phase 4: the opt-in "voice lock" gate as a runtime-toggleable Event
+    # (tray + JARVIS_SPEAKER_GATE). SET = only enrolled voices are answered; a
+    # confidently-unrecognized VOICE turn is dropped (the text/console path is
+    # never gated — physical access implies authorization). Starts from the
+    # config flag; the tray toggle flips it live, no restart.
+    speaker_gate = threading.Event()
+    if cfg.speaker_gate_enabled:
+        speaker_gate.set()
+
+    def _toggle_speaker_gate() -> None:
+        if speaker_gate.is_set():
+            speaker_gate.clear()
+            print("[speaker] voice-lock gate OFF", file=sys.stderr)
+        else:
+            speaker_gate.set()
+            print("[speaker] voice-lock gate ON", file=sys.stderr)
+
+    ui.set_on_speaker_gate_toggle(_toggle_speaker_gate, speaker_gate.is_set)
 
     # M45: knowledge-base triggers. Shared by the tray ("Reindex knowledge")
     # AND the voice intents ("Jarvis, update your knowledge" / "remember this
@@ -1890,6 +1943,7 @@ def main() -> None:
             "mic_device": mic_device_index,
             "pc_speaking": pc_speaking,
             "announce_speaking": announce_speaking,
+            "speaker_gate": speaker_gate,
         },
         daemon=True,
     )

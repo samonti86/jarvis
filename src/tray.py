@@ -69,6 +69,8 @@ class JarvisTray:
         on_acoustic_toggle: Callable[[], None] | None = None,
         on_enroll_face: Callable[[], None] | None = None,
         on_enroll_voice: Callable[[], None] | None = None,
+        speaker_gate_enabled: Callable[[], bool] | None = None,
+        on_speaker_gate_toggle: Callable[[], None] | None = None,
         on_reindex_knowledge: Callable[[], None] | None = None,
         on_restart: Callable[[], None] | None = None,
         on_restart_elevated: Callable[[], None] | None = None,
@@ -99,6 +101,8 @@ class JarvisTray:
         self._on_acoustic_toggle = on_acoustic_toggle
         self._on_enroll_face = on_enroll_face
         self._on_enroll_voice = on_enroll_voice
+        self._speaker_gate_enabled = speaker_gate_enabled
+        self._on_speaker_gate_toggle = on_speaker_gate_toggle
         self._on_reindex_knowledge = on_reindex_knowledge
         self._on_restart = on_restart
         self._on_restart_elevated = on_restart_elevated
@@ -172,6 +176,16 @@ class JarvisTray:
                 "Acoustic awareness",
                 self._handle_toggle_acoustic,
                 checked=lambda item: bool(self._acoustic_enabled()),
+            ))
+        if speaker_gate_enabled is not None and on_speaker_gate_toggle is not None:
+            # Voice lock (M69 Phase 4): when checked, Jarvis answers only
+            # enrolled voices and ignores confidently-unrecognized ones (e.g.
+            # the TV). Fail-open — a degraded clip of an enrolled user still
+            # passes. Same state the JARVIS_SPEAKER_GATE .env flag sets.
+            menu_items.append(pystray.MenuItem(
+                "Voice lock (only enrolled voices)",
+                self._handle_toggle_speaker_gate,
+                checked=lambda item: bool(self._speaker_gate_enabled()),
             ))
         if on_enroll_face is not None:
             # M39: enroll the user's face for the security-mode auth path.
@@ -285,6 +299,10 @@ class JarvisTray:
     def _handle_enroll_voice(self) -> None:
         if self._on_enroll_voice is not None:
             self._on_enroll_voice()
+
+    def _handle_toggle_speaker_gate(self) -> None:
+        if self._on_speaker_gate_toggle is not None:
+            self._on_speaker_gate_toggle()
 
     def _handle_reindex_knowledge(self) -> None:
         if self._on_reindex_knowledge is not None:
