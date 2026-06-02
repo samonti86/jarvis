@@ -1756,18 +1756,27 @@ def main() -> None:
     # M69 Phase 4: the opt-in "voice lock" gate as a runtime-toggleable Event
     # (tray + JARVIS_SPEAKER_GATE). SET = only enrolled voices are answered; a
     # confidently-unrecognized VOICE turn is dropped (the text/console path is
-    # never gated — physical access implies authorization). Starts from the
-    # config flag; the tray toggle flips it live, no restart.
+    # never gated — physical access implies authorization). The tray toggle
+    # flips it live, no restart.
+    #
+    # Persisted across restarts (2026-06-02): a user who locks the mic expects
+    # it to STAY locked next launch. Initial state = the persisted ui_state
+    # flag if present, else the env default (JARVIS_SPEAKER_GATE) for a fresh
+    # install; the tray toggle writes the flag so the choice is sticky.
+    from src import ui_state  # noqa: PLC0415 — local import, main.py convention
     speaker_gate = threading.Event()
-    if cfg.speaker_gate_enabled:
+    if ui_state.get_flag("speaker_gate", cfg.speaker_gate_enabled):
         speaker_gate.set()
+        print("[speaker] voice-lock gate restored ON", file=sys.stderr)
 
     def _toggle_speaker_gate() -> None:
         if speaker_gate.is_set():
             speaker_gate.clear()
+            ui_state.set_flag("speaker_gate", False)
             print("[speaker] voice-lock gate OFF", file=sys.stderr)
         else:
             speaker_gate.set()
+            ui_state.set_flag("speaker_gate", True)
             print("[speaker] voice-lock gate ON", file=sys.stderr)
 
     ui.set_on_speaker_gate_toggle(_toggle_speaker_gate, speaker_gate.is_set)
