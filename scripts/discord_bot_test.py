@@ -101,6 +101,11 @@ check("short content kept", thread_name("what's the weather") == "what's the wea
 check("collapses whitespace/newlines", thread_name("line one\n  line two") == "line one line two")
 check("truncates to limit", len(thread_name("x" * 200)) == 90)
 check("empty -> 'Jarvis'", thread_name("") == "Jarvis")
+# The title-fix composition: a mentioned message yields a CLEAN title (no <@id>).
+_botid = 1511458265244897451
+check("mention-stripped text makes a clean thread title (no <@id> leak)",
+      thread_name(strip_bot_mention(f"<@{_botid}> what is the weather", _botid))
+      == "what is the weather")
 
 
 print("\n[group] chunk_message — Discord 2000-char limit")
