@@ -48,6 +48,25 @@ class Config:
     speaker_gate_enabled: bool  # M69 — opt-in "respond only to enrolled voices" gate. Default off. When on AND a voice is enrolled, a confidently-unrecognized turn (e.g. background TV) is dropped. Fail-open: borderline still responds.
     user_name: str             # M69 — the name the primary user is enrolled under (via "enroll my voice" / the tray). Shows in [speaker] logs. Default "you"; set JARVIS_USER_NAME to your name.
     reminder_discord_enabled: bool  # 2026-06-02 — also push a reminder's text to the Discord webhook when it fires, so reminders reach the user when away from the PC. Default ON when DISCORD_WEBHOOK_URL is set (no presence detection, so it always pushes — harmless redundancy when home). Set JARVIS_REMINDER_DISCORD=0 to disable.
+    discord_bot_token: str            # 2026-06-02 — bot token (Developer Portal → Bot → Reset Token). Enables the two-way Discord channel client. Blank = bot disabled. The ONLY secret of the three; keep out of git.
+    discord_channel_id: int           # the one channel the bot listens in (coarse access boundary). 0 = unset (bot disabled).
+    discord_allowed_user_ids: tuple[int, ...]  # fine access boundary — only these Discord user IDs may talk to Jarvis. Empty = bot disabled (fail-closed: no allowlist ⇒ nobody, never everybody).
+
+
+def _parse_channel_id(raw: str) -> int:
+    """A Discord channel ID is a numeric snowflake; 0 if unset/garbage."""
+    raw = (raw or "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def _parse_user_ids(raw: str) -> tuple[int, ...]:
+    """Comma-separated Discord user IDs → a tuple of ints. Non-numeric tokens
+    are dropped (defensive — an allowlist that silently accepts garbage as a
+    user would be a security hole; better to drop it and fail closed)."""
+    return tuple(
+        int(tok) for tok in (raw or "").replace(" ", "").split(",")
+        if tok.isdigit()
+    )
 
 
 def load() -> Config:
@@ -137,5 +156,10 @@ def load() -> Config:
         reminder_discord_enabled=(
             os.getenv("JARVIS_REMINDER_DISCORD", "1").strip().lower()
             not in ("0", "false", "no", "off")
+        ),
+        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
+        discord_channel_id=_parse_channel_id(os.getenv("DISCORD_CHANNEL_ID", "")),
+        discord_allowed_user_ids=_parse_user_ids(
+            os.getenv("DISCORD_ALLOWED_USER_IDS", "")
         ),
     )

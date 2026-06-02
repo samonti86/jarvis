@@ -117,3 +117,8 @@ sentence-transformers>=3.0
 # `pip uninstall -y typing`. See the M69 entry.
 resemblyzer>=0.1.4
 
+# Discord bot bridge (2026-06-02) — a private channel as a two-way Jarvis
+# client. Gateway bot (outbound, no inbound port needed). Needs a bot token +
+# the Message Content privileged intent enabled in the Developer Portal.
+discord.py>=2.7.1
+

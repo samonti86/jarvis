@@ -325,6 +325,7 @@ class TurnRunner:
         attachments: list[dict] | None = None,
         origin: str = "voice",
         reply_audio: "Callable[[bytes], None] | None" = None,
+        reply_text: "Callable[[str], None] | None" = None,
         session: AudioSession | None = None,
     ) -> bool:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
@@ -372,8 +373,26 @@ class TurnRunner:
         # restricted, which is why these are separate axes off `origin`.
         # NB: deliberately NOT named `speak` — that shadowed the imported
         # speak() function and crashed the apology path ('bool' not callable).
-        text_only = origin == "phone_text"
-        restricted = origin in ("phone_text", "phone_voice")
+        # "discord" (2026-06-02): a Discord-channel turn is text-only (the
+        # reply posts to the channel, the PC never speaks to its empty room)
+        # AND restricted (an internet-relayed, multi-human surface gets the
+        # same reduced tool boundary as the phone — no system/shell/file/code).
+        text_only = origin in ("phone_text", "discord")
+        restricted = origin in ("phone_text", "phone_voice", "discord")
+
+        def _emit_remote_reply(answer: str) -> None:
+            """Post the final reply to a per-turn TEXT sink (Discord), if one
+            was supplied. ONLY the originating surface — this is deliberately
+            NOT the add_jarvis_text broadcast, so a PC/voice/phone turn never
+            leaks into a shared Discord channel. Covers both the success and
+            the apology paths so a remote user always gets *something* back.
+            Fail-soft — a post hiccup can't break the turn."""
+            if reply_text is None:
+                return
+            try:
+                reply_text(answer)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[main] reply_text sink failed: {exc}", file=sys.stderr)
 
         with self._lock:
             # Apply any pending reset/idle boundary BEFORE this turn — so the
@@ -584,6 +603,7 @@ class TurnRunner:
                 # the error path (extra failure surface for little gain — the
                 # text is enough to convey the hiccup).
                 self._ui.add_jarvis_text(apology)
+                _emit_remote_reply(apology)
                 return False
             finally:
                 # Stop suppressing voice capture + release the speech gate the
@@ -622,6 +642,7 @@ class TurnRunner:
             self._memory.record_turn(text, full_response, language)
 
             self._ui.add_jarvis_text(full_response)
+            _emit_remote_reply(full_response)
 
             # M48.2b: speak the reply to the phone that asked (UNICAST,
             # mute-independent). Whole-reply-at-completion v1 — matches the
@@ -683,16 +704,20 @@ def listen_loop(
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
     # process_question. attachments is list[tuple[str, dict]] (filename + block).
-    # M48.2/M48.2b/M48.3: item is (text, attachments, origin, reply_audio, lang).
-    # origin ∈ {"console","phone_text","phone_voice"} — derives PC-TTS gating
-    # (phone_text/phone_voice don't speak on the PC) AND restricted tool
-    # surface (phone origins lose system/shell/file/etc.).
+    # M48.2/M48.2b/M48.3: item is
+    #   (text, attachments, origin, reply_audio, lang, reply_text).
+    # origin ∈ {"console","phone_text","phone_voice","discord"} — derives
+    # PC-TTS gating (phone_*/discord don't speak on the PC) AND restricted tool
+    # surface (phone + discord origins lose system/shell/file/etc.).
     # reply_audio: None (console — PC behaviour) or a conn-bound sink (phone)
     # — its presence routes this reply's audio to THAT phone instead of PC.
     # lang: M48.3 — whisper-detected ISO-639-1 for phone_voice (so Spanish-
     # spoken into the phone gets a Spanish reply + a Spanish voice); "en"
     # for typed inputs where we have no detection. Voice path on the PC
     # mic calls process_question directly (not via this queue), unaffected.
+    # reply_text (2026-06-02): None, or a PER-TURN text sink (Discord) that
+    # posts the reply back to the originating channel — NOT a broadcast, so a
+    # PC/phone turn never leaks into the shared channel.
     text_queue: queue.Queue[
         tuple[
             str,
@@ -700,6 +725,7 @@ def listen_loop(
             str,
             "Callable[[bytes], None] | None",
             str,
+            "Callable[[str], None] | None",
         ]
     ] = queue.Queue()
 
@@ -713,12 +739,22 @@ def listen_loop(
                 continue
             if ui.shutdown.is_set():
                 break
-            text, attachments, origin, reply_audio, lang = item
+            text, attachments, origin, reply_audio, lang, reply_text = item
             blocks = [block for _, block in attachments] if attachments else []
             print(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
                 file=sys.stderr,
             )
+
+            # Discord is a conversational-only remote surface: it must NOT fire
+            # the local privileged shortcuts below (face/voice enrollment
+            # captures the PC's OWN camera/mic — nonsensical and unsafe to
+            # trigger from a chat message; the security + knowledge shortcuts
+            # are likewise reserved for the physically-present / trusted
+            # personal paths). A Discord turn goes straight to the LLM with the
+            # restricted tool surface. Easy to relax later (e.g. deliberate
+            # remote arming), but v1 keeps it strictly conversational.
+            local_shortcuts = origin != "discord"
 
             # Same security-intent dispatch as the voice listen_loop:
             # "activate security", "stand down", and challenge-passphrase
@@ -726,7 +762,7 @@ def listen_loop(
             # this, typed "activate security" gets routed to Claude, which
             # has no tool to arm the watcher and ends up calling
             # system_control to lock the workstation instead.
-            if security_watcher is not None and not attachments:
+            if local_shortcuts and security_watcher is not None and not attachments:
                 try:
                     if security_watcher.handle_transcript(text):
                         ui.add_user_text(text, lang)
@@ -740,7 +776,7 @@ def listen_loop(
             # Uses the on_enroll_face kwarg (wired by main()) rather than a
             # bare name — _trigger_face_enrollment lives in main()'s scope,
             # not listen_loop's.
-            if not attachments and on_enroll_face is not None:
+            if local_shortcuts and not attachments and on_enroll_face is not None:
                 from src.face_auth import matches_enroll_intent  # noqa: PLC0415
                 if matches_enroll_intent(text):
                     ui.add_user_text(text, lang)
@@ -752,7 +788,7 @@ def listen_loop(
             # names beat Whisper's guesses). Named ("enroll Alice's voice",
             # "enroll voice Bob in Spanish") checked before the primary
             # ("enroll my voice"). This text path is never voice-gated.
-            if not attachments and on_enroll_voice is not None:
+            if local_shortcuts and not attachments and on_enroll_voice is not None:
                 _named = speaker_id.parse_named_enroll_intent(text)
                 if _named is not None:
                     ui.add_user_text(text, lang)
@@ -767,7 +803,7 @@ def listen_loop(
 
             # M45: typed knowledge-base intents — same dispatch as the voice
             # path (remember-permanently before reindex; both before Claude).
-            if not attachments and (
+            if local_shortcuts and not attachments and (
                 on_knowledge_remember is not None or on_knowledge_reindex is not None
             ):
                 from src import knowledge as _kb  # noqa: PLC0415
@@ -799,7 +835,7 @@ def listen_loop(
                 # `language` arg drives TTS voice selection downstream.
                 runner.process_question(
                     text, lang, attachments=blocks, origin=origin,
-                    reply_audio=reply_audio,
+                    reply_audio=reply_audio, reply_text=reply_text,
                 )
             finally:
                 ui.set_state(State.IDLE)
@@ -810,7 +846,7 @@ def listen_loop(
     # (text, attachments) args into a single queue item.
     ui.set_on_text_submit(
         lambda text, attachments: text_queue.put(
-            (text, attachments, "console", None, "en")  # console → no phone audio sink; lang "en" (no detection on typed)
+            (text, attachments, "console", None, "en", None)  # console → no phone audio sink, no remote text sink; lang "en"
         )
     )
 
@@ -825,7 +861,7 @@ def listen_loop(
         # non-None ⇒ this reply's audio goes to THAT phone, not the PC.
         remote_server.set_on_text(
             lambda t, reply_audio: text_queue.put(
-                (t, [], "phone_text", reply_audio, "en")  # phone typed → "en" (no detection on typed)
+                (t, [], "phone_text", reply_audio, "en", None)  # phone typed → "en"; text reply rides the broadcast sink
             )
         )
 
@@ -859,7 +895,7 @@ def listen_loop(
                     # selection — phone Spanish gets a Spanish voice reply.
                     lang = (t.language or "en").strip() or "en"
                     text_queue.put(
-                        (text, [], "phone_voice", reply_audio, lang)
+                        (text, [], "phone_voice", reply_audio, lang, None)
                     )
                 except Exception as exc:  # noqa: BLE001 — never crash the WS loop's caller
                     print(
@@ -874,6 +910,35 @@ def listen_loop(
                 target=_worker, name="PhoneAudioSTT", daemon=True
             ).start()
         remote_server.set_on_audio(_on_phone_audio)
+
+    # Discord bot bridge (2026-06-02) — a private channel as a two-way Jarvis
+    # client, riding the SAME text_queue as the phone. Messages from
+    # allowlisted users in the configured channel enqueue with origin="discord"
+    # (→ restricted tools + text-only); the per-turn `reply` sink posts the
+    # answer back to THAT channel (never a broadcast — no leak of PC/phone
+    # turns into the shared channel). Fail-closed + graceful: needs ALL THREE
+    # of token/channel/allowlist, else it doesn't start. Outbound gateway
+    # connection, so no inbound port / Tailscale needed — works off-network.
+    if (cfg.discord_bot_token and cfg.discord_channel_id
+            and cfg.discord_allowed_user_ids):
+        try:
+            from src.discord_bot import DiscordBot  # noqa: PLC0415
+            _discord_bot = DiscordBot(
+                cfg.discord_bot_token, cfg.discord_channel_id,
+                cfg.discord_allowed_user_ids,
+            )
+            _discord_bot.set_on_text(
+                lambda t, reply: text_queue.put(
+                    (t, [], "discord", None, "en", reply)
+                )
+            )
+            _discord_bot.start()
+            print("[discord] bot bridge enabled", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — a bad bot must never stop Jarvis
+            print(f"[discord] bot failed to start: {exc}", file=sys.stderr)
+    elif cfg.discord_bot_token:
+        print("[discord] token set but channel/allowlist incomplete — bot "
+              "disabled", file=sys.stderr)
 
     text_thread = threading.Thread(target=text_input_loop, daemon=True)
     text_thread.start()
