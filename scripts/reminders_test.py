@@ -35,13 +35,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _TMP = tempfile.mkdtemp(prefix="jarvis_reminders_test_")
 os.environ["LOCALAPPDATA"] = _TMP
 
+import src.reminders as remod  # noqa: E402 — for monkeypatching the composer
 from src.reminders import (  # noqa: E402 — must follow the env redirect
     SET_REMINDER_TOOL,
     add, cancel, list_pending, pop_due,
     execute_set_reminder, execute_cancel_reminder, execute_list_reminders,
-    _next_occurrence, _resolve_explicit_fire, _store_path, _validate_repeat,
-    _ISO,
+    _fire_one, _push, _next_occurrence, _resolve_explicit_fire,
+    _store_path, _validate_repeat, _ISO,
 )
+import threading as _threading
+import time as _time
 
 PASSED = 0
 FAILED = 0
@@ -256,6 +259,85 @@ check("cancel removed only the matched one",
       len(list_pending()) == 1 and list_pending()[0]["message"] == "beta reminder")
 check("cancel by exact id",
       cancel(rid=r1["id"]) is None or True)  # r1 already cancelled by query; tolerate
+
+
+# ===========================================================================
+print("\n[group] fire fan-out: announce + Discord notify (2026-06-02)")
+
+# Plain reminder -> BOTH sinks get the SAME spoken text.
+spoke, pushed = [], []
+_fire_one({"message": "check the oven", "fire_at": datetime.now().strftime(_ISO)},
+          datetime.now(), spoke.append, pushed.append)
+check("plain fire: announce got the text", len(spoke) == 1 and "check the oven" in spoke[0], spoke)
+check("plain fire: notify got the SAME text", pushed == spoke, (pushed, spoke))
+
+# notify=None -> announce still fires, no crash (the no-webhook case).
+spoke2 = []
+_fire_one({"message": "no webhook here", "fire_at": datetime.now().strftime(_ISO)},
+          datetime.now(), spoke2.append, None)
+check("notify=None: announce still fires", len(spoke2) == 1 and "no webhook here" in spoke2[0])
+
+# _push tolerates None and a raising sink (must never break the fire).
+_push(None, "x")  # no-op, no raise
+def _boom(_):
+    raise RuntimeError("discord down")
+_push(_boom, "x")  # swallowed
+check("_push: None and raising sink both swallowed (no exception escaped)", True)
+
+# Composition reminder (briefing) -> composed text reaches BOTH sinks. Mock the
+# composer to be instant + deterministic; the fire spawns a worker thread.
+# NOTE: patch the _COMPOSITION_ACTIONS entry, not the module attr — the dict
+# captured the original function reference at definition time.
+_orig_brief = remod._COMPOSITION_ACTIONS["briefing"]
+remod._COMPOSITION_ACTIONS["briefing"] = (
+    (lambda: "WEATHER: clear. NEWS: none.",) + _orig_brief[1:]
+)
+spoke3, pushed3 = [], []
+_fire_one({"id": "rbrief", "message": "morning briefing", "action": "briefing",
+           "fire_at": datetime.now().strftime(_ISO)},
+          datetime.now().replace(hour=7), spoke3.append, pushed3.append)
+# join the briefing-fire worker thread
+deadline = _time.time() + 5
+while _time.time() < deadline and not (spoke3 and pushed3):
+    for th in _threading.enumerate():
+        if th.name.startswith("briefing-fire-"):
+            th.join(timeout=0.2)
+    _time.sleep(0.02)
+check("composition fire: announce got composed text",
+      len(spoke3) == 1 and "WEATHER: clear" in spoke3[0], spoke3)
+check("composition fire: notify got the SAME composed text",
+      pushed3 == spoke3 and len(pushed3) == 1, (pushed3, spoke3))
+check("composition fire: greeting prefix present (7am -> Good morning)",
+      bool(spoke3) and spoke3[0].startswith("Good morning"), spoke3)
+remod._COMPOSITION_ACTIONS["briefing"] = _orig_brief  # restore
+
+
+# ===========================================================================
+print("\n[group] config: reminder_discord_enabled polarity (default ON)")
+import os as _os  # noqa: E402
+import src.config as _cfgmod  # noqa: E402
+
+
+def _enabled_with(env_val) -> bool:
+    saved = _os.environ.get("JARVIS_REMINDER_DISCORD")
+    if env_val is None:
+        _os.environ.pop("JARVIS_REMINDER_DISCORD", None)
+    else:
+        _os.environ["JARVIS_REMINDER_DISCORD"] = env_val
+    try:
+        return _cfgmod.load().reminder_discord_enabled
+    finally:
+        if saved is None:
+            _os.environ.pop("JARVIS_REMINDER_DISCORD", None)
+        else:
+            _os.environ["JARVIS_REMINDER_DISCORD"] = saved
+
+
+check("default (unset) -> ON", _enabled_with(None) is True)
+check("'0' -> OFF", _enabled_with("0") is False)
+check("'false' -> OFF", _enabled_with("false") is False)
+check("'1' -> ON", _enabled_with("1") is True)
+check("garbage -> ON (only explicit falsy disables)", _enabled_with("yarp") is True)
 
 
 # ===========================================================================

@@ -744,13 +744,31 @@ def _action_listing_tag(action: str | None) -> str:
     return ""
 
 
+def _push(notify: "Callable[[str], None] | None", text: str) -> None:
+    """Deliver a fired reminder to the optional remote sink (Discord push, so
+    reminders reach the user when away from the PC). Defensive: a push failure
+    must never break the scheduler or the spoken path — the local announce has
+    already happened by the time we get here."""
+    if notify is None:
+        return
+    try:
+        notify(text)
+    except Exception as exc:  # noqa: BLE001 — a push hiccup can't kill a fire
+        print(f"[reminders] notify push failed: {exc}", file=sys.stderr)
+
+
 def _fire_composition(rec: dict, announce: Callable[[str], None],
-                      now: datetime) -> None:
+                      now: datetime,
+                      notify: "Callable[[str], None] | None" = None) -> None:
     """M59 + M63 — a reminder with an action in _COMPOSITION_ACTIONS fires
     that composition tool instead of speaking its static message. Runs on a
     throwaway thread because composition fetches weather/news/etc. and can
     take 5–10 s — we don't want to block the scheduler poll loop. The
-    `_fire_text` path stays synchronous (cheap; just a string)."""
+    `_fire_text` path stays synchronous (cheap; just a string).
+
+    `notify` (optional): the same composed text is also pushed to the remote
+    sink (Discord) so a scheduled briefing / good-night reaches the user when
+    they're away from the PC."""
     rid = rec.get("id", "?")
     action = rec.get("action") or ""
     entry = _COMPOSITION_ACTIONS.get(action)
@@ -758,7 +776,9 @@ def _fire_composition(rec: dict, announce: Callable[[str], None],
         # Shouldn't happen — caller checks the dispatch dict — but defensive:
         # an unknown action degrades to the plain-text fire path so the user
         # at least hears the reminder's message.
-        announce(_fire_text(rec, now))
+        text = _fire_text(rec, now)
+        announce(text)
+        _push(notify, text)
         return
     composer, noun, _, failed_phrase = entry
 
@@ -769,19 +789,38 @@ def _fire_composition(rec: dict, announce: Callable[[str], None],
             print(f"[reminders] {action} composition failed: {exc}",
                   file=sys.stderr)
             announce(failed_phrase)
+            _push(notify, failed_phrase)
             return
         greeting = _greeting_for(now.hour)
-        announce(f"{greeting} Your {noun}:\n\n{text}")
+        full = f"{greeting} Your {noun}:\n\n{text}"
+        announce(full)
+        _push(notify, full)
 
     threading.Thread(
         target=_worker, name=f"{action}-fire-{rid}", daemon=True,
     ).start()
 
 
+def _fire_one(rec: dict, now: datetime, announce: Callable[[str], None],
+              notify: "Callable[[str], None] | None" = None) -> None:
+    """Deliver one due reminder to all sinks: the local `announce` (speak +
+    console) and the optional remote `notify` (Discord). Composition reminders
+    (briefing / good_night) go through `_fire_composition` (async worker);
+    plain reminders speak `_fire_text` synchronously. Extracted from
+    run_scheduler so the fan-out is unit-testable without the poll loop."""
+    if rec.get("action") in _COMPOSITION_ACTIONS:
+        _fire_composition(rec, announce, now, notify)
+    else:
+        text = _fire_text(rec, now)
+        announce(text)
+        _push(notify, text)
+
+
 def run_scheduler(
     announce: Callable[[str], None],
     stop_event: threading.Event,
     poll_sec: float = 10.0,
+    notify: "Callable[[str], None] | None" = None,
 ) -> None:
     """Daemon loop: every ~poll_sec, fire any due reminders via `announce`
     (main.py's WASAPI-safe Announcer path). Polls immediately on start, so
@@ -793,7 +832,12 @@ def run_scheduler(
     (briefing / good_night) is dispatched via `_fire_composition` on its
     own worker thread, since composition takes 5–10 s; the scheduler poll
     stays snappy. Plain reminders ride the synchronous _fire_text path
-    unchanged."""
+    unchanged.
+
+    `notify` (optional, 2026-06-02): a second, remote sink (Discord push). When
+    given, every fired reminder's text is also pushed there so reminders reach
+    the user when away from the PC. Independent of `announce` and fail-soft —
+    a push failure never affects the spoken path or the loop."""
     print("[reminders] scheduler thread started", file=sys.stderr)
     while not stop_event.is_set():
         try:
@@ -804,10 +848,7 @@ def run_scheduler(
                 print(f"[reminders] firing {rid}: "
                       f"{rec.get('message')} (action={action or '-'})",
                       file=sys.stderr)
-                if action in _COMPOSITION_ACTIONS:
-                    _fire_composition(rec, announce, now)
-                else:
-                    announce(_fire_text(rec, now))
+                _fire_one(rec, now, announce, notify)
         except Exception as exc:  # noqa: BLE001 — keep the thread alive
             print(f"[reminders] scheduler poll failed: {exc}", file=sys.stderr)
         stop_event.wait(poll_sec)
