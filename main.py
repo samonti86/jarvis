@@ -1089,6 +1089,26 @@ def listen_loop(
                         followup = False
                         continue
 
+                # 2026-06-02: a FOLLOW-UP utterance that is a pure sign-off
+                # ("thank you, that is all") must not run a full LLM turn. With
+                # a freshly-set reminder still in context, Claude re-issued
+                # set_reminder on exactly such a turn and created a DUPLICATE
+                # (the "fired twice" report). The sign-off was already detected
+                # AFTER the turn (to close the window); short-circuiting it
+                # BEFORE the turn means a dismissal takes NO action at all.
+                # Scoped to follow-up turns only — a wake-word-invoked "that's
+                # all" still reaches Claude, since the user deliberately
+                # summoned him. Closes cleanly and silently: _announce isn't on
+                # this thread (so no gate-safe spoken reply here), and a quiet
+                # close after "that's all" is the expected sign-off behaviour.
+                if followup and _is_dismissal(transcript.text):
+                    ui.add_user_text(transcript.text, transcript.language)
+                    print("[main] follow-up sign-off — closing without an "
+                          "LLM turn\n", file=sys.stderr)
+                    ui.set_state(State.IDLE)
+                    followup = False
+                    continue
+
                 # M52: pass the AudioSession so process_question can run the
                 # barge-in monitor — only the voice path has the mic, so only
                 # the voice path can be interrupted. Returns True iff the user
