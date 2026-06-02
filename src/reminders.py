@@ -360,8 +360,12 @@ SET_REMINDER_TOOL = {
         "of every month'. For a ONE-OFF reminder give EITHER delay_seconds (a "
         "relative time — you compute the seconds) OR at (an absolute ISO 8601 "
         "datetime; you know today's date), never both. For a RECURRING "
-        "reminder set `repeat` instead — delay_seconds/at are then ignored, "
-        "the first occurrence is derived from the recurrence. `message` is "
+        "reminder set `repeat`. By default the first occurrence is derived "
+        "from the recurrence (e.g. interval starts now+interval). For an "
+        "INTERVAL recurrence you MAY ALSO pass `at` or `delay_seconds` to defer "
+        "the FIRST fire — use this for 'every 5 minutes STARTING at 7:50pm' "
+        "(set repeat.kind=interval, interval_seconds=300, AND at='...T19:50:00'); "
+        "weekly/monthly carry their own time so they ignore at/delay. `message` is "
         "what Jarvis speaks aloud when it fires, phrased as the task itself "
         "('check the printer', 'your 10-minute timer is up'). Confirm the "
         "reminder briefly once it's set."
@@ -395,8 +399,10 @@ SET_REMINDER_TOOL = {
                 "type": "object",
                 "description": (
                     "OMIT for a normal one-shot reminder. Include to make the "
-                    "reminder RECUR; delay_seconds/at are then ignored — the "
-                    "first occurrence is derived from the recurrence."
+                    "reminder RECUR. The first occurrence is derived from the "
+                    "recurrence by default; for kind=interval you may ALSO set "
+                    "at/delay_seconds to defer the first fire (then it repeats "
+                    "on the interval from there). weekly/monthly ignore at/delay."
                 ),
                 "properties": {
                     "kind": {
@@ -508,6 +514,49 @@ CANCEL_REMINDER_TOOL = {
 
 # --- tool executors --------------------------------------------------------
 
+def _resolve_explicit_fire(params: dict) -> "datetime | str | None":
+    """Parse an explicit one-off fire time from `delay_seconds` / `at`.
+
+    Shared by the one-shot path and the interval-recurrence deferred-start
+    path. Returns:
+      - a datetime, if either field is given and valid;
+      - a voice-friendly error string, if given but invalid (both supplied,
+        unparseable, in the past, or beyond the horizon);
+      - None, if NEITHER was supplied — the caller decides what that means
+        (an error for a one-off; "derive from the recurrence" for interval).
+    """
+    delay = params.get("delay_seconds")
+    at = (params.get("at") or "").strip()
+    if delay is None and not at:
+        return None
+    if delay is not None and at:
+        return "Give me either a delay or an absolute time, sir — not both."
+
+    now = datetime.now()
+    if delay is not None:
+        try:
+            delay = int(delay)
+        except (TypeError, ValueError):
+            return "I couldn't read that delay, sir."
+        if delay <= 0:
+            return "That time isn't in the future, sir."
+        fire_at = now + timedelta(seconds=delay)
+    else:
+        parsed = _parse_iso(at)
+        if parsed is None:
+            return "I couldn't read that time, sir."
+        if parsed <= now:
+            return (
+                f"{_human_dt(parsed)} has already passed, sir — "
+                f"shall I set it for another time?"
+            )
+        fire_at = parsed
+
+    if fire_at > now + timedelta(days=_MAX_HORIZON_DAYS):
+        return "That's further out than I can schedule, sir."
+    return fire_at
+
+
 def execute_set_reminder(params: dict) -> str:
     """Schedule a reminder. Never raises — every failure is a readable string."""
     message = (params.get("message") or "").strip()
@@ -525,14 +574,28 @@ def execute_set_reminder(params: dict) -> str:
         return (f"I don't know the '{action}' action, sir — only "
                 f"'briefing' and 'good_night' are supported right now.")
 
-    # M54: a recurring reminder. The first occurrence is derived from the
-    # recurrence itself, so delay_seconds/at are intentionally ignored here.
+    # M54: a recurring reminder. Normally the first occurrence is derived from
+    # the recurrence itself. EXCEPTION (2026-06-02): an `interval` reminder
+    # ("every 5 minutes") otherwise starts firing now+interval, with no way to
+    # express "every 5 minutes STARTING at 7:50pm" — the gap that broke a real
+    # use case. So for interval, honor an explicit first-fire time (at /
+    # delay_seconds) when one is given, then re-arm on the interval from there
+    # (the re-arm already computes from now() at each fire, so it stays
+    # correct). weekly/monthly carry their own day+time, so they ignore
+    # at/delay and derive the first slot as before.
     repeat = params.get("repeat")
     if repeat:
         spec = _validate_repeat(repeat)
         if isinstance(spec, str):
             return spec  # validation failed — already a voice-friendly message
-        fire_at = _next_occurrence(spec, datetime.now())
+        fire_at = None
+        if spec["kind"] == "interval":
+            explicit = _resolve_explicit_fire(params)
+            if isinstance(explicit, str):
+                return explicit  # invalid at/delay — voice-friendly error
+            fire_at = explicit  # datetime (deferred start) or None (start now+interval)
+        if fire_at is None:
+            fire_at = _next_occurrence(spec, datetime.now())
         if fire_at is None:
             return "I couldn't work out when that should recur, sir."
         rec = add(message, fire_at, repeat=spec, action=action)
@@ -542,35 +605,11 @@ def execute_set_reminder(params: dict) -> str:
             f"First one at {_human_dt(fire_at)}. id: {rec['id']}."
         )
 
-    delay = params.get("delay_seconds")
-    at = (params.get("at") or "").strip()
-    if delay is not None and at:
-        return "Give me either a delay or an absolute time, sir — not both."
-
-    now = datetime.now()
-    if delay is not None:
-        try:
-            delay = int(delay)
-        except (TypeError, ValueError):
-            return "I couldn't read that delay, sir."
-        if delay <= 0:
-            return "That time isn't in the future, sir."
-        fire_at = now + timedelta(seconds=delay)
-    elif at:
-        parsed = _parse_iso(at)
-        if parsed is None:
-            return "I couldn't read that time, sir."
-        if parsed <= now:
-            return (
-                f"{_human_dt(parsed)} has already passed, sir — "
-                f"shall I set it for another time?"
-            )
-        fire_at = parsed
-    else:
+    fire_at = _resolve_explicit_fire(params)
+    if isinstance(fire_at, str):
+        return fire_at  # invalid at/delay — voice-friendly error
+    if fire_at is None:
         return "I need a time for the reminder, sir."
-
-    if fire_at > now + timedelta(days=_MAX_HORIZON_DAYS):
-        return "That's further out than I can schedule, sir."
 
     rec = add(message, fire_at, action=action)
     kind_label = _action_label(action, capitalised=True)
