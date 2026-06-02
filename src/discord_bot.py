@@ -6,11 +6,19 @@ privileged Message Content intent. This module runs discord.py's asyncio loop
 in its OWN daemon thread — exactly the shape src/remote_console.py uses — and
 bridges to the brain through the SAME seam as the phone:
 
-  inbound : on_message → (channel + allowlist + non-bot filter) → on_text(text,
-            reply) which main.py wires onto text_queue with origin="discord".
-  outbound: a PER-TURN reply sink posts the answer back to the originating
-            channel. NOT a JarvisUI broadcast sink — a PC/voice/phone turn must
-            never echo into the shared channel where the household can read it.
+  inbound : on_message → (scope + allowlist + non-bot + ADDRESSED filter) →
+            on_text(text, reply) which main.py wires onto text_queue with
+            origin="discord".
+  outbound: a PER-TURN reply sink posts the answer back in a THREAD off the
+            triggering message (or in the existing thread). NOT a JarvisUI
+            broadcast sink — a PC/voice/phone turn must never echo into the
+            shared channel where the household can read it.
+
+Addressed-only (2026-06-02): in a channel where the household also chats with
+each other, the bot replies ONLY when explicitly addressed — the message
+@-mentions the bot OR contains the word "jarvis". The one exception is inside a
+thread the bot itself started: there, every message is for Jarvis, so no
+re-addressing is needed (a natural back-and-forth).
 
 Why a bot, not the webhook, and why the gateway (not HTTP interactions): the
 gateway is an OUTBOUND connection, so it needs no inbound port / Tailscale /
@@ -29,12 +37,17 @@ connect/import error is logged, never fatal to Jarvis.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import threading
 from typing import Callable, Iterable
 
 # Discord's hard per-message ceiling is 2000 chars; stay under it with margin.
 _DISCORD_MSG_LIMIT = 1900
+
+# Word-boundary match on the wake name, case-insensitive — "Jarvis", "hey
+# jarvis,", "JARVIS?" all hit; "jarvison" does not.
+_NAME_RE = re.compile(r"\bjarvis\b", re.IGNORECASE)
 
 
 def should_handle(
@@ -43,19 +56,46 @@ def should_handle(
     author_is_bot: bool,
     is_webhook: bool,
     channel_id: int,
+    parent_id: int | None,
     allowed_users: frozenset[int],
     allowed_channel: int,
 ) -> bool:
-    """Pure decision: should this inbound message be routed to the brain?
+    """Pure decision: is this message IN SCOPE for Jarvis?
 
-    True only when it's a human (not a bot/webhook — the loop guard), in the
-    configured channel, from an allowlisted user. Factored out so the gating
-    is unit-testable without a live gateway connection."""
+    True only when it's a human (not a bot/webhook — the loop guard), from an
+    allowlisted user, in the configured channel OR a thread hanging off it
+    (`parent_id` == the configured channel; None for non-thread messages).
+    Note: 'in scope' ≠ 'reply' — see is_addressed for the addressed-only gate.
+    Factored out so gating is unit-testable without a live gateway."""
     if author_is_bot or is_webhook:
         return False
-    if channel_id != allowed_channel:
+    in_scope = channel_id == allowed_channel or parent_id == allowed_channel
+    if not in_scope:
         return False
     return author_id in allowed_users
+
+
+def is_addressed(content: str, bot_user_id: int, mention_ids: Iterable[int]) -> bool:
+    """True if the message explicitly addresses Jarvis — an @-mention of the
+    bot, or the word 'jarvis' anywhere. Lets the household chat freely in the
+    channel without Jarvis butting in on every line."""
+    if bot_user_id in set(mention_ids):
+        return True
+    return _NAME_RE.search(content or "") is not None
+
+
+def strip_bot_mention(content: str, bot_user_id: int) -> str:
+    """Remove the bot's own @-mention token (<@id> / <@!id>) so the LLM sees
+    clean text ('what's the weather') not raw mention markup. Leaves the
+    literal name 'Jarvis' in place (harmless, natural address)."""
+    return re.sub(rf"<@!?{bot_user_id}>", "", content or "").strip()
+
+
+def thread_name(content: str, limit: int = 90) -> str:
+    """A Discord thread title (≤100 chars) from the triggering message; falls
+    back to 'Jarvis' for an empty/mention-only prompt."""
+    one_line = " ".join((content or "").split())
+    return one_line[:limit] if one_line else "Jarvis"
 
 
 def chunk_message(text: str, limit: int = _DISCORD_MSG_LIMIT) -> list[str]:
@@ -110,6 +150,9 @@ class DiscordBot:
         self._on_text: Callable[[str, Callable[[str], None]], None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        # Thread IDs the bot itself created — inside these, every message is for
+        # Jarvis, so the addressed-only gate is skipped (natural follow-ups).
+        self._bot_threads: set[int] = set()
 
     def set_on_text(
         self, fn: Callable[[str, Callable[[str], None]], None]
@@ -149,23 +192,41 @@ class DiscordBot:
 
         @client.event
         async def on_message(message: "discord.Message") -> None:
+            is_thread = isinstance(message.channel, discord.Thread)
+            parent_id = message.channel.parent_id if is_thread else None
             if not should_handle(
                 author_id=message.author.id,
                 author_is_bot=bool(getattr(message.author, "bot", False)),
                 is_webhook=message.webhook_id is not None,
                 channel_id=message.channel.id,
+                parent_id=parent_id,
                 allowed_users=self._allowed,
                 allowed_channel=self._channel_id,
             ):
                 return
-            content = (message.content or "").strip()
-            if not content or self._on_text is None:
+            if self._on_text is None:
                 return
 
-            # Per-turn reply sink bound to THIS channel. Called by the brain on
-            # the text_input_loop thread → marshal onto the bot's loop.
-            def _reply(answer: str, _ch=message.channel) -> None:
-                self._post(_ch, answer)
+            # Addressed-only gate — reply only when explicitly addressed
+            # (@-mention or the word "jarvis"), EXCEPT inside a thread the bot
+            # started, where every message is already for Jarvis.
+            in_bot_thread = is_thread and message.channel.id in self._bot_threads
+            bot_id = client.user.id if client.user else 0
+            if not in_bot_thread and not is_addressed(
+                message.content, bot_id, [m.id for m in message.mentions]
+            ):
+                return
+
+            # Strip the bot's own @-mention so the LLM sees clean text.
+            content = strip_bot_mention(message.content, bot_id)
+            if not content:  # mention/name only, nothing to answer
+                return
+
+            # Per-turn reply sink bound to THIS message. Called by the brain on
+            # the text_input_loop thread → marshal onto the bot's loop. Passing
+            # the whole message lets _post decide thread-vs-channel.
+            def _reply(answer: str, _msg=message) -> None:
+                self._post(_msg, answer)
 
             try:
                 self._on_text(content, _reply)
@@ -179,9 +240,16 @@ class DiscordBot:
         except Exception as exc:  # noqa: BLE001 — a dead bot must not kill Jarvis
             print(f"[discord] bot stopped: {exc}", file=sys.stderr)
 
-    def _post(self, channel: object, answer: str) -> None:
-        """Thread-safe: post `answer` (chunked) back to `channel`. Called from
-        the brain's worker thread; marshals onto the bot's loop. Fail-soft."""
+    def _post(self, message: object, answer: str) -> None:
+        """Thread-safe: post `answer` (chunked) back as a THREADED reply to
+        `message`. Called from the brain's worker thread; marshals onto the
+        bot's loop. Fail-soft.
+
+        Target resolution: if the triggering message is already in a thread,
+        reply there; otherwise create a thread off the message (recording its
+        id so follow-ups skip the addressed-gate) and reply inside it. If the
+        bot lacks thread permissions, fall back to an inline channel reply and
+        log what to grant — so the feature degrades instead of breaking."""
         if self._loop is None:
             print("[discord] reply dropped — bot loop not ready", file=sys.stderr)
             return
@@ -190,8 +258,29 @@ class DiscordBot:
             return
 
         async def _send() -> None:
-            for piece in chunks:
-                await channel.send(piece)  # type: ignore[attr-defined]
+            import discord  # noqa: PLC0415 — cached; needed for Thread/Forbidden
+            try:
+                channel = message.channel  # type: ignore[attr-defined]
+                if isinstance(channel, discord.Thread):
+                    target = channel
+                else:
+                    try:
+                        target = await message.create_thread(  # type: ignore[attr-defined]
+                            name=thread_name(message.content)  # type: ignore[attr-defined]
+                        )
+                        self._bot_threads.add(target.id)
+                    except discord.Forbidden:
+                        print(
+                            "[discord] no thread permission — replying inline. "
+                            "Grant the bot 'Create Public Threads' + 'Send "
+                            "Messages in Threads' to enable threaded replies.",
+                            file=sys.stderr,
+                        )
+                        target = channel
+                for piece in chunks:
+                    await target.send(piece)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[discord] send failed: {exc}", file=sys.stderr)
 
         try:
             asyncio.run_coroutine_threadsafe(_send(), self._loop)
