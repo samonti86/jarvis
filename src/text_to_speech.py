@@ -201,7 +201,7 @@ def speak_streaming(
                 if sentence is None:
                     return
                 try:
-                    mp3_bytes = asyncio.run(_fetch_mp3(sentence, voice))
+                    mp3_bytes = asyncio.run(_fetch_mp3_with_retry(sentence, voice))
                     decoded = miniaudio.mp3_read_s16(mp3_bytes)
                     samples = np.frombuffer(decoded.samples.tobytes(), dtype=np.int16)
                     if decoded.nchannels > 1:
@@ -380,7 +380,7 @@ def _run_envelope_ticker(
 
 
 def _speak_edge_tts(text: str, voice: str) -> None:
-    mp3_bytes = asyncio.run(_fetch_mp3(text, voice))
+    mp3_bytes = asyncio.run(_fetch_mp3_with_retry(text, voice))
     decoded = miniaudio.mp3_read_s16(mp3_bytes)
 
     samples = np.frombuffer(decoded.samples.tobytes(), dtype=np.int16)
@@ -390,6 +390,17 @@ def _speak_edge_tts(text: str, voice: str) -> None:
     sd.play(samples, samplerate=decoded.sample_rate, blocking=True)
 
 
+# edge-tts talks to Microsoft's voice endpoint over a websocket; a transient
+# close-without-audio surfaces as NoAudioReceived ("No audio was received…") —
+# its most common flake (rate-limit / network blip / service hiccup). It's the
+# textbook retry case: the SAME text succeeds moments later (proven 2026-06-02
+# — a 78-char sentence that failed live re-synthesized 5/5 OK). Without a retry
+# a single flake permanently dropped a sentence from a spoken reply on the
+# streaming path, which (unlike the one-shot speak() path) had no fallback.
+_TTS_FETCH_ATTEMPTS = 3
+_TTS_FETCH_BACKOFF_S = 0.4
+
+
 async def _fetch_mp3(text: str, voice: str) -> bytes:
     communicate = edge_tts.Communicate(text, voice)
     chunks: list[bytes] = []
@@ -397,6 +408,39 @@ async def _fetch_mp3(text: str, voice: str) -> bytes:
         if chunk["type"] == "audio":
             chunks.append(chunk["data"])
     return b"".join(chunks)
+
+
+async def _fetch_mp3_with_retry(
+    text: str, voice: str, attempts: int = _TTS_FETCH_ATTEMPTS
+) -> bytes:
+    """`_fetch_mp3` with a bounded retry on transient edge-tts failures.
+
+    Retries on BOTH a raised exception (NoAudioReceived and friends) and an
+    empty-but-no-exception result (defensive). After `attempts` tries it
+    re-raises the last exception, so each caller's EXISTING terminal behaviour
+    still runs on a genuine, persistent failure (synth_worker drops the
+    sentence; speak() falls back to pyttsx3; the phone path logs). The
+    streaming path's maxsize=2 lookahead buffer absorbs the backoff, so
+    playback stays gapless in the common single-retry case.
+    """
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            mp3 = await _fetch_mp3(text, voice)
+            if mp3:
+                return mp3
+            last_exc = RuntimeError("edge-tts returned no audio bytes")
+        except Exception as exc:  # noqa: BLE001 — retry ANY transient synth error
+            last_exc = exc
+        if i < attempts - 1:
+            print(
+                f"[tts] synth attempt {i + 1}/{attempts} failed "
+                f"({last_exc}); retrying",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(_TTS_FETCH_BACKOFF_S * (i + 1))
+    assert last_exc is not None  # loop ran >=1 time, so it's always set
+    raise last_exc
 
 
 def _speak_pyttsx3(text: str) -> None:
