@@ -633,11 +633,11 @@ class TurnRunner:
                 try:
                     import asyncio  # noqa: PLC0415 — lazy per main.py convention
                     from src.text_to_speech import (  # noqa: PLC0415
-                        DEFAULT_VOICE, VOICE_BY_LANG, _fetch_mp3,
+                        DEFAULT_VOICE, VOICE_BY_LANG, _fetch_mp3_with_retry,
                     )
 
                     voice = VOICE_BY_LANG.get(language, DEFAULT_VOICE)
-                    mp3 = asyncio.run(_fetch_mp3(full_response, voice))
+                    mp3 = asyncio.run(_fetch_mp3_with_retry(full_response, voice))
                     reply_audio(mp3)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[main] phone reply audio failed: {exc}",
