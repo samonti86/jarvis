@@ -223,10 +223,12 @@ class DiscordBot:
                 return
 
             # Per-turn reply sink bound to THIS message. Called by the brain on
-            # the text_input_loop thread → marshal onto the bot's loop. Passing
-            # the whole message lets _post decide thread-vs-channel.
-            def _reply(answer: str, _msg=message) -> None:
-                self._post(_msg, answer)
+            # the text_input_loop thread → marshal onto the bot's loop. Passes
+            # the whole message (so _post can decide thread-vs-channel) plus the
+            # CLEANED text as the thread title (so the title reads "what is the
+            # weather", not the raw "<@id> what is the weather" mention markup).
+            def _reply(answer: str, _msg=message, _title=content) -> None:
+                self._post(_msg, answer, _title)
 
             try:
                 self._on_text(content, _reply)
@@ -240,16 +242,18 @@ class DiscordBot:
         except Exception as exc:  # noqa: BLE001 — a dead bot must not kill Jarvis
             print(f"[discord] bot stopped: {exc}", file=sys.stderr)
 
-    def _post(self, message: object, answer: str) -> None:
+    def _post(self, message: object, answer: str, title_hint: str = "") -> None:
         """Thread-safe: post `answer` (chunked) back as a THREADED reply to
         `message`. Called from the brain's worker thread; marshals onto the
         bot's loop. Fail-soft.
 
         Target resolution: if the triggering message is already in a thread,
-        reply there; otherwise create a thread off the message (recording its
-        id so follow-ups skip the addressed-gate) and reply inside it. If the
-        bot lacks thread permissions, fall back to an inline channel reply and
-        log what to grant — so the feature degrades instead of breaking."""
+        reply there; otherwise create a thread off the message (titled from
+        `title_hint` — the cleaned text, no mention markup — and set to
+        AUTO-ARCHIVE after 1h idle so it self-clears from the channel sidebar;
+        recording its id so follow-ups skip the addressed-gate) and reply
+        inside it. If the bot lacks thread permissions, fall back to an inline
+        channel reply and log what to grant — degrade, don't break."""
         if self._loop is None:
             print("[discord] reply dropped — bot loop not ready", file=sys.stderr)
             return
@@ -265,8 +269,13 @@ class DiscordBot:
                     target = channel
                 else:
                     try:
+                        # auto_archive_duration=60 (minutes): the thread drops
+                        # off the channel sidebar ~1h after the last message
+                        # (still readable under "Archived Threads"; a new reply
+                        # un-archives it). Keeps #general uncluttered.
                         target = await message.create_thread(  # type: ignore[attr-defined]
-                            name=thread_name(message.content)  # type: ignore[attr-defined]
+                            name=thread_name(title_hint),
+                            auto_archive_duration=60,
                         )
                         self._bot_threads.add(target.id)
                     except discord.Forbidden:
