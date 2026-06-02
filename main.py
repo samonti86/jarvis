@@ -1641,11 +1641,28 @@ def main() -> None:
     # alert. Bound to the ⏰ label so reminders read as reminders in the
     # console, not 🚨 alerts. Daemon thread; reminder_stop ends it cleanly at
     # shutdown. The local import matches the SecurityWatcher pattern above.
+    # A reminder also pushes to Discord on fire (2026-06-02) so it reaches the
+    # user when away from the PC — the dual-channel pattern the security /
+    # homelab alerts already use. Gated on BOTH a configured webhook AND the
+    # opt-out flag; None when either is off, so the scheduler simply skips the
+    # remote sink (no wasted POST per fire). No presence detection, so it
+    # always pushes — redundant-but-harmless when home.
     from src.reminders import run_scheduler as _run_reminder_scheduler
+    from src.notifications import send_discord_message as _send_discord_message
+    _reminder_webhook = (
+        cfg.discord_webhook_url if cfg.reminder_discord_enabled else ""
+    )
+    _reminder_notify = (
+        (lambda t: _send_discord_message(_reminder_webhook, t))
+        if _reminder_webhook else None
+    )
+    if _reminder_notify is not None:
+        print("[reminders] Discord push on fire: enabled", file=sys.stderr)
     reminder_stop = threading.Event()
     threading.Thread(
         target=_run_reminder_scheduler,
         args=(lambda t: _announce(t, label="⏰"), reminder_stop),
+        kwargs={"notify": _reminder_notify},
         name="ReminderScheduler",
         daemon=True,
     ).start()

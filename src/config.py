@@ -47,6 +47,7 @@ class Config:
     speaker_threshold: float   # M69 — min cosine similarity for a recognized speaker. 0.60 default: live data showed the enrolled user 0.83-0.95 normally but 0.66 with a rough/hoarse voice, vs ~0.566 for background media — so 0.60 sits below the rough-voice floor (fail-open: never ignore the real user) while still rejecting media. Tight margin to media (~0.03); tune per setup via JARVIS_SPEAKER_THRESHOLD. Active only once a voice is enrolled.
     speaker_gate_enabled: bool  # M69 — opt-in "respond only to enrolled voices" gate. Default off. When on AND a voice is enrolled, a confidently-unrecognized turn (e.g. background TV) is dropped. Fail-open: borderline still responds.
     user_name: str             # M69 — the name the primary user is enrolled under (via "enroll my voice" / the tray). Shows in [speaker] logs. Default "you"; set JARVIS_USER_NAME to your name.
+    reminder_discord_enabled: bool  # 2026-06-02 — also push a reminder's text to the Discord webhook when it fires, so reminders reach the user when away from the PC. Default ON when DISCORD_WEBHOOK_URL is set (no presence detection, so it always pushes — harmless redundancy when home). Set JARVIS_REMINDER_DISCORD=0 to disable.
 
 
 def load() -> Config:
@@ -130,4 +131,11 @@ def load() -> Config:
             in ("1", "true", "yes", "on")
         ),
         user_name=os.getenv("JARVIS_USER_NAME", "you").strip() or "you",
+        # ON unless explicitly falsy — opposite polarity to the opt-in flags
+        # above: a reminder reaching the user when away is the default win.
+        # No-op anyway if DISCORD_WEBHOOK_URL is blank (main.py gates on it).
+        reminder_discord_enabled=(
+            os.getenv("JARVIS_REMINDER_DISCORD", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        ),
     )
