@@ -138,11 +138,16 @@ _DEBUG_MIN_SCORE = 0.10  # only log a window whose strongest label clears this
 # Loudness floor for the transient events (knock/doorbell/glass). The model
 # occasionally hallucinates e.g. "Knock"=0.43 on a near-SILENT window
 # (rms~0.002) — a false "someone's at the door" while away. Live data
-# (2026-06-03) cleanly separated the classes: real events measured rms
-# 0.076–0.32, spurious fires 0.002–0.009. 0.03 sits in the gap — passes every
-# real event, rejects the silent hallucinations. Same idea as the running-water
-# volume guard, generalised. Env-tunable per setup.
-_EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.03)
+# (2026-06-03) separated the classes: spurious fires peaked at rms 0.009, real
+# events ran 0.033–0.32. The DOORBELL is the quietest real event (rms 0.033)
+# because Windows Voice Focus (kept on "Automatic" for voice clarity) attenuates
+# non-speech — so the floor must leave margin BELOW the real doorbell, not hug
+# it. 0.02 sits in the gap (rejects ≤0.009 hallucinations, passes the 0.033
+# doorbell with room to spare for further Voice-Focus attenuation). Leans toward
+# detection on purpose: a missed knock/doorbell while away is worse than a rare
+# false ping. Same idea as the running-water volume guard, generalised.
+# Env-tunable per setup.
+_EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.02)
 
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
@@ -212,7 +217,13 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
     ),
     ClassRule(
         name="glass_break",
-        aliases=("Glass", "Shatter"),
+        # "Breaking" added 2026-06-03: a faint break scored Glass 0.19 +
+        # Shatter 0.09 = 0.28 (just under threshold, missed) but had
+        # Breaking 0.08 — aggregating it clears 0.30. Deliberately NOT adding
+        # "Chink, clink" (fires on normal glasses touching → false positives).
+        # Glass is the priority event (triggers the M72 photo so the user can
+        # check the Ring indoor cam), so bias toward catching a faint break.
+        aliases=("Glass", "Shatter", "Breaking"),
         threshold=0.30, sustain=1, cooldown_seconds=45.0,
         speak="Sir — I just heard glass breaking.",
         push="💥 Glass breaking",
