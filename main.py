@@ -326,6 +326,7 @@ class TurnRunner:
         origin: str = "voice",
         reply_audio: "Callable[[bytes], None] | None" = None,
         reply_text: "Callable[[str], None] | None" = None,
+        reply_image: "Callable[[bytes, str], None] | None" = None,
         session: AudioSession | None = None,
     ) -> bool:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
@@ -459,7 +460,7 @@ class TurnRunner:
                     bits.append("PAUSED(10-iter cap)")
                 self._ui.add_telemetry_chip(" · ".join(bits))
 
-            def on_image_captured(image_bytes: bytes, media_type: str, tool_name: str) -> None:  # noqa: ARG001 — media_type unused for now
+            def on_image_captured(image_bytes: bytes, media_type: str, tool_name: str) -> None:
                 """Called by stream_response when a vision tool returns an
                 image. Renders the bytes as an inline thumbnail in the
                 console transcript so the user sees *what Jarvis saw*, not
@@ -470,6 +471,18 @@ class TurnRunner:
                     "screen_snapshot": "🖥 screen snapshot",
                 }.get(tool_name, f"🖼 {tool_name}")
                 self._ui.add_image_thumbnail(image_bytes, label)
+                # M71 — relay the captured frame to the originating remote
+                # surface (Discord) if a per-turn image sink was supplied.
+                # The sink BUFFERS it; the photo is posted into the same thread
+                # as the reply (see discord_bot._post). Only Discord sets this
+                # sink (camera is clawed back for origin="discord" only), so a
+                # PC/phone turn never relays its webcam frame anywhere.
+                if reply_image is not None:
+                    try:
+                        reply_image(image_bytes, media_type)
+                    except Exception as exc:  # noqa: BLE001 — never break the turn
+                        print(f"[main] reply_image sink failed: {exc}",
+                              file=sys.stderr)
 
             def llm_stream():
                 # `interrupt_event` is a free variable bound just below (before
@@ -487,6 +500,7 @@ class TurnRunner:
                     on_image_captured=on_image_captured,
                     engineer_mode=engineer,
                     restricted=restricted,
+                    origin=origin,
                     interrupt_event=interrupt_event,
                 ):
                     response_chunks.append(chunk)
@@ -705,7 +719,7 @@ def listen_loop(
     # tuples here; the text_input_loop worker pops them and calls
     # process_question. attachments is list[tuple[str, dict]] (filename + block).
     # M48.2/M48.2b/M48.3: item is
-    #   (text, attachments, origin, reply_audio, lang, reply_text).
+    #   (text, attachments, origin, reply_audio, lang, reply_text, reply_image).
     # origin ∈ {"console","phone_text","phone_voice","discord"} — derives
     # PC-TTS gating (phone_*/discord don't speak on the PC) AND restricted tool
     # surface (phone + discord origins lose system/shell/file/etc.).
@@ -718,6 +732,10 @@ def listen_loop(
     # reply_text (2026-06-02): None, or a PER-TURN text sink (Discord) that
     # posts the reply back to the originating channel — NOT a broadcast, so a
     # PC/phone turn never leaks into the shared channel.
+    # reply_image (M71): None, or a PER-TURN image sink (Discord only) that
+    # buffers a webcam frame captured mid-turn so it's posted into the same
+    # thread as the reply. Set ONLY for discord turns (camera_snapshot is
+    # clawed back for origin="discord"); None everywhere else.
     text_queue: queue.Queue[
         tuple[
             str,
@@ -726,6 +744,7 @@ def listen_loop(
             "Callable[[bytes], None] | None",
             str,
             "Callable[[str], None] | None",
+            "Callable[[bytes, str], None] | None",
         ]
     ] = queue.Queue()
 
@@ -739,7 +758,7 @@ def listen_loop(
                 continue
             if ui.shutdown.is_set():
                 break
-            text, attachments, origin, reply_audio, lang, reply_text = item
+            text, attachments, origin, reply_audio, lang, reply_text, reply_image = item
             blocks = [block for _, block in attachments] if attachments else []
             print(
                 f"[text-input] received: {text} (attachments={len(blocks)})",
@@ -836,6 +855,7 @@ def listen_loop(
                 runner.process_question(
                     text, lang, attachments=blocks, origin=origin,
                     reply_audio=reply_audio, reply_text=reply_text,
+                    reply_image=reply_image,
                 )
             finally:
                 ui.set_state(State.IDLE)
@@ -846,7 +866,7 @@ def listen_loop(
     # (text, attachments) args into a single queue item.
     ui.set_on_text_submit(
         lambda text, attachments: text_queue.put(
-            (text, attachments, "console", None, "en", None)  # console → no phone audio sink, no remote text sink; lang "en"
+            (text, attachments, "console", None, "en", None, None)  # console → no phone audio sink, no remote text/image sink; lang "en"
         )
     )
 
@@ -861,7 +881,7 @@ def listen_loop(
         # non-None ⇒ this reply's audio goes to THAT phone, not the PC.
         remote_server.set_on_text(
             lambda t, reply_audio: text_queue.put(
-                (t, [], "phone_text", reply_audio, "en", None)  # phone typed → "en"; text reply rides the broadcast sink
+                (t, [], "phone_text", reply_audio, "en", None, None)  # phone typed → "en"; text reply rides the broadcast sink; no image sink
             )
         )
 
@@ -895,7 +915,7 @@ def listen_loop(
                     # selection — phone Spanish gets a Spanish voice reply.
                     lang = (t.language or "en").strip() or "en"
                     text_queue.put(
-                        (text, [], "phone_voice", reply_audio, lang, None)
+                        (text, [], "phone_voice", reply_audio, lang, None, None)
                     )
                 except Exception as exc:  # noqa: BLE001 — never crash the WS loop's caller
                     print(
@@ -927,9 +947,13 @@ def listen_loop(
                 cfg.discord_bot_token, cfg.discord_channel_id,
                 cfg.discord_allowed_user_ids,
             )
+            # M71: the bot now hands us TWO per-turn sinks — reply_text (post
+            # the answer) and reply_image (buffer a webcam frame so it's
+            # attached to that same threaded reply). reply_image is Discord-only
+            # because camera_snapshot is clawed back for origin="discord" alone.
             _discord_bot.set_on_text(
-                lambda t, reply: text_queue.put(
-                    (t, [], "discord", None, "en", reply)
+                lambda t, reply_text, reply_image: text_queue.put(
+                    (t, [], "discord", None, "en", reply_text, reply_image)
                 )
             )
             _discord_bot.start()
@@ -1805,6 +1829,13 @@ def main() -> None:
         # can't starve the Python-fed TTS path and stutter an announce.
         speaking_event=announce_speaking,
     )
+
+    # M71: when armed, the watcher owns the webcam (persistent capture). Let a
+    # camera_snapshot (Discord, while away) borrow a frame from it instead of
+    # opening a contending handle that would only grab black. Disarmed ⇒ the
+    # provider returns None ⇒ cameras.py opens its own (the camera is free).
+    from src import cameras as _cameras  # noqa: PLC0415
+    _cameras.set_armed_frame_provider(security_watcher.grab_frame_for_snapshot)
 
     # M39: face-enrollment trigger. Shared by the tray menu "Enroll my face"
     # AND the voice intent ("Jarvis, enroll my face"). Non-blocking — queues

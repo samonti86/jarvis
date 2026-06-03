@@ -290,10 +290,18 @@ class SecurityWatcher:
         self._camera_index = camera_index
         # M44.3: persistent capture handle for the armed-watcher lifetime.
         # Opened lazily on the first grab, reused every poll, released when
-        # the watcher loop exits (disarm / stop / watchdog trip). Sole owner
-        # is the single watcher thread (_grab_frame's only caller), so no
-        # lock is needed. See _grab_frame / _watch_loop's finally.
+        # the watcher loop exits (disarm / stop / watchdog trip). See
+        # _grab_frame / _watch_loop's finally.
+        # M71: a SECOND caller now exists — grab_frame_for_snapshot, invoked
+        # off the LLM tool thread when a Discord camera_snapshot lands while
+        # armed (the watcher owns the camera, so it serves the frame rather
+        # than letting a contending handle grab black). Two threads reading
+        # one cv2.VideoCapture is undefined, so an RLock now serialises all
+        # capture access (_grab_frame / _release_cap / the snapshot grab).
+        # RLock (not Lock) because _grab_frame calls _release_cap on a read
+        # failure while already holding it.
         self._cap = None
+        self._cap_lock = threading.RLock()
         # M35: empty passphrase = skip CHALLENGE state entirely. Detection
         # just announces movement (M34 behavior). Lets the user opt out of
         # the challenge step without removing security mode entirely.
@@ -1206,8 +1214,10 @@ class SecurityWatcher:
         Called on a read failure (self-heal: next poll re-opens) and from
         _watch_loop's finally, so the camera is freed the instant the
         watcher stops — keeping the persistent capture strictly scoped to
-        the armed-watcher lifetime (camera fully free whenever NOT armed)."""
-        cap, self._cap = self._cap, None
+        the armed-watcher lifetime (camera fully free whenever NOT armed).
+        M71: under _cap_lock (the snapshot grab can race the watcher)."""
+        with self._cap_lock:
+            cap, self._cap = self._cap, None
         if cap is not None:
             try:
                 cap.release()
@@ -1233,6 +1243,10 @@ class SecurityWatcher:
         except ImportError:
             return None
 
+        # M71 — serialise capture access; grab_frame_for_snapshot can call in
+        # from the LLM tool thread while the watcher loop is mid-grab. RLock,
+        # so the _release_cap calls below (which re-acquire) don't deadlock.
+        self._cap_lock.acquire()
         try:
             if self._cap is None:
                 cap = cv2.VideoCapture(self._camera_index, cv2.CAP_DSHOW)
@@ -1266,6 +1280,24 @@ class SecurityWatcher:
         except Exception as exc:  # noqa: BLE001
             print(f"[security] frame grab failed: {exc}", file=sys.stderr)
             self._release_cap()
+            return None
+        finally:
+            self._cap_lock.release()
+
+    def grab_frame_for_snapshot(self):
+        """M71 — serve a fresh frame from the armed watcher's persistent
+        capture so a remote `camera_snapshot` (Discord, while away) doesn't
+        contend for the webcam. Windows hands a UVC cam to ONE reader, so a
+        second handle opened by cameras.py while armed gets a black/garbage
+        frame (the 'camera covered' symptom). Returns a BGR ndarray when armed
+        and holding the camera; None when not armed (the camera is free, so the
+        caller opens its own handle — no contention). Never raises."""
+        if not self.is_armed():
+            return None
+        try:
+            return self._grab_frame()
+        except Exception as exc:  # noqa: BLE001 — a snapshot must never break
+            print(f"[security] snapshot frame grab failed: {exc}", file=sys.stderr)
             return None
 
     def _detect_person(self, frame) -> bool:
