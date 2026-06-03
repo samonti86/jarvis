@@ -118,6 +118,42 @@ def send_discord_alert(
     return True
 
 
+def send_discord_photo(
+    webhook_url: str,
+    content: str,
+    image_bytes: bytes,
+    image_filename: str = "snapshot.jpg",
+) -> bool:
+    """M72 — post caller-supplied text WITH a photo attachment to a Discord
+    webhook. The generic photo counterpart to send_discord_message (text only)
+    and send_discord_alert (fixed security text): used for the multimodal
+    acoustic alert ("I heard X — here's what I see" + the camera frame).
+
+    Returns True on HTTP 2xx, False on any failure. Never raises — callers
+    fire-and-forget. `content` is clamped to Discord's 2000-char limit.
+    """
+    if not webhook_url or not image_bytes:
+        return False
+    payload = {"content": (content or "")[:2000], "username": "Jarvis"}
+    files = {
+        "payload_json": (None, json.dumps(payload), "application/json"),
+        "files[0]": (image_filename, image_bytes, "image/jpeg"),
+    }
+    try:
+        resp = httpx.post(webhook_url, files=files, timeout=_DISCORD_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        print(f"[notify] discord photo POST failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return False
+    if resp.status_code >= 400:
+        print(f"[notify] discord photo returned HTTP {resp.status_code}: "
+              f"{resp.text[:200]}", file=sys.stderr)
+        return False
+    print(f"[notify] discord photo sent ({len(image_bytes)} bytes, "
+          f"HTTP {resp.status_code})", file=sys.stderr)
+    return True
+
+
 def send_discord_alert_for_path(
     webhook_url: str,
     image_path: Path,

@@ -152,6 +152,23 @@ def _grab_own_frame():
             cap.release()
 
 
+def encode_jpeg(frame) -> bytes | None:
+    """Encode a BGR ndarray frame to JPEG bytes at the standard quality.
+    Returns None if cv2 is missing or the encode fails. Shared by the snapshot
+    tool and M72's multimodal acoustic alert (which encodes the armed watcher's
+    frame). Never raises."""
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        return None
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+        return bytes(buf) if ok else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cameras] encode_jpeg failed: {exc}", file=sys.stderr)
+        return None
+
+
 def execute_camera_snapshot(params: dict) -> str | list[dict]:
     """Capture a webcam frame. Returns either a list of content blocks (image
     + caption) on success, or a readable error string. Never raises.

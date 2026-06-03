@@ -129,6 +129,25 @@ _DISABLED = _env_set("JARVIS_ACOUSTIC_DISABLE")  # per-class kill switch
 # first live test (the M44.1 lesson — guess loose, calibrate from a real
 # measurement). The other six classes ignore this floor.
 _RUNNING_WATER_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_WATER_RMS_FLOOR", 0.025)
+# Debug: set JARVIS_ACOUSTIC_DEBUG=1 to log the top AudioSet labels + scores for
+# any non-quiet window. The data-driven way to tune a class (e.g. find what a
+# table-knock actually classifies as — likely "Tap"/"Wood", not "Knock") instead
+# of guessing thresholds. Off by default (would spam the log).
+_DEBUG_TOPK = os.getenv("JARVIS_ACOUSTIC_DEBUG", "").strip() not in ("", "0", "false", "False")
+_DEBUG_MIN_SCORE = 0.10  # only log a window whose strongest label clears this
+# Loudness floor for the transient events (knock/doorbell/glass). The model
+# occasionally hallucinates e.g. "Knock"=0.43 on a near-SILENT window
+# (rms~0.002) — a false "someone's at the door" while away. Live data
+# (2026-06-03) separated the classes: spurious fires peaked at rms 0.009, real
+# events ran 0.033–0.32. The DOORBELL is the quietest real event (rms 0.033)
+# because Windows Voice Focus (kept on "Automatic" for voice clarity) attenuates
+# non-speech — so the floor must leave margin BELOW the real doorbell, not hug
+# it. 0.02 sits in the gap (rejects ≤0.009 hallucinations, passes the 0.033
+# doorbell with room to spare for further Voice-Focus attenuation). Leans toward
+# detection on purpose: a missed knock/doorbell while away is worse than a rare
+# false ping. Same idea as the running-water volume guard, generalised.
+# Env-tunable per setup.
+_EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.02)
 
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
@@ -160,13 +179,25 @@ class ClassRule:
     push: str                              # Discord one-liner
     needs_volume_guard: bool = False       # gate on RMS too (running_water)
     experimental: bool = False             # logs "experimental" on activate
+    rms_floor: float = 0.0                 # min window RMS to fire (0 = no floor);
+                                           # rejects model hallucinations on silence
 
 
-# The default v1 allowlist — the seven the user confirmed. Thresholds + sustain
-# are starting points; expect to tune after the first real test. Cnn14 outputs
-# a per-class sigmoid score in [0, 1]; multi-label, so scores DO NOT sum to 1
-# across classes — independent per-class probabilities. A strong event
-# typically scores 0.3–0.8 on its primary label.
+# The active allowlist — the THREE the user wants while armed (2026-06-03):
+# knock, doorbell, glass breaking. Acoustic awareness is coupled to armed mode
+# (armed = away = listen), and these are the away-relevant events: someone at
+# the door (knock/doorbell — though a Ring doorbell usually flags a real
+# visitor first) and the high-priority GLASS BREAK, which triggers the M72
+# multimodal alert (photo + description to Discord) so the user can see what
+# Jarvis sees and cross-check the Ring indoor camera. The other four events
+# (smoke/phone/timer/water) are defined in _OTHER_RULES below but NOT active —
+# add one back to _DEFAULT_RULES to re-enable.
+#
+# Thresholds + sustain are starting points; expect to tune (knock especially —
+# a table-knock may classify as Tap/Wood, not "Knock"; see the knock-tuning
+# follow-on). Cnn14 outputs a per-class sigmoid score in [0, 1]; multi-label,
+# so scores DO NOT sum to 1 — independent per-class probabilities. A strong
+# event typically scores 0.3–0.8 on its primary label.
 _DEFAULT_RULES: tuple[ClassRule, ...] = (
     ClassRule(
         name="doorbell",
@@ -174,6 +205,7 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=0.30, sustain=1, cooldown_seconds=25.0,
         speak="Sir — that sounded like the doorbell.",
         push="🔔 Doorbell",
+        rms_floor=_EVENT_RMS_FLOOR,
     ),
     ClassRule(
         name="knock",
@@ -181,20 +213,35 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=0.25, sustain=1, cooldown_seconds=30.0,
         speak="Sir — there's someone at the door.",
         push="🚪 Knock at the door",
+        rms_floor=_EVENT_RMS_FLOOR,
     ),
+    ClassRule(
+        name="glass_break",
+        # "Breaking" added 2026-06-03: a faint break scored Glass 0.19 +
+        # Shatter 0.09 = 0.28 (just under threshold, missed) but had
+        # Breaking 0.08 — aggregating it clears 0.30. Deliberately NOT adding
+        # "Chink, clink" (fires on normal glasses touching → false positives).
+        # Glass is the priority event (triggers the M72 photo so the user can
+        # check the Ring indoor cam), so bias toward catching a faint break.
+        aliases=("Glass", "Shatter", "Breaking"),
+        threshold=0.30, sustain=1, cooldown_seconds=45.0,
+        speak="Sir — I just heard glass breaking.",
+        push="💥 Glass breaking",
+        rms_floor=_EVENT_RMS_FLOOR,
+    ),
+)
+
+
+# Defined but NOT in the active set (the user scoped acoustic to the three
+# above on 2026-06-03). Kept here so re-enabling any is a one-line move into
+# _DEFAULT_RULES, with the tuned aliases/thresholds preserved.
+_OTHER_RULES: tuple[ClassRule, ...] = (
     ClassRule(
         name="smoke_alarm",
         aliases=("Smoke detector, smoke alarm", "Fire alarm"),
         threshold=0.30, sustain=2, cooldown_seconds=60.0,
         speak="Sir — I'm hearing a smoke alarm.",
         push="🚨 Smoke / fire alarm",
-    ),
-    ClassRule(
-        name="glass_break",
-        aliases=("Glass", "Shatter"),
-        threshold=0.30, sustain=1, cooldown_seconds=45.0,
-        speak="Sir — I just heard glass breaking.",
-        push="💥 Glass breaking",
     ),
     ClassRule(
         name="phone_ringing",
@@ -364,9 +411,15 @@ class SoundDetector:
         rules: tuple[ClassRule, ...] = _DEFAULT_RULES,
         device: int | None = None,
         speaking_event: "threading.Event | None" = None,
+        on_visual_alert: "Callable[[str], None] | None" = None,
     ) -> None:
         self._announce = announce
         self._discord = (discord_webhook_url or "").strip()
+        # M72 — multimodal alert hook: on a fired event, ALSO look through the
+        # camera and push a photo + Claude description to Discord. main.py wires
+        # this to a function that's a no-op unless armed (the camera is the
+        # watcher's then). Optional + fail-soft; None ⇒ text-only (pre-M72).
+        self._on_visual_alert = on_visual_alert
         # Honour the per-class kill switch at construction (reads env once).
         self._rules = tuple(r for r in rules if r.name not in _DISABLED)
         self._device = device              # sounddevice device index; None = default
@@ -662,6 +715,20 @@ class SoundDetector:
             return
         # clipwise shape: (1, 527). Take the batch-of-one row.
         scores = clipwise[0]
+        # Debug aid (JARVIS_ACOUSTIC_DEBUG=1): log what PANNs actually hears so
+        # a class can be tuned from data, not guesswork. Top-6 labels for any
+        # window above the floor — knock on the table while this is on and read
+        # the labels your knock produces.
+        if _DEBUG_TOPK and self._labels:
+            try:
+                top = np.argsort(scores)[::-1][:6]
+                if float(scores[top[0]]) >= _DEBUG_MIN_SCORE:
+                    pairs = ", ".join(
+                        f"{self._labels[i]}={float(scores[i]):.2f}" for i in top
+                    )
+                    print(f"[acoustic] top: {pairs} (rms={rms:.3f})", file=sys.stderr)
+            except Exception:  # noqa: BLE001 — debug log must never break the loop
+                pass
         now = time.monotonic()
         for r in self._resolved:
             # Aggregate score across all of this rule's matched class indices
@@ -669,6 +736,13 @@ class SoundDetector:
             # e.g. smoke_alarm = "Smoke detector, smoke alarm" + "Fire alarm").
             score = float(sum(scores[i] for i in r.indices))
             above = score >= r.rule.threshold
+            # Loudness floor (knock/doorbell/glass): reject a window whose
+            # score clears the threshold but is too QUIET to be a real event —
+            # the model hallucinates e.g. "Knock"=0.43 on near-silence (rms
+            # ~0.002). Live data put real events at rms ≥ 0.076, so a 0.03
+            # floor kills the false fires without touching genuine ones.
+            if above and r.rule.rms_floor > 0.0 and rms < r.rule.rms_floor:
+                above = False
             # Volume guard for running_water. Even if the model says
             # "running water," refuse to count the window unless the room
             # is actually loud enough — keeps the pet fountain (a soft
@@ -692,6 +766,20 @@ class SoundDetector:
                 target=self._push_discord, args=(rule.push,),
                 name="AcousticNotify", daemon=True,
             ).start()
+        # M72 — multimodal: look + describe + push a photo. On its OWN thread
+        # (it does a ~2s vision call) so it never blocks the inference loop or
+        # the text push. The hook itself is gated on armed (no-op at home).
+        if self._on_visual_alert is not None:
+            threading.Thread(
+                target=self._safe_visual, args=(rule.name,),
+                name="AcousticVisual", daemon=True,
+            ).start()
+
+    def _safe_visual(self, event_name: str) -> None:
+        try:
+            self._on_visual_alert(event_name)
+        except Exception as exc:  # noqa: BLE001 — a proactive extra must never break
+            print(f"[acoustic] visual alert failed: {exc}", file=sys.stderr)
 
     def _push_discord(self, content: str) -> None:
         from src.notifications import send_discord_message  # noqa: PLC0415
