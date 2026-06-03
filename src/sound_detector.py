@@ -129,6 +129,12 @@ _DISABLED = _env_set("JARVIS_ACOUSTIC_DISABLE")  # per-class kill switch
 # first live test (the M44.1 lesson — guess loose, calibrate from a real
 # measurement). The other six classes ignore this floor.
 _RUNNING_WATER_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_WATER_RMS_FLOOR", 0.025)
+# Debug: set JARVIS_ACOUSTIC_DEBUG=1 to log the top AudioSet labels + scores for
+# any non-quiet window. The data-driven way to tune a class (e.g. find what a
+# table-knock actually classifies as — likely "Tap"/"Wood", not "Knock") instead
+# of guessing thresholds. Off by default (would spam the log).
+_DEBUG_TOPK = os.getenv("JARVIS_ACOUSTIC_DEBUG", "").strip() not in ("", "0", "false", "False")
+_DEBUG_MIN_SCORE = 0.10  # only log a window whose strongest label clears this
 
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
@@ -162,11 +168,21 @@ class ClassRule:
     experimental: bool = False             # logs "experimental" on activate
 
 
-# The default v1 allowlist — the seven the user confirmed. Thresholds + sustain
-# are starting points; expect to tune after the first real test. Cnn14 outputs
-# a per-class sigmoid score in [0, 1]; multi-label, so scores DO NOT sum to 1
-# across classes — independent per-class probabilities. A strong event
-# typically scores 0.3–0.8 on its primary label.
+# The active allowlist — the THREE the user wants while armed (2026-06-03):
+# knock, doorbell, glass breaking. Acoustic awareness is coupled to armed mode
+# (armed = away = listen), and these are the away-relevant events: someone at
+# the door (knock/doorbell — though a Ring doorbell usually flags a real
+# visitor first) and the high-priority GLASS BREAK, which triggers the M72
+# multimodal alert (photo + description to Discord) so the user can see what
+# Jarvis sees and cross-check the Ring indoor camera. The other four events
+# (smoke/phone/timer/water) are defined in _OTHER_RULES below but NOT active —
+# add one back to _DEFAULT_RULES to re-enable.
+#
+# Thresholds + sustain are starting points; expect to tune (knock especially —
+# a table-knock may classify as Tap/Wood, not "Knock"; see the knock-tuning
+# follow-on). Cnn14 outputs a per-class sigmoid score in [0, 1]; multi-label,
+# so scores DO NOT sum to 1 — independent per-class probabilities. A strong
+# event typically scores 0.3–0.8 on its primary label.
 _DEFAULT_RULES: tuple[ClassRule, ...] = (
     ClassRule(
         name="doorbell",
@@ -183,18 +199,25 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         push="🚪 Knock at the door",
     ),
     ClassRule(
-        name="smoke_alarm",
-        aliases=("Smoke detector, smoke alarm", "Fire alarm"),
-        threshold=0.30, sustain=2, cooldown_seconds=60.0,
-        speak="Sir — I'm hearing a smoke alarm.",
-        push="🚨 Smoke / fire alarm",
-    ),
-    ClassRule(
         name="glass_break",
         aliases=("Glass", "Shatter"),
         threshold=0.30, sustain=1, cooldown_seconds=45.0,
         speak="Sir — I just heard glass breaking.",
         push="💥 Glass breaking",
+    ),
+)
+
+
+# Defined but NOT in the active set (the user scoped acoustic to the three
+# above on 2026-06-03). Kept here so re-enabling any is a one-line move into
+# _DEFAULT_RULES, with the tuned aliases/thresholds preserved.
+_OTHER_RULES: tuple[ClassRule, ...] = (
+    ClassRule(
+        name="smoke_alarm",
+        aliases=("Smoke detector, smoke alarm", "Fire alarm"),
+        threshold=0.30, sustain=2, cooldown_seconds=60.0,
+        speak="Sir — I'm hearing a smoke alarm.",
+        push="🚨 Smoke / fire alarm",
     ),
     ClassRule(
         name="phone_ringing",
@@ -668,6 +691,20 @@ class SoundDetector:
             return
         # clipwise shape: (1, 527). Take the batch-of-one row.
         scores = clipwise[0]
+        # Debug aid (JARVIS_ACOUSTIC_DEBUG=1): log what PANNs actually hears so
+        # a class can be tuned from data, not guesswork. Top-6 labels for any
+        # window above the floor — knock on the table while this is on and read
+        # the labels your knock produces.
+        if _DEBUG_TOPK and self._labels:
+            try:
+                top = np.argsort(scores)[::-1][:6]
+                if float(scores[top[0]]) >= _DEBUG_MIN_SCORE:
+                    pairs = ", ".join(
+                        f"{self._labels[i]}={float(scores[i]):.2f}" for i in top
+                    )
+                    print(f"[acoustic] top: {pairs} (rms={rms:.3f})", file=sys.stderr)
+            except Exception:  # noqa: BLE001 — debug log must never break the loop
+                pass
         now = time.monotonic()
         for r in self._resolved:
             # Aggregate score across all of this rule's matched class indices
