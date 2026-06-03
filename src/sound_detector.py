@@ -135,6 +135,14 @@ _RUNNING_WATER_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_WATER_RMS_FLOOR", 0.025)
 # of guessing thresholds. Off by default (would spam the log).
 _DEBUG_TOPK = os.getenv("JARVIS_ACOUSTIC_DEBUG", "").strip() not in ("", "0", "false", "False")
 _DEBUG_MIN_SCORE = 0.10  # only log a window whose strongest label clears this
+# Loudness floor for the transient events (knock/doorbell/glass). The model
+# occasionally hallucinates e.g. "Knock"=0.43 on a near-SILENT window
+# (rms~0.002) — a false "someone's at the door" while away. Live data
+# (2026-06-03) cleanly separated the classes: real events measured rms
+# 0.076–0.32, spurious fires 0.002–0.009. 0.03 sits in the gap — passes every
+# real event, rejects the silent hallucinations. Same idea as the running-water
+# volume guard, generalised. Env-tunable per setup.
+_EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.03)
 
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
@@ -166,6 +174,8 @@ class ClassRule:
     push: str                              # Discord one-liner
     needs_volume_guard: bool = False       # gate on RMS too (running_water)
     experimental: bool = False             # logs "experimental" on activate
+    rms_floor: float = 0.0                 # min window RMS to fire (0 = no floor);
+                                           # rejects model hallucinations on silence
 
 
 # The active allowlist — the THREE the user wants while armed (2026-06-03):
@@ -190,6 +200,7 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=0.30, sustain=1, cooldown_seconds=25.0,
         speak="Sir — that sounded like the doorbell.",
         push="🔔 Doorbell",
+        rms_floor=_EVENT_RMS_FLOOR,
     ),
     ClassRule(
         name="knock",
@@ -197,6 +208,7 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=0.25, sustain=1, cooldown_seconds=30.0,
         speak="Sir — there's someone at the door.",
         push="🚪 Knock at the door",
+        rms_floor=_EVENT_RMS_FLOOR,
     ),
     ClassRule(
         name="glass_break",
@@ -204,6 +216,7 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=0.30, sustain=1, cooldown_seconds=45.0,
         speak="Sir — I just heard glass breaking.",
         push="💥 Glass breaking",
+        rms_floor=_EVENT_RMS_FLOOR,
     ),
 )
 
@@ -712,6 +725,13 @@ class SoundDetector:
             # e.g. smoke_alarm = "Smoke detector, smoke alarm" + "Fire alarm").
             score = float(sum(scores[i] for i in r.indices))
             above = score >= r.rule.threshold
+            # Loudness floor (knock/doorbell/glass): reject a window whose
+            # score clears the threshold but is too QUIET to be a real event —
+            # the model hallucinates e.g. "Knock"=0.43 on near-silence (rms
+            # ~0.002). Live data put real events at rms ≥ 0.076, so a 0.03
+            # floor kills the false fires without touching genuine ones.
+            if above and r.rule.rms_floor > 0.0 and rms < r.rule.rms_floor:
+                above = False
             # Volume guard for running_water. Even if the model says
             # "running water," refuse to count the window unless the room
             # is actually loud enough — keeps the pet fountain (a soft
