@@ -1997,10 +1997,39 @@ def main() -> None:
     mic_device_index = resolve_input_device(cfg.mic_device)
 
     from src.sound_detector import SoundDetector
+    # M72 — multimodal acoustic alert: when Jarvis hears something WHILE ARMED,
+    # he also looks through the camera and pushes a photo + a one-line Claude
+    # description to Discord. Gated by the armed frame provider —
+    # grab_frame_for_snapshot returns None unless armed, so this no-ops at home
+    # (no camera light for every doorbell) and only fires for the away case it's
+    # built for. Runs on the SoundDetector's own AcousticVisual thread; every
+    # step is fail-soft so a missing key / network blip / no camera just skips
+    # the visual and the text alert (already sent) stands.
+    def _acoustic_visual_alert(event_name: str) -> None:
+        if not cfg.discord_webhook_url:
+            return
+        frame = security_watcher.grab_frame_for_snapshot()
+        if frame is None:
+            return  # not armed → the watcher isn't holding the camera; skip
+        jpeg = _cameras.encode_jpeg(frame)
+        if not jpeg:
+            return
+        from src.vision_describe import describe_scene  # noqa: PLC0415
+        from src.notifications import send_discord_photo  # noqa: PLC0415
+        desc = describe_scene(
+            jpeg, event_name,
+            api_key=cfg.anthropic_api_key, model=cfg.claude_model,
+        )
+        pretty = event_name.replace("_", " ")
+        caption = f"👁 {desc}" if desc else f"👁 I heard {pretty} — here's the room, sir."
+        send_discord_photo(cfg.discord_webhook_url, caption, jpeg,
+                           image_filename="acoustic.jpg")
+
     sound_detector = SoundDetector(
         announce=lambda t: _announce(t, label="🔔"),
         discord_webhook_url=cfg.discord_webhook_url,
         device=mic_device_index,
+        on_visual_alert=_acoustic_visual_alert,
         # Cooperative speech gate (same Event the SecurityWatcher uses): the
         # PANNs inference loop defers while a proactive announce plays so it
         # can't starve the TTS path. M58 coupled acoustic to armed mode but

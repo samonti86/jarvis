@@ -364,9 +364,15 @@ class SoundDetector:
         rules: tuple[ClassRule, ...] = _DEFAULT_RULES,
         device: int | None = None,
         speaking_event: "threading.Event | None" = None,
+        on_visual_alert: "Callable[[str], None] | None" = None,
     ) -> None:
         self._announce = announce
         self._discord = (discord_webhook_url or "").strip()
+        # M72 — multimodal alert hook: on a fired event, ALSO look through the
+        # camera and push a photo + Claude description to Discord. main.py wires
+        # this to a function that's a no-op unless armed (the camera is the
+        # watcher's then). Optional + fail-soft; None ⇒ text-only (pre-M72).
+        self._on_visual_alert = on_visual_alert
         # Honour the per-class kill switch at construction (reads env once).
         self._rules = tuple(r for r in rules if r.name not in _DISABLED)
         self._device = device              # sounddevice device index; None = default
@@ -692,6 +698,20 @@ class SoundDetector:
                 target=self._push_discord, args=(rule.push,),
                 name="AcousticNotify", daemon=True,
             ).start()
+        # M72 — multimodal: look + describe + push a photo. On its OWN thread
+        # (it does a ~2s vision call) so it never blocks the inference loop or
+        # the text push. The hook itself is gated on armed (no-op at home).
+        if self._on_visual_alert is not None:
+            threading.Thread(
+                target=self._safe_visual, args=(rule.name,),
+                name="AcousticVisual", daemon=True,
+            ).start()
+
+    def _safe_visual(self, event_name: str) -> None:
+        try:
+            self._on_visual_alert(event_name)
+        except Exception as exc:  # noqa: BLE001 — a proactive extra must never break
+            print(f"[acoustic] visual alert failed: {exc}", file=sys.stderr)
 
     def _push_discord(self, content: str) -> None:
         from src.notifications import send_discord_message  # noqa: PLC0415
