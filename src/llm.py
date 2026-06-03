@@ -596,6 +596,28 @@ Remote session (limited capability):
   apologize at length — just redirect."""
 
 
+# M71 — Discord variant of the restricted addendum. Discord is the ONE remote
+# origin with camera_snapshot clawed back (see _RESTRICTED_ALLOW_BY_ORIGIN), so
+# its prompt must NOT tell Claude the camera is off-limits — it tells Claude the
+# camera IS available and the photo is shared into the channel. Everything else
+# stays denied, identical to the base addendum.
+_REMOTE_RESTRICTED_DISCORD_ADDENDUM = """
+
+Remote session (Discord — limited capability):
+- You are answering from a private Discord channel, not at the PC.
+- You CAN look through the webcam: call camera_snapshot when the user asks you
+  to check on the home, see what's going on, or look at something. The photo
+  you capture is posted into this Discord channel alongside your reply, so
+  describe what you see plainly and usefully (who or what is present, lights,
+  anything notable).
+- For safety this session still CANNOT run system control, the investigative
+  shell, the deep diagnostics collector, Plex admin actions, local file reads,
+  screen capture, code execution, or self-update — those tools are simply not
+  available here (enforced, not advisory).
+- If asked for one of those, say plainly it's not available from Discord and
+  offer what you CAN do. Don't pretend, don't apologize at length."""
+
+
 # Anthropic's server-side web search tool. Server-side = Anthropic runs it,
 # we just declare it.
 #
@@ -700,6 +722,7 @@ def build_system_prompt(
     plex_laptop_available: bool = False,
     engineer_mode: bool = False,
     remote_restricted: bool = False,
+    restricted_origin: str = "",
 ) -> str:
     """Compose the system prompt with the current date and optional memory.
 
@@ -729,8 +752,15 @@ def build_system_prompt(
     if remote_restricted:
         # Stable per session-origin (a turn is restricted or not for its
         # whole life), so it stays in the cacheable prefix like the other
-        # addenda — no prompt-cache churn.
-        base += _REMOTE_RESTRICTED_ADDENDUM
+        # addenda — no prompt-cache churn. M71: an origin with camera clawed
+        # back (Discord) gets the variant that tells Claude the webcam IS
+        # available, instead of the base "no camera" wording.
+        if "camera_snapshot" in _RESTRICTED_ALLOW_BY_ORIGIN.get(
+            restricted_origin, frozenset()
+        ):
+            base += _REMOTE_RESTRICTED_DISCORD_ADDENDUM
+        else:
+            base += _REMOTE_RESTRICTED_ADDENDUM
     if not summaries:
         return base
     memory_block = format_summaries_for_prompt(summaries)
@@ -815,6 +845,27 @@ _RESTRICTED_DENY: frozenset[str] = frozenset({
 })
 
 
+# M71 — per-origin claw-back: specific otherwise-denied tools selectively
+# re-allowed for ONE restricted origin, deny-by-default everywhere else.
+# Discord gets camera_snapshot back so the household can ask Jarvis to look
+# through the webcam while away (the captured photo is relayed into the
+# channel; see main.py's reply_image sink). Least-privilege is preserved —
+# this is a SURGICAL exception, not a boundary flip: every other restricted
+# tool (system/shell/file/screen/code/self-update) stays denied for Discord,
+# and the phone origins get nothing back. New exceptions go here, one origin
+# at a time, deliberately. [[feedback-jarvis-least-privilege]]
+_RESTRICTED_ALLOW_BY_ORIGIN: dict[str, frozenset[str]] = {
+    "discord": frozenset({"camera_snapshot"}),
+}
+
+
+def _effective_deny(origin: str) -> frozenset[str]:
+    """The deny-set actually applied to a restricted `origin`: the base
+    _RESTRICTED_DENY minus any tools clawed back for that origin. An unknown
+    or empty origin gets the full deny (safe default)."""
+    return _RESTRICTED_DENY - _RESTRICTED_ALLOW_BY_ORIGIN.get(origin, frozenset())
+
+
 # Server-side tools — Anthropic runs these; we only declare them (in
 # stream_response's `tools` list) and record that they fired. Ordered:
 # defines telemetry order. Each name doubles as its own stderr label.
@@ -839,6 +890,7 @@ def _execute_client_tool(
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
     restricted: bool = False,
+    origin: str = "",
 ) -> str | list[dict]:
     """Dispatch a client-side tool call. Returns text (or, for camera_snapshot,
     a list of content blocks) for Claude to consume. Errors become readable
@@ -849,9 +901,12 @@ def _execute_client_tool(
     session from being OFFERED a denied tool; this refuses to EXECUTE one
     even if a denied name reaches here anyway (model quirk, prompt
     injection from the phone, a future code path). Server-side, not
-    prompt-only — the [[feedback-diag-vs-action-split]] rule."""
-    if restricted and name in _RESTRICTED_DENY:
-        print(f"[llm] restricted session denied tool '{name}'", file=sys.stderr)
+    prompt-only — the [[feedback-diag-vs-action-split]] rule. M71: the deny-set
+    is per-origin (Discord has camera clawed back), so an origin's allowed
+    exception executes while everything else still refuses."""
+    if restricted and name in _effective_deny(origin):
+        print(f"[llm] restricted session ({origin or 'remote'}) denied tool '{name}'",
+              file=sys.stderr)
         return (
             f"The '{name}' tool isn't available from the remote console "
             f"(safety: this session can't run system, shell, file, or "
@@ -884,6 +939,7 @@ def stream_response(
     on_image_captured: Callable[[bytes, str, str], None] | None = None,
     engineer_mode: bool = False,
     restricted: bool = False,
+    origin: str = "",
     interrupt_event: threading.Event | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
@@ -928,6 +984,7 @@ def stream_response(
         plex_laptop_available=plex_laptop_client is not None,
         engineer_mode=engineer_mode,
         remote_restricted=restricted,
+        restricted_origin=origin,
     )
     system_param = [
         {
@@ -964,7 +1021,8 @@ def stream_response(
     # family (plex_action), and dynamic Plex MCP names uniformly. The
     # _execute_client_tool deny-check is the defense-in-depth second gate.
     if restricted:
-        tools = [t for t in tools if t.get("name") not in _RESTRICTED_DENY]
+        denied = _effective_deny(origin)
+        tools = [t for t in tools if t.get("name") not in denied]
 
     # Mutable working copy — we append assistant + tool_result turns as the
     # agentic loop runs. The caller's `messages` list is left untouched.
@@ -1086,6 +1144,7 @@ def stream_response(
                 plex_client=plex_client,
                 plex_laptop_client=plex_laptop_client,
                 restricted=restricted,
+                origin=origin,
             )
             # Vision tools (camera_snapshot, screen_snapshot) return a list
             # containing an image block + a caption text block. If a UI hook

@@ -147,7 +147,11 @@ class DiscordBot:
         self._token = token
         self._channel_id = int(channel_id)
         self._allowed: frozenset[int] = frozenset(int(u) for u in allowed_user_ids)
-        self._on_text: Callable[[str, Callable[[str], None]], None] | None = None
+        # M71: on_text now carries TWO per-turn sinks — reply_text (post the
+        # answer) and reply_image (buffer a webcam frame for the same threaded
+        # reply). reply_image exists because camera_snapshot is clawed back for
+        # origin="discord" so the household can check the home while away.
+        self._on_text: "Callable[[str, Callable[[str], None], Callable[[bytes, str], None]], None] | None" = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         # Thread IDs the bot itself created — inside these, every message is for
@@ -155,10 +159,13 @@ class DiscordBot:
         self._bot_threads: set[int] = set()
 
     def set_on_text(
-        self, fn: Callable[[str, Callable[[str], None]], None]
+        self,
+        fn: "Callable[[str, Callable[[str], None], Callable[[bytes, str], None]], None]",
     ) -> None:
-        """Wire the inbound handler. fn(text, reply): enqueue the turn; the
-        brain later calls reply(answer) to post back to the channel."""
+        """Wire the inbound handler. fn(text, reply_text, reply_image): enqueue
+        the turn; the brain calls reply_text(answer) to post back, and (M71)
+        reply_image(bytes, media_type) to buffer a captured webcam frame so it's
+        attached to that same threaded reply."""
         self._on_text = fn
 
     def start(self) -> None:
@@ -227,11 +234,22 @@ class DiscordBot:
             # the whole message (so _post can decide thread-vs-channel) plus the
             # CLEANED text as the thread title (so the title reads "what is the
             # weather", not the raw "<@id> what is the weather" mention markup).
+            # M71 — per-turn webcam-frame buffer. The brain calls reply_image
+            # mid-turn (when camera_snapshot fires) BEFORE reply_text at the
+            # end, so by the time we post the answer this list holds any photo
+            # to attach. Buffering (vs posting the image immediately) keeps the
+            # photo + the description in ONE thread — posting separately would
+            # race _post's thread creation and split them.
+            pending_images: list[tuple[bytes, str]] = []
+
+            def _reply_image(img: bytes, media_type: str) -> None:
+                pending_images.append((img, media_type))
+
             def _reply(answer: str, _msg=message, _title=content) -> None:
-                self._post(_msg, answer, _title)
+                self._post(_msg, answer, _title, pending_images)
 
             try:
-                self._on_text(content, _reply)
+                self._on_text(content, _reply, _reply_image)
             except Exception as exc:  # noqa: BLE001 — never break the gateway loop
                 print(f"[discord] on_text raised: {exc}", file=sys.stderr)
 
@@ -242,7 +260,8 @@ class DiscordBot:
         except Exception as exc:  # noqa: BLE001 — a dead bot must not kill Jarvis
             print(f"[discord] bot stopped: {exc}", file=sys.stderr)
 
-    def _post(self, message: object, answer: str, title_hint: str = "") -> None:
+    def _post(self, message: object, answer: str, title_hint: str = "",
+              images: "list[tuple[bytes, str]] | None" = None) -> None:
         """Thread-safe: post `answer` (chunked) back as a THREADED reply to
         `message`. Called from the brain's worker thread; marshals onto the
         bot's loop. Fail-soft.
@@ -258,11 +277,12 @@ class DiscordBot:
             print("[discord] reply dropped — bot loop not ready", file=sys.stderr)
             return
         chunks = chunk_message(answer)
-        if not chunks:
+        if not chunks and not images:
             return
 
         async def _send() -> None:
-            import discord  # noqa: PLC0415 — cached; needed for Thread/Forbidden
+            import io  # noqa: PLC0415
+            import discord  # noqa: PLC0415 — cached; needed for Thread/Forbidden/File
             try:
                 channel = message.channel  # type: ignore[attr-defined]
                 if isinstance(channel, discord.Thread):
@@ -286,8 +306,26 @@ class DiscordBot:
                             file=sys.stderr,
                         )
                         target = channel
-                for piece in chunks:
-                    await target.send(piece)
+                # M71 — build the webcam attachment(s) once and attach to the
+                # FIRST message so the photo + Jarvis's description land together
+                # in the same thread (not split across separate posts).
+                files = []
+                for i, (img, media_type) in enumerate(images or []):
+                    ext = "png" if "png" in (media_type or "") else "jpg"
+                    suffix = "" if i == 0 else str(i)
+                    files.append(
+                        discord.File(io.BytesIO(img), filename=f"snapshot{suffix}.{ext}")
+                    )
+                if not chunks:
+                    # Image(s) only (empty text reply) — post the photo alone.
+                    if files:
+                        await target.send(files=files)
+                    return
+                for idx, piece in enumerate(chunks):
+                    if idx == 0 and files:
+                        await target.send(content=piece, files=files)
+                    else:
+                        await target.send(piece)
             except Exception as exc:  # noqa: BLE001
                 print(f"[discord] send failed: {exc}", file=sys.stderr)
 
