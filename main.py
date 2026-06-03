@@ -1424,7 +1424,9 @@ def _build_announcer(ui: JarvisUI, pc_speaking: threading.Event) -> _Announcer:
     return _Announcer(_announce, announce_speaking, _shutdown)
 
 
-def _build_remote_console(cfg: Config, ui: JarvisUI, security_watcher) -> object | None:
+def _build_remote_console(
+    cfg: Config, ui: JarvisUI, security_watcher, announce
+) -> object | None:
     """M48.1 LAN remote console. Returns the started RemoteConsoleServer, or
     None when disabled (no token) or on any startup failure.
 
@@ -1449,6 +1451,21 @@ def _build_remote_console(cfg: Config, ui: JarvisUI, security_watcher) -> object
         except Exception as exc:  # noqa: BLE001 — never break on a remote ask
             print(f"[remote] control {action!r} failed: {exc}", file=sys.stderr)
         return {"armed": bool(security_watcher.is_armed())}
+
+    # M70 — geofenced auto-arm. The PresenceController owns the policy (deferred
+    # arm + flap damping + greet-on-real-transition); main.py just binds it to
+    # the live SecurityWatcher and the WASAPI-safe announce path (tagged 🏠).
+    # Reached via the token-gated /presence HTTP route an iOS Shortcuts
+    # automation fires — same secret as the WS console.
+    from src.presence import PresenceController  # noqa: PLC0415
+    _presence = PresenceController(
+        arm=security_watcher.activate,
+        disarm=security_watcher.deactivate,
+        is_armed=security_watcher.is_armed,
+        announce=lambda t: announce(t, label="🏠"),
+        arm_delay=cfg.presence_arm_delay,
+        greeting=cfg.presence_greeting,
+    )
 
     try:
         # Import is INSIDE the try: a missing `websockets` (or any
@@ -1499,6 +1516,7 @@ def _build_remote_console(cfg: Config, ui: JarvisUI, security_watcher) -> object
             host=cfg.remote_bind,
             port=cfg.remote_port,
             on_control=_remote_control,
+            on_presence=_presence.handle_event,
             ssl_context=ssl_ctx,
         )
         ui.set_remote(remote_server)
@@ -2025,7 +2043,7 @@ def main() -> None:
     # M48.1: LAN remote console (token-gated, optional). Returns the started
     # server or None. on_text is wired later in listen_loop once the
     # text_queue exists (the late-injection pattern).
-    remote_server = _build_remote_console(cfg, ui, security_watcher)
+    remote_server = _build_remote_console(cfg, ui, security_watcher, _announce)
 
     # M60 — self-status registry: each subsystem reports a one-line status via
     # the `status_report` tool. Registered with the live subsystem handles.
