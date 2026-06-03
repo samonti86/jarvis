@@ -36,6 +36,7 @@ import json
 import ssl
 import sys
 import threading
+import urllib.parse
 from typing import Callable
 
 import websockets
@@ -97,6 +98,10 @@ class RemoteConsoleServer:
     on_text(text)      — fed a user utterance; wire to the text_queue.
     on_control(action) — "arm" | "disarm" | "status"; returns a dict with
                           at least {"armed": bool}. Wire to SecurityWatcher.
+    on_presence(event) — M70 geofenced auto-arm. "leave"/"arrive"/etc → a
+                          result dict; wire to a PresenceController. Reached
+                          via the token-gated HTTP /presence route, not the WS
+                          session (an iOS Shortcuts automation fires it).
     """
 
     def __init__(
@@ -106,6 +111,7 @@ class RemoteConsoleServer:
         port: int,
         on_text: Callable[[str], None] | None = None,
         on_control: Callable[[str], dict] | None = None,
+        on_presence: Callable[[str], dict] | None = None,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._token = token
@@ -139,6 +145,13 @@ class RemoteConsoleServer:
             )
         )
         self._on_control = on_control or (lambda a: {"armed": self._snapshot.get("armed", False)})
+        # M70 — presence (geofenced auto-arm) hook. Settable late like
+        # on_text, though in practice it's known at construction (the
+        # PresenceController is built alongside SecurityWatcher). Safe stub
+        # until wired: a presence ping is acknowledged but does nothing.
+        self._on_presence: Callable[[str], dict] = on_presence or (
+            lambda e: {"ok": False, "error": "presence not wired"}
+        )
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._clients: set[ServerConnection] = set()
@@ -162,6 +175,10 @@ class RemoteConsoleServer:
 
     def set_on_control(self, fn: Callable[[str], dict]) -> None:
         self._on_control = fn
+
+    def set_on_presence(self, fn: Callable[[str], dict]) -> None:
+        """M70 — wire the geofenced auto-arm handler (PresenceController)."""
+        self._on_presence = fn
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -269,7 +286,84 @@ class RemoteConsoleServer:
             )
         if path == "/healthz":
             return self._http(200, "text/plain; charset=utf-8", "ok")
+        if path == "/presence":
+            return self._handle_presence(request)
         return self._http(404, "text/plain; charset=utf-8", "not found", 404)
+
+    # ------------------------------------------------------------------
+    # M70 — geofenced auto-arm endpoint (token-gated HTTP, not WS).
+    # ------------------------------------------------------------------
+
+    def _handle_presence(self, request: Request) -> Response:
+        """An iOS Shortcuts personal automation (or any client) hits this on a
+        geofence boundary:
+
+            /presence?event=leave     → arm (deferred, flap-damped)
+            /presence?event=arrive    → disarm + "welcome home, sir"
+
+        Auth uses the SAME JARVIS_REMOTE_TOKEN as the WS console, supplied as
+        an `Authorization: Bearer <token>` header (preferred), an
+        `X-Jarvis-Token` header, or a `?token=` query param (least preferred —
+        leaks into URLs/proxy logs). **GET only.** The `websockets` HTTP
+        parser rejects any non-GET method at the request-line stage
+        (`process_request` is never even invoked for a POST) — verified live,
+        M70. That's fine: everything rides the query string + headers, and a
+        body would be unread anyway (this is a WS server's HTTP shim, not a
+        real HTTP framework). The iOS Shortcuts automation MUST use Method=GET
+        (see .env.example). Returns a small JSON result. NEVER raises — a remote ping must not crash the loop."""
+        parsed = urllib.parse.urlparse(request.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        supplied = self._presence_token_from(
+            request.headers.get("Authorization"),
+            request.headers.get("X-Jarvis-Token"),
+            (params.get("token") or [None])[0],
+        )
+        if not self._presence_authed(supplied):
+            _log("presence: rejected (bad/missing token)")
+            return self._http(
+                401, "text/plain; charset=utf-8", "unauthorized", 401
+            )
+        event = ((params.get("event") or [""])[0] or "").strip()
+        try:
+            result = self._on_presence(event) or {}
+        except Exception as exc:  # noqa: BLE001 — never let a remote ask crash
+            _log(f"on_presence({event!r}) raised: {exc}")
+            result = {"ok": False, "error": "internal"}
+        _log(f"presence event={event!r} -> {result}")
+        # State changes (the deferred arm firing, the disarm-on-arrive) reach
+        # every client through SecurityWatcher's on_armed_changed →
+        # ui.set_armed_indicator → update_armed broadcast — the same path the
+        # tray/voice arming uses — so we deliberately do NOT broadcast here.
+        return self._http(
+            200, "application/json; charset=utf-8", json.dumps(result)
+        )
+
+    @staticmethod
+    def _presence_token_from(
+        auth_header: str | None,
+        token_header: str | None,
+        query_token: str | None,
+    ) -> str:
+        """Pull the bearer token from the request, preferring the most
+        private channel: Authorization header → X-Jarvis-Token header →
+        ?token= query param. Returns "" when none present."""
+        if auth_header:
+            stripped = auth_header.strip()
+            # Accept "Bearer <tok>" (case-insensitive scheme) or a bare token.
+            if stripped.lower().startswith("bearer "):
+                return stripped[7:].strip()
+            return stripped
+        if token_header:
+            return token_header.strip()
+        if query_token:
+            return query_token.strip()
+        return ""
+
+    def _presence_authed(self, supplied: str) -> bool:
+        if not self._token or not supplied:
+            return False
+        # Constant-time compare — don't leak token length/prefix via timing.
+        return hmac.compare_digest(supplied, self._token)
 
     @staticmethod
     def _http(

@@ -39,6 +39,8 @@ class Config:
     remote_token: str          # M48 — shared secret the phone PWA must present on WS connect. BLANK = remote console DISABLED (safe default: the server only starts when a token is set).
     remote_port: int           # M48 — TCP port the LAN remote-console server listens on.
     remote_bind: str           # M48 — interface to bind. "0.0.0.0" = all (LAN-reachable; the token + a LAN-only firewall rule are the controls). Never port-forward this.
+    presence_arm_delay: float  # M70 — seconds to DEFER an auto-arm after a "leave" geofence ping, cancelled if an "arrive" lands first. Absorbs boundary-flap (skirting the geofence fires leave→arrive in seconds). Default 60; the iOS geofence is already ~100m out so a minute's delay after leaving costs nothing. 0 = arm immediately.
+    presence_greeting: str     # M70 — what Jarvis says on an arrive that disarms an armed house. Default "Welcome home, sir."; set JARVIS_PRESENCE_GREETING to change it.
     tls_cert_file: str         # M48.3 prereq — absolute path to a TLS cert (e.g. from `tailscale cert <host>.ts.net`). BOTH cert+key set ⇒ HTTPS/WSS; either missing ⇒ plain HTTP/WS (LAN-mode fallback). File MUST live outside the repo (it's a credential).
     tls_key_file: str          # M48.3 prereq — absolute path to the matching TLS private key. Same on/off semantics as tls_cert_file. Keep out of git.
     homelab_monitor_enabled: bool  # M56 — start the proactive homelab monitor at launch. Default off (opt-in via this flag or the tray toggle). Poll/threshold/disk tunables live in src/homelab_monitor.py.
@@ -107,6 +109,14 @@ def load() -> Config:
         remote_token=os.getenv("JARVIS_REMOTE_TOKEN", "").strip(),
         remote_port=int(os.getenv("JARVIS_REMOTE_PORT", "8765")),
         remote_bind=os.getenv("JARVIS_REMOTE_BIND", "0.0.0.0").strip(),
+        # M70 — geofenced auto-arm (rides the token-gated /presence route on
+        # the remote console; no separate enable flag — it exists iff the
+        # console does, i.e. iff a token is set). Arm is deferred to damp
+        # geofence boundary-flap; the greeting fires only on a real disarm.
+        presence_arm_delay=float(os.getenv("JARVIS_PRESENCE_ARM_DELAY", "60")),
+        presence_greeting=os.getenv(
+            "JARVIS_PRESENCE_GREETING", "Welcome home, sir."
+        ).strip(),
         # M48.3 prereq — TLS via Tailscale's MagicDNS `*.ts.net` cert
         # (`tailscale cert <host>` mints the pair via Let's Encrypt; both files
         # are credentials and MUST live outside the repo). When both are set
