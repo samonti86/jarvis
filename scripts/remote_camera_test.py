@@ -16,6 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np  # noqa: E402
+
+from src import cameras  # noqa: E402
 from src.llm import (  # noqa: E402
     _RESTRICTED_ALLOW_BY_ORIGIN,
     _RESTRICTED_DENY,
@@ -103,6 +106,38 @@ check("phone prompt does NOT invite camera use",
 unrestricted = build_system_prompt(remote_restricted=False, restricted_origin="")
 check("unrestricted (PC) prompt has NEITHER restricted addendum",
       "Remote session" not in unrestricted)
+
+
+# --- armed-frame provider routing (cameras.py) ----------------------------
+# Hermetic: a fake provider returns a synthetic frame, so execute_camera_snapshot
+# encodes THAT (cv2.imencode only) and never opens real hardware. This is the
+# fix for the armed-contention "camera covered" symptom.
+
+gray = np.full((120, 160, 3), 128, dtype=np.uint8)   # mean 128 -> not "black"
+black = np.zeros((120, 160, 3), dtype=np.uint8)       # mean 0   -> "covered"
+
+cameras.set_armed_frame_provider(lambda: gray)
+res = cameras.execute_camera_snapshot({})
+check("provider frame is used (returns image content blocks, no hardware)",
+      isinstance(res, list) and any(
+          isinstance(b, dict) and b.get("type") == "image" for b in res))
+check("provider-frame result carries the 'captured just now' caption",
+      isinstance(res, list) and any(
+          isinstance(b, dict) and b.get("type") == "text"
+          and "just now" in b.get("text", "") for b in res))
+
+cameras.set_armed_frame_provider(lambda: black)
+res = cameras.execute_camera_snapshot({})
+check("a black provider frame -> 'came back black' message (shutter/covered)",
+      isinstance(res, str) and "black" in res)
+
+# (A raising/None provider falls back to opening a real camera — deliberately
+# NOT exercised here so the suite stays hermetic and never flashes the webcam
+# during the gate. The try/except fallback is covered by inspection.)
+
+# Reset so the module global doesn't leak into other processes/tests.
+cameras.set_armed_frame_provider(None)
+check("provider can be reset to None", cameras._armed_frame_provider is None)
 
 
 # --- summary --------------------------------------------------------------

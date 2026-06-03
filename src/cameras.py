@@ -77,6 +77,25 @@ _WARMUP_FRAMES = 6
 _BLACK_FRAME_MEAN = 8.0
 
 
+# M71 — armed-camera frame provider (dependency-injected by main.py at
+# startup). When security is ARMED, the watcher holds the webcam open with a
+# persistent capture (M44.3) and a SECOND handle opened here gets a black/
+# garbage frame (Windows hands a UVC cam to one reader) — the "camera covered"
+# symptom seen from Discord while away. So if a provider is registered and
+# returns a frame (armed), we use the OWNER's frame; disarmed ⇒ provider
+# returns None ⇒ we open our own handle (the camera is free). Same injection
+# shape as homelab_monitor's active-monitor setter / good_night's security
+# getter — keeps cameras.py decoupled from the SecurityWatcher.
+_armed_frame_provider = None
+
+
+def set_armed_frame_provider(fn) -> None:
+    """Wire the armed-watcher frame source (SecurityWatcher.grab_frame_for_snapshot).
+    fn() returns a BGR ndarray when armed + holding the camera, else None."""
+    global _armed_frame_provider
+    _armed_frame_provider = fn
+
+
 def _camera_index() -> int:
     """Which DirectShow device to open. Default 0 (the first/only camera);
     override with CAMERA_INDEX in .env if you have several and want another.
@@ -88,9 +107,12 @@ def _camera_index() -> int:
         return 0
 
 
-def execute_camera_snapshot(params: dict) -> str | list[dict]:
-    """Capture a webcam frame. Returns either a list of content blocks (image
-    + caption) on success, or a readable error string. Never raises."""
+def _grab_own_frame():
+    """Open our OWN DirectShow capture, warm up, grab one frame, release.
+    Returns a BGR ndarray on success, or a readable error string (cv2 missing /
+    camera busy / no frame). The disarmed path — used when security isn't
+    holding the camera (M71). Black-frame guard + encode happen in the shared
+    tail of execute_camera_snapshot, so they apply to provider frames too."""
     try:
         import cv2  # type: ignore  # lazy: see module docstring
     except ImportError:
@@ -121,23 +143,59 @@ def execute_camera_snapshot(params: dict) -> str | list[dict]:
                 "The webcam opened but didn't return a usable frame — try again "
                 "in a moment."
             )
-
-        if float(frame.mean()) < _BLACK_FRAME_MEAN:
-            return (
-                "The webcam image came back black — the privacy shutter is "
-                "probably closed or something's over the lens."
-            )
-
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
-        if not ok:
-            return "Couldn't encode the webcam frame."
-        jpg = bytes(buf)
+        return frame
     except Exception as exc:  # noqa: BLE001 — defensive; this tool must never raise
         print(f"[cameras] snapshot failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return f"Camera error: {exc}"
     finally:
         if cap is not None:
             cap.release()
+
+
+def execute_camera_snapshot(params: dict) -> str | list[dict]:
+    """Capture a webcam frame. Returns either a list of content blocks (image
+    + caption) on success, or a readable error string. Never raises.
+
+    M71: if security is ARMED, the watcher owns the webcam (persistent capture,
+    M44.3) — so we ask IT for the frame (the registered provider) instead of
+    opening a contending second handle that would only grab black. Disarmed ⇒
+    provider returns None ⇒ we open our own handle (the camera is free)."""
+    frame = None
+    provider = _armed_frame_provider
+    if provider is not None:
+        try:
+            frame = provider()
+            if frame is not None:
+                print("[cameras] using armed-watcher frame (camera owned by "
+                      "security)", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — fall back to own capture
+            print(f"[cameras] armed frame provider failed: {exc}", file=sys.stderr)
+            frame = None
+
+    if frame is None:
+        result = _grab_own_frame()
+        if isinstance(result, str):
+            return result  # readable error — pass straight through
+        frame = result
+
+    # Shared tail — black-frame guard + JPEG encode, for BOTH the armed-watcher
+    # frame and our own.
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        return (
+            "Camera support isn't installed (opencv-python-headless missing). "
+            "Run: pip install opencv-python-headless"
+        )
+    if float(frame.mean()) < _BLACK_FRAME_MEAN:
+        return (
+            "The webcam image came back black — the privacy shutter is "
+            "probably closed or something's over the lens."
+        )
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+    if not ok:
+        return "Couldn't encode the webcam frame."
+    jpg = bytes(buf)
 
     h, w = frame.shape[:2]
     print(f"[cameras] snapshot ok: {w}x{h}, {len(jpg)} bytes", file=sys.stderr)

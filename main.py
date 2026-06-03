@@ -1830,6 +1830,13 @@ def main() -> None:
         speaking_event=announce_speaking,
     )
 
+    # M71: when armed, the watcher owns the webcam (persistent capture). Let a
+    # camera_snapshot (Discord, while away) borrow a frame from it instead of
+    # opening a contending handle that would only grab black. Disarmed ⇒ the
+    # provider returns None ⇒ cameras.py opens its own (the camera is free).
+    from src import cameras as _cameras  # noqa: PLC0415
+    _cameras.set_armed_frame_provider(security_watcher.grab_frame_for_snapshot)
+
     # M39: face-enrollment trigger. Shared by the tray menu "Enroll my face"
     # AND the voice intent ("Jarvis, enroll my face"). Non-blocking — queues
     # the announce prompt and returns; capture + enrollment run later on the
