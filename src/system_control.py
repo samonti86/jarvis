@@ -14,6 +14,10 @@ Ten actions, each individually scoped:
   restart_service   restart a Windows service by name — requires
                     confirmed=true AND admin AND a service name matching
                     ^[A-Za-z0-9._-]{1,128}$ (M40)
+  stop_service      stop a Windows service by name — same gates as
+                    restart_service (M75)
+  start_service     start a Windows service by name — same gates as
+                    restart_service (M75)
   dhcp_cycle        release + renew DHCP lease on all adapters — requires
                     confirmed=true AND admin (M42)
 
@@ -82,15 +86,18 @@ SYSTEM_CONTROL_TOOL = {
         "Control THIS Windows PC with a fixed allowlist of safe actions: "
         "open an app, lock the workstation, set or mute system volume, "
         "turn off the display, kill a running process, flush the DNS "
-        "resolver cache, restart a Windows service, or cycle the DHCP "
-        "lease (release + renew). "
+        "resolver cache, restart / stop / start a Windows service, or "
+        "cycle the DHCP lease (release + renew). "
         "IMPORTANT for the mutating actions (kill_process, flush_dns, "
-        "restart_service, dhcp_cycle): you MUST first ask the user to "
+        "restart_service, stop_service, start_service, dhcp_cycle): you "
+        "MUST first ask the user to "
         "confirm in plain language ('Confirm: flush the DNS cache?' / "
-        "'Confirm: restart the Spooler service?' / 'Confirm: release "
+        "'Confirm: restart the Spooler service?' / 'Confirm: stop the "
+        "Spooler service?' / 'Confirm: release "
         "and renew the DHCP lease? This briefly drops network "
         "connectivity.'), wait for their explicit yes, THEN call this "
-        "tool with confirmed=true. flush_dns, restart_service, and "
+        "tool with confirmed=true. flush_dns, restart_service, "
+        "stop_service, start_service, and "
         "dhcp_cycle additionally require Jarvis to be running as "
         "Administrator — the tool returns a clear error if not, which "
         "you should relay to the user. Other actions (open_app, lock, "
@@ -106,7 +113,8 @@ SYSTEM_CONTROL_TOOL = {
                     "open_app", "lock_workstation",
                     "volume_set", "volume_mute", "volume_unmute",
                     "screen_off", "kill_process",
-                    "flush_dns", "restart_service", "dhcp_cycle",
+                    "flush_dns", "restart_service", "stop_service",
+                    "start_service", "dhcp_cycle",
                 ],
             },
             "target": {
@@ -116,7 +124,8 @@ SYSTEM_CONTROL_TOOL = {
                     "calculator, file explorer, vs code, terminal, task "
                     "manager, settings, control panel, powershell, cmd). "
                     "For kill_process: process name ('chrome.exe' or 'chrome'). "
-                    "For restart_service: the Windows service name as it "
+                    "For restart_service / stop_service / start_service: the "
+                    "Windows service name as it "
                     "appears in services.msc (e.g. 'Spooler', 'PlexService', "
                     "'WSearch'). Must match [A-Za-z0-9._-]{1,128}. "
                     "Ignored for other actions."
@@ -132,7 +141,8 @@ SYSTEM_CONTROL_TOOL = {
                 "type": "boolean",
                 "description": (
                     "Required true for kill_process, flush_dns, "
-                    "restart_service, and dhcp_cycle — only set this "
+                    "restart_service, stop_service, start_service, and "
+                    "dhcp_cycle — only set this "
                     "AFTER the user has explicitly confirmed in "
                     "conversation. The tool rejects those actions "
                     "without it. Ignored for other actions."
@@ -533,18 +543,42 @@ def _do_dhcp_cycle(confirmed: bool) -> str:
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
-def _do_restart_service(target: str, confirmed: bool) -> str:
-    """Run `Restart-Service -Name <target>` via PowerShell. Requires
-    confirmed=true AND admin AND a service name that matches the regex.
+# The three service verbs differ ONLY in the PowerShell cmdlet, the
+# success/timeout wording, and the confirmation gerund — everything else
+# (regex validation, confirmation gate, admin gate, subprocess plumbing,
+# 30s timeout, error passthrough) is identical. (action) → (cmdlet,
+# past-tense verb, gerund, short verb). M75 — the third service verb is the
+# one that earned the rule-of-three extraction (same philosophy as the M43
+# http_util pull-out: extract on the tool that makes it three).
+_SERVICE_CMDLETS: dict[str, tuple[str, str, str, str]] = {
+    "restart_service": ("Restart-Service", "Restarted", "restarting", "restart"),
+    "stop_service":    ("Stop-Service",    "Stopped",   "stopping",   "stop"),
+    "start_service":   ("Start-Service",   "Started",   "starting",   "start"),
+}
 
-    PowerShell (rather than `net stop` + `net start` or `sc.exe`):
-    Restart-Service handles dependent services correctly, propagates
-    errors as exceptions with usable messages, and the -ErrorAction Stop
-    + try/catch idiom lets us exit non-zero on failure so we can
-    distinguish "service not found" from "denied" from "succeeded."
+
+def _do_service_action(action: str, target: str, confirmed: bool) -> str:
+    """Run a Windows service verb (`Restart-Service` / `Stop-Service` /
+    `Start-Service`) via PowerShell. Requires confirmed=true AND admin AND a
+    service name that matches the regex.
+
+    PowerShell (rather than `net stop`/`net start` or `sc.exe`): the
+    *-Service cmdlets propagate errors as exceptions with usable messages,
+    and the `-ErrorAction Stop` + try/catch idiom lets us exit non-zero on
+    failure so we can distinguish "service not found" from "denied" from
+    "succeeded."
+
+    Deliberately NO `-Force` on Stop-Service: a service with running
+    dependents will fail with a clear "Cannot stop ... because it has
+    dependent services" message that we surface, rather than silently
+    stopping the dependents too (a bigger blast radius the user should opt
+    into explicitly — the "Jarvis stays Jarvis, not Ultron" least-privilege
+    principle). Same reason Start-Service is left to surface its own
+    "dependency failed to start" errors.
     """
+    cmdlet, past, gerund, verb = _SERVICE_CMDLETS[action]
     if not target:
-        return "Service name required for restart_service."
+        return f"Service name required for {action}."
     if not _SERVICE_NAME_RE.match(target):
         # Reject anything with spaces, quotes, semicolons, pipes,
         # backticks, ampersands, $, etc. before it ever reaches PowerShell.
@@ -555,25 +589,25 @@ def _do_restart_service(target: str, confirmed: bool) -> str:
         )
     if not confirmed:
         return (
-            f"restart_service requires explicit user confirmation. Ask the "
-            f"user to confirm restarting the '{target}' service, then call "
+            f"{action} requires explicit user confirmation. Ask the "
+            f"user to confirm {gerund} the '{target}' service, then call "
             f"this tool again with confirmed=true."
         )
     if not _IS_ADMIN:
         return (
-            "Restarting a Windows service requires Jarvis to be running as "
-            "Administrator, sir. Restart Jarvis from an elevated prompt "
-            "and try again."
+            f"{gerund.capitalize()} a Windows service requires Jarvis to be "
+            "running as Administrator, sir. Restart Jarvis from an elevated "
+            "prompt and try again."
         )
 
-    # -NoProfile skips $PROFILE.ps1 (faster, deterministic). The Restart-
-    # Service cmdlet by default doesn't fail loudly when the service is
-    # missing or denied — `-ErrorAction Stop` promotes those to terminating
-    # errors that our try/catch surfaces, and `exit 1` makes the subprocess
-    # exit non-zero so we know to look at stderr.
+    # -NoProfile skips $PROFILE.ps1 (faster, deterministic). The *-Service
+    # cmdlets by default don't fail loudly when the service is missing or
+    # denied — `-ErrorAction Stop` promotes those to terminating errors that
+    # our try/catch surfaces, and `exit 1` makes the subprocess exit non-zero
+    # so we know to look at stderr.
     ps_script = (
-        f"try {{ Restart-Service -Name '{target}' -ErrorAction Stop; "
-        f"Write-Output 'Restarted {target}.' }} "
+        f"try {{ {cmdlet} -Name '{target}' -ErrorAction Stop; "
+        f"Write-Output '{past} {target}.' }} "
         f"catch {{ Write-Error $_.Exception.Message; exit 1 }}"
     )
 
@@ -585,13 +619,13 @@ def _do_restart_service(target: str, confirmed: bool) -> str:
         )
     except subprocess.TimeoutExpired:
         print(
-            f"[system_control] restart_service '{target}' timed out after 30s",
+            f"[system_control] {action} '{target}' timed out after 30s",
             file=sys.stderr,
         )
-        return f"Restarting '{target}' timed out after 30 seconds."
+        return f"{gerund.capitalize()} '{target}' timed out after 30 seconds."
     except (OSError, FileNotFoundError) as exc:
         print(
-            f"[system_control] restart_service '{target}' spawn failed: {exc}",
+            f"[system_control] {action} '{target}' spawn failed: {exc}",
             file=sys.stderr,
         )
         return f"Could not run PowerShell: {exc}"
@@ -601,18 +635,18 @@ def _do_restart_service(target: str, confirmed: bool) -> str:
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     print(
-        f"[system_control] restart_service '{target}' exit={rc} in {elapsed:.2f}s",
+        f"[system_control] {action} '{target}' exit={rc} in {elapsed:.2f}s",
         file=sys.stderr,
     )
     if rc != 0:
         # PowerShell error wraps the SCM error — typical messages: "Cannot
         # find any service with service name 'foo'.", "Cannot open <name>
-        # service on computer '.'." (the denied-access shape). Pass it
-        # through so the user knows whether the name was wrong or whether
-        # something else blocked it.
+        # service on computer '.'." (the denied-access shape), "Cannot stop
+        # ... because it has dependent services". Pass it through so the user
+        # knows whether the name was wrong or whether something else blocked it.
         msg = stderr or stdout or "no output"
-        return f"Could not restart '{target}': {msg}"
-    return stdout or f"Restarted {target}."
+        return f"Could not {verb} '{target}': {msg}"
+    return stdout or f"{past} {target}."
 
 
 def execute_system_control_tool(params: dict) -> str:
@@ -639,8 +673,8 @@ def execute_system_control_tool(params: dict) -> str:
             return _do_kill_process(target, confirmed)
         if action == "flush_dns":
             return _do_flush_dns(confirmed)
-        if action == "restart_service":
-            return _do_restart_service(target, confirmed)
+        if action in _SERVICE_CMDLETS:
+            return _do_service_action(action, target, confirmed)
         if action == "dhcp_cycle":
             return _do_dhcp_cycle(confirmed)
         return f"Unknown action '{action}'."
