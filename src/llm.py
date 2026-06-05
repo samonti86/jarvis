@@ -82,6 +82,10 @@ from src.plex_laptop import (
 from src.plex_mcp import PlexMCPClient
 from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
 from src.game_length import GAME_LENGTH_TOOL, execute_game_length_tool
+from src.sound_detector import (
+    WHAT_DID_YOU_HEAR_TOOL,
+    execute_what_did_you_hear,
+)
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.pc_shell import PC_SHELL_TOOL, execute_pc_shell
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
@@ -438,6 +442,14 @@ Self-status (one tool):
     systems nominal, sir"); only enumerate the problem subsystems unless the
     user explicitly asked for a full report. Like the briefing and
     homelab_status, this is a fresh-state question — re-run every time.
+24b. what_did_you_hear — what AMBIENT sounds Jarvis has recently heard via
+    acoustic awareness (M58): use for "what did you just hear?", "did you
+    hear something?", "what was that noise?", "heard anything?". Returns any
+    monitored alerts that fired (doorbell, knock, glass) plus the general
+    soundscape over the last few minutes; says so plainly if acoustic
+    awareness is off. This is about sounds IN THE ROOM — NOT a request to
+    repeat or transcribe what the USER just said. Fresh-state — re-run every
+    time.
 
 Outlook calendar (one tool):
 25. get_calendar_events — read events from the user's Outlook calendar
@@ -817,6 +829,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "update_jarvis":                _ClientTool(execute_update_jarvis, "self_update"),
     "homelab_status":               _ClientTool(execute_homelab_status, "homelab"),
     "status_report":                _ClientTool(execute_status_report, "self_status"),
+    "what_did_you_hear":            _ClientTool(execute_what_did_you_hear, "acoustic_recall"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -1011,6 +1024,7 @@ def stream_response(
         KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, GOOD_NIGHT_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
+        WHAT_DID_YOU_HEAR_TOOL,
         UPDATE_JARVIS_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,
