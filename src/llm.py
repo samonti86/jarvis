@@ -81,6 +81,7 @@ from src.plex_laptop import (
 )
 from src.plex_mcp import PlexMCPClient
 from src.screen import SCREEN_SNAPSHOT_TOOL, execute_screen_snapshot
+from src.game_length import GAME_LENGTH_TOOL, execute_game_length_tool
 from src.sports import SPORTS_TOOL, execute_sports_tool
 from src.pc_shell import PC_SHELL_TOOL, execute_pc_shell
 from src.system_control import SYSTEM_CONTROL_TOOL, execute_system_control_tool
@@ -182,6 +183,12 @@ Live information (you have six tools — pick the right one):
    the user names a game they liked and wants recommendations. NOTE: this tool covers
    reference data only — it cannot see the user's personal library, trophies, or
    playtime, so don't claim it can.
+3b. get_game_length — for HOW LONG a game takes to beat: "how long is X",
+   "how long to beat X", "how many hours is X". Returns the main-story,
+   main+extras, and completionist times from How Long To Beat. Distinct from
+   get_game_info: that's release dates / summaries / recommendations (facts
+   ABOUT a game); this is the TIME to finish it. If the user asks both ("tell
+   me about X and how long it is") you may call both.
 4. get_movie_tv_info — for movies and TV shows: release and air dates, plot
    summaries, cast, ratings, runtime, what's trending, and recommendations.
    ALWAYS prefer this over web_search for general movie/TV info queries. Use
@@ -793,6 +800,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_sports_info":              _ClientTool(execute_sports_tool, "sports_tool"),
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
+    "get_game_length":              _ClientTool(execute_game_length_tool, "game_length"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
     "get_person_info":              _ClientTool(execute_person_info_tool, "tmdb_person"),
     "get_news":                     _ClientTool(execute_news_tool, "news"),
@@ -997,7 +1005,8 @@ def stream_response(
     ]
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
-        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, TMDB_TOOL, GET_PERSON_INFO_TOOL,
+        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, GAME_LENGTH_TOOL,
+        TMDB_TOOL, GET_PERSON_INFO_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
         KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,

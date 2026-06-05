@@ -122,3 +122,10 @@ resemblyzer>=0.1.4
 # the Message Content privileged intent enabled in the Developer Portal.
 discord.py>=2.7.1
 
+
+# Game-length tool (get_game_length) — "how long to beat X?" via How Long To
+# Beat. No API key (HLTB has no public API; this package scrapes their search
+# endpoint, so it can break when the site changes — lazy-imported behind a
+# sentinel in src/game_length.py so a broken install degrades gracefully).
+# Pulls aiohttp + beautifulsoup4 + fake_useragent transitively.
+howlongtobeatpy>=1.0.21
