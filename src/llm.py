@@ -96,6 +96,10 @@ from src.tmdb import (
     execute_tmdb_tool,
 )
 from src.weather import WEATHER_TOOL, execute_weather_tool
+from src.weather_alerts import (
+    GET_WEATHER_ALERTS_TOOL,
+    execute_weather_alerts_tool,
+)
 
 
 JARVIS_SYSTEM_PROMPT = """You are Jarvis, a personal voice assistant in the spirit of Tony Stark's J.A.R.V.I.S.
@@ -180,6 +184,11 @@ Live information (you have six tools — pick the right one):
    roster / who-plays-for question, no exceptions, however obvious the answer feels.
 2. get_weather — for current weather, today's forecast, or a multi-day forecast for
    any city worldwide. ALWAYS prefer this over web_search for weather queries.
+2b. get_weather_alerts — for OFFICIAL active alerts / watches / warnings (US
+   National Weather Service): "any weather alerts?", "is there a storm
+   warning?", "are we under a watch?". This is distinct from get_weather (the
+   forecast) — it reports issued alerts with severity. Jarvis also watches
+   this feed proactively and warns of severe storms on his own.
 3. get_game_info — for video game release dates, summaries, popular titles, and
    recommendations across PlayStation, Nintendo, Xbox, PC, and mobile. ALWAYS prefer
    this over web_search for general game-info queries. Use mode=details when the user
@@ -811,6 +820,7 @@ class _ClientTool(NamedTuple):
 _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "get_sports_info":              _ClientTool(execute_sports_tool, "sports_tool"),
     "get_weather":                  _ClientTool(execute_weather_tool, "weather_tool"),
+    "get_weather_alerts":           _ClientTool(execute_weather_alerts_tool, "weather_alerts"),
     "get_game_info":                _ClientTool(execute_games_tool, "games_tool"),
     "get_game_length":              _ClientTool(execute_game_length_tool, "game_length"),
     "get_movie_tv_info":            _ClientTool(execute_tmdb_tool, "tmdb_tool"),
@@ -1018,7 +1028,8 @@ def stream_response(
     ]
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
-        SPORTS_TOOL, WEATHER_TOOL, GAMES_TOOL, GAME_LENGTH_TOOL,
+        SPORTS_TOOL, WEATHER_TOOL, GET_WEATHER_ALERTS_TOOL,
+        GAMES_TOOL, GAME_LENGTH_TOOL,
         TMDB_TOOL, GET_PERSON_INFO_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
         KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,

@@ -1555,6 +1555,7 @@ def _build_remote_console(
 def _register_status(
     cfg: Config, security_watcher, sound_detector, homelab_monitor,
     plex_client, plex_laptop_client, remote_server, calendar_monitor,
+    weather_monitor,
 ) -> None:
     """M60 — self-status registry. Each subsystem reports a one-line status
     via the `status_report` tool ("Jarvis, are you healthy?"). Order is
@@ -1612,6 +1613,10 @@ def _register_status(
         return (f"Calendar reminders: "
                 f"{'active' if calendar_monitor.is_active() else 'off'}")
 
+    def _status_weather() -> str:
+        return (f"Weather alerts: "
+                f"{'active' if weather_monitor.is_active() else 'off'}")
+
     def _status_reminders() -> str:
         from src.reminders import list_pending  # noqa: PLC0415 — lazy
         items = list_pending()
@@ -1637,12 +1642,14 @@ def _register_status(
     _ss_register("STT backend", _status_stt)
     _ss_register("Reminders", _status_reminders)
     _ss_register("Calendar reminders", _status_calendar)
+    _ss_register("Weather alerts", _status_weather)
     _ss_register("Process memory", _status_memory)
     _ss_register("Log errors", _status_errors)
 
 
 def _shutdown_subsystems(
     *, security_watcher, homelab_monitor, sound_detector, calendar_monitor,
+    weather_monitor,
     announcer: _Announcer, reminder_stop: threading.Event,
     worker: threading.Thread, plex_client, plex_laptop_client,
 ) -> None:
@@ -1659,6 +1666,8 @@ def _shutdown_subsystems(
     sound_detector.shutdown()
     # M62.2: stop the calendar reminder monitor.
     calendar_monitor.shutdown()
+    # M77: stop the severe-weather alerts monitor.
+    weather_monitor.shutdown()
     # M34: stop the Announcer thread (sets stop + wakes its blocked get()).
     announcer.shutdown()
     # M53: stop the reminder scheduler.
@@ -2068,6 +2077,17 @@ def main() -> None:
     )
     calendar_monitor.activate()  # internally a no-op when not configured / disabled
 
+    # M77 — severe-weather proactive alerts. Watches the NWS active-alerts feed
+    # for the home location and warns on its own before a power-threatening
+    # storm (tied to the no-UPS power-loss situation). Default ON when
+    # JARVIS_HOME_LOCATION is set; no-op otherwise. Tagged ⛈.
+    from src.weather_alerts import WeatherAlertMonitor
+    weather_monitor = WeatherAlertMonitor(
+        announce=lambda t: _announce(t, label="⛈"),
+        discord_webhook_url=cfg.discord_webhook_url,
+    )
+    weather_monitor.activate()  # internally a no-op when not configured / disabled
+
     # M63 — "good night" wrap. Wire the security-state getter so the
     # composition tool can report current armed/standing-down state without
     # needing security_watcher threaded through stream_response. Same
@@ -2114,6 +2134,7 @@ def main() -> None:
     _register_status(
         cfg, security_watcher, sound_detector, homelab_monitor,
         plex_client, plex_laptop_client, remote_server, calendar_monitor,
+        weather_monitor,
     )
 
     # M69 — if any voice is enrolled, warm the speaker-ID model in the
@@ -2152,6 +2173,7 @@ def main() -> None:
         homelab_monitor=homelab_monitor,
         sound_detector=sound_detector,
         calendar_monitor=calendar_monitor,
+        weather_monitor=weather_monitor,
         announcer=_ann,
         reminder_stop=reminder_stop,
         worker=worker,
