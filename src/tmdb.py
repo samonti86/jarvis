@@ -45,8 +45,9 @@ TMDB_TOOL = {
     "name": "get_movie_tv_info",
     "description": (
         "Get information about movies and TV shows — release/air dates, "
-        "plot summaries, cast, ratings, runtime, what's trending, and "
-        "recommendations. Covers essentially every film and series. Use this "
+        "plot summaries, cast, ratings, runtime, what's trending, "
+        "recommendations, and where to stream/rent/buy a title. Covers "
+        "essentially every film and series. Use this "
         "for any movie or TV question EXCEPT the user's personal Plex library "
         "or their own watchlist/ratings (we don't have access to those — for "
         "the user's own library use the Plex tools instead). For a review on "
@@ -58,20 +59,24 @@ TMDB_TOOL = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["search", "details", "popular", "similar"],
+                "enum": [
+                    "search", "details", "popular", "similar", "providers",
+                ],
                 "description": (
                     "search = quick lookup with up to 5 matches; "
                     "details = full summary of one title (best when the user "
                     "wants info on a specific movie or show); "
                     "popular = what's trending now, optional movie/tv filter; "
-                    "similar = recommendations based on a title the user liked."
+                    "similar = recommendations based on a title the user liked; "
+                    "providers = where to stream/rent/buy a title (e.g. "
+                    "'where can I watch Dune?')."
                 ),
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Movie or show title. Required for search, details, and "
-                    "similar. Omit for popular."
+                    "Movie or show title. Required for search, details, "
+                    "similar, and providers. Omit for popular."
                 ),
             },
             "media": {
@@ -443,6 +448,96 @@ def _do_similar(query: str, key: str, media: str | None) -> str:
     )
 
 
+# --- providers mode ("where to stream") ------------------------------------
+# TMDB exposes JustWatch-sourced availability via /{type}/{id}/watch/providers.
+# The payload is keyed by ISO-3166-1 country code — availability genuinely
+# differs by region, so we read the user's region from env rather than guess.
+
+def _region() -> str:
+    """ISO 3166-1 country code for watch/providers. Read fresh from
+    TMDB_WATCH_REGION (default 'US'), same read-at-call-time pattern as
+    _api_key(); uppercased since TMDB's result keys are uppercase
+    ('US', 'GB', 'MX')."""
+    return (os.getenv("TMDB_WATCH_REGION", "").strip() or "US").upper()
+
+
+# Watch-provider category → spoken label, in read-out order. flatrate =
+# included with a subscription (what people usually mean by "where can I
+# watch X"); free / ads = free tiers (Tubi, Pluto, …); rent / buy =
+# transactional storefronts.
+_PROVIDER_CATEGORIES: list[tuple[str, str]] = [
+    ("flatrate", "Stream"),
+    ("free", "Free"),
+    ("ads", "Free with ads"),
+    ("rent", "Rent"),
+    ("buy", "Buy"),
+]
+
+# How many services to name per category — voice, and Claude trims anyway,
+# but a popular title can list a dozen rent/buy storefronts.
+_MAX_PROVIDERS = 6
+
+
+def _do_providers(query: str, key: str, media: str | None, region: str) -> str:
+    """Two-hop: search → resolve top (id, media_type, title) →
+    /{mt}/{id}/watch/providers → pull the configured region's
+    flatrate/free/ads/rent/buy lists. Resolves via _search_results (not
+    _search_top) so we keep the canonical title for the spoken reply.
+
+    Availability data is sourced by TMDB from JustWatch; it's surprisingly
+    complete for US streaming and the right answer to 'where can I watch X'
+    without a paid availability API."""
+    results = _search_results(query, key, media)
+    if results is None:
+        return f"Streaming availability unavailable for '{query}'."
+    if not results:
+        return f"No movie or show found matching '{query}'."
+    top = results[0]
+    tid = top.get("id")
+    if tid is None:
+        return f"No movie or show found matching '{query}'."
+    mt = top.get("media_type") or media or "movie"
+    if mt not in ("movie", "tv"):
+        mt = "movie"
+    title = _title(top)
+
+    r = _http_get_with_retry(
+        f"{_TMDB_BASE}/{mt}/{int(tid)}/watch/providers", params={"api_key": key}
+    )
+    if r is None:
+        return f"Streaming availability unavailable for '{title}'."
+    try:
+        data = r.json()
+    except ValueError:
+        return f"Streaming availability returned malformed data for '{title}'."
+
+    region_data = (data.get("results") or {}).get(region)
+    if not region_data:
+        return (
+            f"I don't have any streaming availability for '{title}' in "
+            f"{region}, sir."
+        )
+
+    lines: list[str] = []
+    for cat_key, cat_label in _PROVIDER_CATEGORIES:
+        names = [
+            (p.get("provider_name") or "").strip()
+            for p in (region_data.get(cat_key) or [])
+            if p.get("provider_name")
+        ]
+        if names:
+            lines.append(f"{cat_label}: {', '.join(names[:_MAX_PROVIDERS])}")
+
+    if not lines:
+        # The region key exists (often just a JustWatch `link`) but lists no
+        # actual stream/rent/buy options — title not currently available there.
+        return (
+            f"'{title}' isn't currently listed to stream, rent, or buy in "
+            f"{region}, sir."
+        )
+    return f"Where to watch {title} ({region}):\n" + "\n".join(lines)
+
+
 def execute_tmdb_tool(params: dict) -> str:
     """Run the tool. Always returns a string for Claude — never raises.
     Same shape as execute_games_tool: validate key + args up front, dispatch
@@ -461,7 +556,7 @@ def execute_tmdb_tool(params: dict) -> str:
     if timeframe not in ("day", "week"):
         timeframe = "week"
 
-    if mode in ("search", "details", "similar") and not query:
+    if mode in ("search", "details", "similar", "providers") and not query:
         return f"A movie or show title is required for mode '{mode}'."
 
     if mode == "search":
@@ -472,7 +567,12 @@ def execute_tmdb_tool(params: dict) -> str:
         return _do_popular(media, timeframe, key)
     if mode == "similar":
         return _do_similar(query, key, media)
-    return f"Unknown mode '{mode}'. Use search, details, popular, or similar."
+    if mode == "providers":
+        return _do_providers(query, key, media, _region())
+    return (
+        f"Unknown mode '{mode}'. Use search, details, popular, similar, "
+        "or providers."
+    )
 
 
 # --- M66 — get_person_info (sibling tool, same module) ---------------------
