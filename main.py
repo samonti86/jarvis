@@ -2036,6 +2036,10 @@ def main() -> None:
         # left this loop ungated — the 2026-05-28 armed-stutter regression.
         speaking_event=announce_speaking,
     )
+    # M76 — expose the detector's recent-sounds buffer to the what_did_you_hear
+    # tool (the self_status.register decoupling pattern).
+    from src.sound_detector import register_detector as _register_sound_detector
+    _register_sound_detector(sound_detector)
     if cfg.acoustic_monitor_enabled:
         sound_detector.activate()
     ui.set_on_acoustic_toggle(

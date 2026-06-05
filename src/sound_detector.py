@@ -60,6 +60,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -158,6 +159,20 @@ _EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.02)
 # it independently. The old "YOLO is the only torch consumer" assumption in
 # security.py is FALSE since M58. <= 0 leaves torch's default (debug/parity).
 _TORCH_THREADS = _env_int("JARVIS_ACOUSTIC_THREADS", 1)
+
+# Recent-sounds ring buffer (M76 — the what_did_you_hear tool). Each salient
+# window records its dominant AudioSet label so the user can ask "what did you
+# just hear?" after an alert. Capacity bounds memory (tiny tuples); the tool
+# filters by age, so this just needs to comfortably cover the longest report
+# window (~15 min) of CONTINUOUS salient sound — far more than ever happens,
+# since quiet/silent windows aren't recorded.
+_RECENT_MAXLEN = 450
+# Don't record a window unless its top label clears this — keeps "Silence" and
+# near-quiet noise out of the soundscape. Same 0.10 floor the debug log uses.
+_RECENT_MIN_SCORE = 0.15
+# AudioSet labels that are "nothing happened" — never worth recording as a
+# heard sound even if they score high (a quiet room scores "Silence" near 1.0).
+_RECENT_IGNORE_LABELS = {"silence"}
 
 
 # --- Per-class rules -------------------------------------------------------
@@ -453,6 +468,15 @@ class SoundDetector:
         self._resolved: list[_ResolvedRule] = []
         self._model_load_failed = False
 
+        # M76 — recent-sounds ring buffers for the what_did_you_hear tool.
+        # Written by the inference thread (_classify_window / _fire), read by
+        # the turn-worker thread (recent_sounds_summary) → guarded by a lock.
+        # `_recent` = (monotonic_ts, label, score, rms) per salient window;
+        # `_recent_fires` = (monotonic_ts, rule_name) per fired alert.
+        self._recent_lock = threading.Lock()
+        self._recent: deque = deque(maxlen=_RECENT_MAXLEN)
+        self._recent_fires: deque = deque(maxlen=64)
+
     # ---------------------------------------------------------------------
     # Public state
     # ---------------------------------------------------------------------
@@ -473,6 +497,11 @@ class SoundDetector:
             r.tracker.reset()
         self._buf.clear()
         self._buf_len = 0
+        # Fresh session — a "what did you hear?" right after re-arming should
+        # not report sounds from a prior arm.
+        with self._recent_lock:
+            self._recent.clear()
+            self._recent_fires.clear()
         try:
             while True:
                 self._chunks.get_nowait()
@@ -715,6 +744,7 @@ class SoundDetector:
             return
         # clipwise shape: (1, 527). Take the batch-of-one row.
         scores = clipwise[0]
+        now = time.monotonic()
         # Debug aid (JARVIS_ACOUSTIC_DEBUG=1): log what PANNs actually hears so
         # a class can be tuned from data, not guesswork. Top-6 labels for any
         # window above the floor — knock on the table while this is on and read
@@ -729,7 +759,10 @@ class SoundDetector:
                     print(f"[acoustic] top: {pairs} (rms={rms:.3f})", file=sys.stderr)
             except Exception:  # noqa: BLE001 — debug log must never break the loop
                 pass
-        now = time.monotonic()
+        # M76 — record the dominant sound of this window for what_did_you_hear.
+        # Cheap (one argmax); skips silence and near-quiet so the soundscape
+        # reflects real events, not the floor. Never breaks the loop.
+        self._record_observation(scores, rms, now)
         for r in self._resolved:
             # Aggregate score across all of this rule's matched class indices
             # (a logical alert often corresponds to multiple AudioSet labels —
@@ -760,6 +793,11 @@ class SoundDetector:
     def _fire(self, rule: ClassRule, score: float, rms: float) -> None:
         print(f"[acoustic] FIRE {rule.name} (score={score:.2f} rms={rms:.3f})",
               file=sys.stderr)
+        # M76 — record the fired alert so what_did_you_hear can report it with
+        # certainty ("you heard the doorbell ~40s ago"), distinct from the
+        # general soundscape.
+        with self._recent_lock:
+            self._recent_fires.append((time.monotonic(), rule.name))
         self._safe_announce(rule.speak)
         if self._discord:
             threading.Thread(
@@ -788,8 +826,171 @@ class SoundDetector:
         except Exception as exc:  # noqa: BLE001 — never break on a push
             print(f"[acoustic] discord push failed: {exc}", file=sys.stderr)
 
+    def _record_observation(self, scores: np.ndarray, rms: float, now: float) -> None:
+        """Append this window's dominant sound to the recent ring buffer for
+        the what_did_you_hear tool. Skips silence / near-quiet so the
+        soundscape reflects real events. Never raises (proactive bookkeeping
+        must not break the inference loop)."""
+        if not self._labels:
+            return
+        try:
+            top_idx = int(np.argmax(scores))
+            top_score = float(scores[top_idx])
+            if top_score < _RECENT_MIN_SCORE:
+                return
+            label = self._labels[top_idx]
+            if label.strip().lower() in _RECENT_IGNORE_LABELS:
+                return
+            with self._recent_lock:
+                self._recent.append((now, label, top_score, rms))
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must not break the loop
+            print(f"[acoustic] record observation failed: {exc}", file=sys.stderr)
+
+    def recent_sounds_summary(self, max_age_seconds: float = 180.0) -> str:
+        """Voice-friendly summary of recently-heard sounds for the
+        what_did_you_hear tool. Snapshots the buffers under the lock, then
+        defers to the pure `_summarize_sounds` formatter (testable without
+        threads)."""
+        now = time.monotonic()
+        active = self._active.is_set()
+        with self._recent_lock:
+            recent = list(self._recent)
+            fires = list(self._recent_fires)
+        return _summarize_sounds(active, recent, fires, now, max_age_seconds)
+
     def _safe_announce(self, text: str) -> None:
         try:
             self._announce(text)
         except Exception as exc:  # noqa: BLE001
             print(f"[acoustic] announce failed: {exc}", file=sys.stderr)
+
+
+# --- what_did_you_hear tool (M76) ------------------------------------------
+# Completes the acoustic arc: M58 DETECTS sounds, M72 REACTS (look + describe +
+# push while armed), and this lets the user RECALL on demand — "Jarvis, what
+# did you just hear?" / "did you hear something?". The SoundDetector keeps a
+# rolling buffer of recent dominant sounds + fired alerts; this tool reads it.
+#
+# Decoupled from main.py via a module-level singleton (the self_status.register
+# / good_night.register_security_getter pattern): main.py registers the live
+# detector at startup; the tool reads whatever's registered.
+
+_ACTIVE_DETECTOR: "SoundDetector | None" = None
+
+
+def register_detector(detector: "SoundDetector | None") -> None:
+    """Register the live SoundDetector so the what_did_you_hear tool can read
+    its recent-sounds buffer. Called once in main.py at construction."""
+    global _ACTIVE_DETECTOR
+    _ACTIVE_DETECTOR = detector
+
+
+def _ago(seconds: float) -> str:
+    """Human, voice-friendly recency: 'just now' / '~40s ago' / '~3m ago'."""
+    if seconds < 10:
+        return "just now"
+    if seconds < 90:
+        return f"~{int(round(seconds))}s ago"
+    return f"~{int(round(seconds / 60.0))}m ago"
+
+
+def _summarize_sounds(active, recent, fires, now, max_age_seconds, max_items=6):
+    """Pure formatter for recent sounds — no threads, no I/O, trivially
+    testable. `recent` = [(ts, label, score, rms)], `fires` = [(ts, name)],
+    timestamps on the same monotonic clock as `now`.
+
+    Three honest states: not-listening (acoustic off), listening-but-quiet
+    (nothing recorded in the window), and a summary of fired alerts + the
+    general soundscape."""
+    if not active:
+        return ("Acoustic awareness is off, sir — I'm not actively listening "
+                "for sounds right now.")
+
+    recent_in = [(ts, label, score) for (ts, label, score, _rms) in recent
+                 if now - ts <= max_age_seconds]
+    fires_in = [(ts, name) for (ts, name) in fires
+                if now - ts <= max_age_seconds]
+
+    if not recent_in and not fires_in:
+        return "Nothing notable, sir — it's been quiet."
+
+    lines: list[str] = []
+
+    # Fired alerts first — the high-confidence monitored events, reported with
+    # certainty and most-recent-first.
+    if fires_in:
+        fired_bits = [
+            f"{name.replace('_', ' ')} ({_ago(now - ts)})"
+            for ts, name in sorted(fires_in, key=lambda x: x[0], reverse=True)
+        ]
+        lines.append("Alerts that fired: " + ", ".join(fired_bits))
+
+    # General soundscape — aggregate the dominant-label observations by label,
+    # keeping peak score + most-recent time, then list most-recent-first.
+    if recent_in:
+        agg: dict[str, dict] = {}
+        for ts, label, score in recent_in:
+            e = agg.get(label)
+            if e is None:
+                agg[label] = {"peak": score, "recent": ts}
+            else:
+                e["peak"] = max(e["peak"], score)
+                e["recent"] = max(e["recent"], ts)
+        ranked = sorted(agg.items(), key=lambda kv: kv[1]["recent"], reverse=True)
+        sound_bits = [
+            f"{label} (peak {e['peak']:.2f}, {_ago(now - e['recent'])})"
+            for label, e in ranked[:max_items]
+        ]
+        tail = (f" (+{len(ranked) - max_items} more)"
+                if len(ranked) > max_items else "")
+        lines.append("Sounds detected: " + ", ".join(sound_bits) + tail)
+
+    mins = int(round(max_age_seconds / 60.0))
+    header = f"In the last {mins} minute{'s' if mins != 1 else ''}, sir:"
+    return header + "\n" + "\n".join(lines)
+
+
+WHAT_DID_YOU_HEAR_TOOL = {
+    "name": "what_did_you_hear",
+    "description": (
+        "Report the non-speech AMBIENT sounds Jarvis has recently heard "
+        "through acoustic awareness (M58) — use for 'what did you just "
+        "hear?', 'did you hear something?', 'what was that noise?', 'have you "
+        "heard anything?'. Returns any monitored alerts that fired (doorbell, "
+        "knock, glass breaking) plus the general soundscape detected over the "
+        "last few minutes. If acoustic awareness is off, it says so. This is "
+        "about sounds IN THE ROOM, NOT the user's own spoken words or a "
+        "request to transcribe speech."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "minutes": {
+                "type": "integer",
+                "description": (
+                    "How far back to look, in minutes (default 3, max 15). "
+                    "Use a larger value for 'did you hear anything in the "
+                    "last 10 minutes?'."
+                ),
+            },
+        },
+    },
+}
+
+
+def execute_what_did_you_hear(params: dict) -> str:
+    """Run the tool. Always returns a string — never raises."""
+    detector = _ACTIVE_DETECTOR
+    if detector is None:
+        return "Acoustic awareness isn't set up on this machine, sir."
+    minutes = params.get("minutes")
+    try:
+        minutes = int(minutes) if minutes is not None else 3
+    except (TypeError, ValueError):
+        minutes = 3
+    minutes = max(1, min(15, minutes))
+    try:
+        return detector.recent_sounds_summary(max_age_seconds=minutes * 60.0)
+    except Exception as exc:  # noqa: BLE001 — defensive
+        print(f"[acoustic] what_did_you_hear failed: {exc}", file=sys.stderr)
+        return "I couldn't read the recent sounds just now, sir."
