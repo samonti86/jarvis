@@ -125,6 +125,12 @@ check("moderate (below floor) -> False",
       _should_announce(_alert(severity="Moderate"), set(), sev) is False)
 check("already announced -> False",
       _should_announce(_alert(aid="urn:x"), {"urn:x"}, sev) is False)
+# Casing robustness: NWS emits Title-case today, but the match must not go dark
+# if a feed ever returns a different case (the on-demand path already lowercases).
+check("UPPERCASE severity still fires",
+      _should_announce(_alert(severity="SEVERE"), set(), sev) is True)
+check("lowercase severity still fires",
+      _should_announce(_alert(severity="extreme"), set(), sev) is True)
 
 
 # --- _power_risk ---------------------------------------------------------

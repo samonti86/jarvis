@@ -36,6 +36,11 @@ import httpx
 # but we'd rather absorb a slow upload than timeout in the middle.
 _DISCORD_TIMEOUT_SECONDS = 10.0
 
+# Discord's hard limit on message `content` is 2000 chars (a 400 over it). One
+# constant for every sender so the clamp can't drift (send_discord_message used
+# to clamp 1900 while send_discord_photo clamped 2000, both docstringed "2000").
+_DISCORD_CONTENT_LIMIT = 2000
+
 
 def send_discord_alert(
     webhook_url: str,
@@ -134,7 +139,7 @@ def send_discord_photo(
     """
     if not webhook_url or not image_bytes:
         return False
-    payload = {"content": (content or "")[:2000], "username": "Jarvis"}
+    payload = {"content": (content or "")[:_DISCORD_CONTENT_LIMIT], "username": "Jarvis"}
     files = {
         "payload_json": (None, json.dumps(payload), "application/json"),
         "files[0]": (image_filename, image_bytes, "image/jpeg"),
@@ -193,7 +198,7 @@ def send_discord_message(webhook_url: str, content: str) -> bool:
     if not webhook_url or not content:
         return False
 
-    payload = {"content": content[:1900], "username": "Jarvis"}
+    payload = {"content": content[:_DISCORD_CONTENT_LIMIT], "username": "Jarvis"}
     try:
         resp = httpx.post(
             webhook_url, json=payload, timeout=_DISCORD_TIMEOUT_SECONDS,

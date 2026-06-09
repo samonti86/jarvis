@@ -168,7 +168,7 @@ _TORCH_THREADS = _env_int("JARVIS_ACOUSTIC_THREADS", 1)
 # since quiet/silent windows aren't recorded.
 _RECENT_MAXLEN = 450
 # Don't record a window unless its top label clears this — keeps "Silence" and
-# near-quiet noise out of the soundscape. Same 0.10 floor the debug log uses.
+# near-quiet noise out of the soundscape (a touch above the 0.10 debug-log floor).
 _RECENT_MIN_SCORE = 0.15
 # AudioSet labels that are "nothing happened" — never worth recording as a
 # heard sound even if they score high (a quiet room scores "Silence" near 1.0).
@@ -455,8 +455,10 @@ class SoundDetector:
         # newest — recent audio matters more than ancient backlog.
         self._chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=4)
         # Audio callback accumulates into this until it has WINDOW_SAMPLES,
-        # then dispatches and resets. Single-thread access (only sounddevice's
-        # callback touches it) — no lock needed.
+        # then dispatches and resets. No lock: while the stream runs ONLY the
+        # sounddevice callback touches it; activate() clears it too, but always
+        # BEFORE stream.start() (and re-activate early-returns), so the callback
+        # can never be mid-append when the clear runs. Preserve that ordering.
         self._buf: list[np.ndarray] = []
         self._buf_len = 0
         self._dropped = 0

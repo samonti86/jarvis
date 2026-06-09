@@ -263,9 +263,9 @@ class RemoteConsoleServer:
         if path == _WS_PATH:
             return None  # proceed to the WebSocket handshake
         if path in ("/", "/index.html"):
-            return self._http(200, "text/html; charset=utf-8", PWA_HTML)
+            return self._http("text/html; charset=utf-8", PWA_HTML)
         if path == "/manifest.json":
-            return self._http(200, "application/manifest+json", PWA_MANIFEST)
+            return self._http("application/manifest+json", PWA_MANIFEST)
         if path == "/silence.mp3":
             # M48.3 — gesture-time `<audio>` element unlock. Returns the
             # pre-generated 200ms silent MP3 (built once at server load via
@@ -274,7 +274,7 @@ class RemoteConsoleServer:
             # same as today's M48.2b accepted UX.
             if _SILENCE_MP3 is None:
                 return self._http(
-                    404, "text/plain; charset=utf-8",
+                    "text/plain; charset=utf-8",
                     "silence.mp3 not available (PyAV MP3 encoder absent)",
                     404,
                 )
@@ -285,10 +285,10 @@ class RemoteConsoleServer:
                 cache="public, max-age=86400, immutable",
             )
         if path == "/healthz":
-            return self._http(200, "text/plain; charset=utf-8", "ok")
+            return self._http("text/plain; charset=utf-8", "ok")
         if path == "/presence":
             return self._handle_presence(request)
-        return self._http(404, "text/plain; charset=utf-8", "not found", 404)
+        return self._http("text/plain; charset=utf-8", "not found", 404)
 
     # ------------------------------------------------------------------
     # M70 — geofenced auto-arm endpoint (token-gated HTTP, not WS).
@@ -321,7 +321,7 @@ class RemoteConsoleServer:
         if not self._presence_authed(supplied):
             _log("presence: rejected (bad/missing token)")
             return self._http(
-                401, "text/plain; charset=utf-8", "unauthorized", 401
+                "text/plain; charset=utf-8", "unauthorized", 401
             )
         event = ((params.get("event") or [""])[0] or "").strip()
         try:
@@ -335,7 +335,7 @@ class RemoteConsoleServer:
         # ui.set_armed_indicator → update_armed broadcast — the same path the
         # tray/voice arming uses — so we deliberately do NOT broadcast here.
         return self._http(
-            200, "application/json; charset=utf-8", json.dumps(result)
+            "application/json; charset=utf-8", json.dumps(result)
         )
 
     @staticmethod
@@ -367,7 +367,7 @@ class RemoteConsoleServer:
 
     @staticmethod
     def _http(
-        _status: int, ctype: str, body: str, status: int = 200
+        ctype: str, body: str, status: int = 200
     ) -> Response:
         data = body.encode("utf-8")
         headers = Headers(

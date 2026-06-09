@@ -318,6 +318,228 @@ class TurnRunner:
         _seal_session(self._memory, self._history, self._session_language,
                       self._session_started_at, self._cfg)
 
+    def _emit_remote_reply(self, reply_text: "Callable[[str], None] | None",
+                           answer: str) -> None:
+        """Post the final reply to a per-turn TEXT sink (Discord), if one was
+        supplied. ONLY the originating surface — deliberately NOT the
+        add_jarvis_text broadcast, so a PC/voice/phone turn never leaks into a
+        shared Discord channel. Covers the success, apology, and empty-reply
+        paths so a remote user always gets *something* back. Fail-soft — a post
+        hiccup can't break the turn."""
+        if reply_text is None:
+            return
+        try:
+            reply_text(answer)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[main] reply_text sink failed: {exc}", file=sys.stderr)
+
+    def _begin_turn(self, text: str, language: str,
+                    attachments: list[dict] | None) -> None:
+        """Open one turn: apply a pending reset/idle session boundary, capture
+        the session language on the first turn, surface the user message to the
+        console/UI, and append it to history (as a content-block list when there
+        are attachments, else a plain string). Runs under the caller's lock —
+        does NOT acquire self._lock itself."""
+        # Apply any pending reset/idle boundary BEFORE this turn — so the
+        # user's question starts a fresh session rather than tacking onto
+        # a stale one.
+        if self._reset_event.is_set():
+            if self._history:
+                print(f"[main] conversation reset (manual; sealing {len(self._history)} msgs)")
+                self._ui.add_system_text("conversation reset.")
+            self.seal_and_refresh()
+            self._reset_event.clear()
+        elif self._history and (time.time() - self._last_turn_time) > IDLE_RESET_SEC:
+            print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
+            self._ui.add_system_text("conversation reset (idle).")
+            self.seal_and_refresh()
+
+        # First turn of a (possibly new) session — capture its language.
+        if not self._history:
+            self._session_language = language or "en"
+            self._session_started_at = datetime.now().isoformat(timespec="seconds")
+
+        print(f"\n[user, {language}] {text}")
+        print("[jarvis] ", end="", flush=True)
+        self._ui.add_user_text(text, language)
+
+        # Build user-message content. With attachments: list of blocks
+        # (each attachment first so Claude has the doc/image in context
+        # before the question text). Without: plain string (cheaper).
+        if attachments:
+            content: list[dict] | str = list(attachments)
+            if text:
+                content.append({"type": "text", "text": text})
+        else:
+            content = text
+
+        self._history.append({"role": "user", "content": content})
+
+    def _finalize_turn(self, *, response_chunks: list[str], interrupted: bool,
+                       text: str, language: str,
+                       reply_text: "Callable[[str], None] | None",
+                       reply_audio: "Callable[[bytes], None] | None") -> bool:
+        """Assemble the streamed reply, persist + relay it, and (for a phone
+        turn) synthesize the reply audio. Returns `interrupted` (the value the
+        voice loop uses to decide whether to open a follow-up window). Runs
+        under the caller's lock — does NOT acquire self._lock itself.
+
+        An empty reply pops the orphan user message and (for a remote turn)
+        emits a short acknowledgement so the user isn't left in silence."""
+        full_response = "".join(response_chunks).strip()
+        if not full_response:
+            self._history.pop()  # nothing came back; drop the orphan user message
+            # Don't leave a REMOTE user in silence wondering if the turn
+            # even landed — Claude can legitimately return an empty turn
+            # (e.g. a tool-only turn that yields no prose). Emit a short
+            # acknowledgement to the originating surface, mirroring the
+            # apology path's fan-out. The PC/voice path stays silent (the
+            # user is present and saw the state indicators); nothing is
+            # appended to history (nothing was actually said).
+            if not interrupted and (reply_text is not None or reply_audio is not None):
+                ack = ("Disculpe, no tengo nada que añadir."
+                       if language == "es"
+                       else "I didn't have anything to add, sir.")
+                self._ui.add_jarvis_text(ack)
+                self._emit_remote_reply(reply_text, ack)
+            return interrupted
+
+        self._history.append({"role": "assistant", "content": full_response})
+        _trim_history(self._history)
+        self._last_turn_time = time.time()
+
+        # Persist the completed exchange to today's transcript file.
+        self._memory.record_turn(text, full_response, language)
+
+        self._ui.add_jarvis_text(full_response)
+        self._emit_remote_reply(reply_text, full_response)
+
+        # M48.2b: speak the reply to the phone that asked (UNICAST,
+        # mute-independent). Whole-reply-at-completion v1 — matches the
+        # at-completion text parity; streamed audio is a documented
+        # deferrable. Same edge-tts voice as the PC (VOICE_BY_LANG).
+        # Defensive: the text already reached the phone via the fan-out
+        # above, so a synth/transport hiccup must NEVER break the turn.
+        if reply_audio is not None:
+            try:
+                import asyncio  # noqa: PLC0415 — lazy per main.py convention
+                from src.text_to_speech import (  # noqa: PLC0415
+                    DEFAULT_VOICE, VOICE_BY_LANG, _fetch_mp3_with_retry,
+                )
+
+                voice = VOICE_BY_LANG.get(language, DEFAULT_VOICE)
+                mp3 = asyncio.run(_fetch_mp3_with_retry(full_response, voice))
+                reply_audio(mp3)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[main] phone reply audio failed: {exc}",
+                      file=sys.stderr)
+        print()
+        return interrupted
+
+    def _stream_and_speak(
+        self, *, llm_stream, pc_silent: bool, barge_enabled: bool,
+        session: "AudioSession | None", interrupt_event: "threading.Event | None",
+        language: str, reply_text: "Callable[[str], None] | None",
+    ) -> bool:
+        """Run the LLM stream and, when audible, speak it — holding the
+        cooperative speech gates for the spoken portion and running the
+        barge-in monitor for its duration. Returns True if the turn ERRORED
+        (the caller then returns False after the apology surfaced here); False
+        on a clean run. Runs under the caller's lock — does NOT acquire it.
+
+        For the audible portion it SETS self._pc_speaking (omni-mic echo
+        suppression) + self._announce_speaking (the armed PANNs/YOLO CPU loops
+        defer so the TTS path doesn't stutter), and clears both in `finally`.
+        On an exception it pops the orphan user message and surfaces a brief
+        spoken/text apology."""
+        speaking_aloud = not pc_silent
+        monitor_stop = threading.Event()
+        monitor_thread: threading.Thread | None = None
+
+        # Mark "PC is speaking out loud" for the audible portion of this turn so
+        # the always-on voice-capture loop (esp. the M51 follow-up window)
+        # discards anything it picks up while we talk — the mic stops
+        # self-capturing our own reply (the omni-mic echo, 2026-05-29). Silent
+        # turns (mute / phone) never set it; cleared in `finally` the instant
+        # our audio ends. The announce_speaking gate (set alongside) makes the
+        # armed CPU loops defer for the spoken portion, exactly as for a
+        # proactive announce (2026-06-01: only announces were gated → stutter).
+        if speaking_aloud:
+            self._pc_speaking.set()
+            self._announce_speaking.set()
+
+        try:
+            if pc_silent:
+                # Drain the LLM stream silently. response_chunks gets populated
+                # inside llm_stream via the print + append, so finalize works
+                # unchanged. State stays THINKING — caller flips to IDLE after.
+                for _ in llm_stream():
+                    pass
+            else:
+                # M52: run the barge-in monitor for the duration of playback. It
+                # reads the mic on its own thread and, on a "Hey Jarvis", just
+                # sets interrupt_event — speak_streaming polls it and performs
+                # the sd.stop() cut on its own (stream-owning) thread, the
+                # WASAPI thread-affinity fix.
+                if barge_enabled:
+                    monitor_thread = threading.Thread(
+                        target=monitor_for_wake_word,
+                        args=(session, interrupt_event, monitor_stop),
+                        kwargs={"threshold": self._cfg.wake_word_threshold},
+                        name="BargeInMonitor",
+                        daemon=True,
+                    )
+                    monitor_thread.start()
+                speak_streaming(
+                    llm_stream(),
+                    language=language,
+                    on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
+                    on_amplitude=self._ui.set_amplitude,
+                    interrupt_event=interrupt_event,
+                )
+        except Exception as exc:
+            self._history.pop()  # keep history alternating user/assistant cleanly
+            print(f"\n[main] LLM/TTS failed: {exc}")
+            # M20: don't leave the user in silence after a partial reply. Speak
+            # a brief apology in their language via the simpler Tier A path (no
+            # streaming pipeline that could fail again). Wrap in defensive
+            # try/except so the apology itself can't break the loop. Add to
+            # transcript too so the console reflects it. When silent (muted OR
+            # phone-text origin), skip the spoken apology but still surface its
+            # text — the phone/console sees the hiccup, the PC stays quiet.
+            apology = (
+                "Disculpe, tuve un problema técnico. ¿Podría intentarlo de nuevo?"
+                if language == "es"
+                else "Apologies, a technical hiccup. Could you try that again?"
+            )
+            if not pc_silent:
+                self._ui.set_state(State.SPEAKING)
+                try:
+                    speak(apology, language=language)
+                except Exception as apology_exc:
+                    print(f"[main] apology TTS also failed: {apology_exc}")
+            # Phone-audio turns: the apology TEXT still reaches the phone via the
+            # fan-out; we deliberately don't synth audio on the error path
+            # (extra failure surface for little gain — the text conveys it).
+            self._ui.add_jarvis_text(apology)
+            self._emit_remote_reply(reply_text, apology)
+            return True
+        finally:
+            # Stop suppressing voice capture + release the speech gate the
+            # instant our audio ends (so the armed loops resume promptly).
+            if speaking_aloud:
+                self._pc_speaking.clear()
+                self._announce_speaking.clear()
+            # M52: always wind the barge-in monitor down — normal end,
+            # exception, OR barge-in. monitor_stop makes its next session.read()
+            # (≤80ms away) the last; the join is instant on a clean turn and
+            # capped short otherwise (daemon thread).
+            if monitor_thread is not None:
+                monitor_stop.set()
+                monitor_thread.join(timeout=1.0)
+        print()
+        return False
+
     def process_question(
         self,
         text: str,
@@ -381,55 +603,10 @@ class TurnRunner:
         text_only = origin in ("phone_text", "discord")
         restricted = origin in ("phone_text", "phone_voice", "discord")
 
-        def _emit_remote_reply(answer: str) -> None:
-            """Post the final reply to a per-turn TEXT sink (Discord), if one
-            was supplied. ONLY the originating surface — this is deliberately
-            NOT the add_jarvis_text broadcast, so a PC/voice/phone turn never
-            leaks into a shared Discord channel. Covers both the success and
-            the apology paths so a remote user always gets *something* back.
-            Fail-soft — a post hiccup can't break the turn."""
-            if reply_text is None:
-                return
-            try:
-                reply_text(answer)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[main] reply_text sink failed: {exc}", file=sys.stderr)
-
         with self._lock:
-            # Apply any pending reset/idle boundary BEFORE this turn — so the
-            # user's question starts a fresh session rather than tacking onto
-            # a stale one.
-            if self._reset_event.is_set():
-                if self._history:
-                    print(f"[main] conversation reset (manual; sealing {len(self._history)} msgs)")
-                    self._ui.add_system_text("conversation reset.")
-                self.seal_and_refresh()
-                self._reset_event.clear()
-            elif self._history and (time.time() - self._last_turn_time) > IDLE_RESET_SEC:
-                print(f"[main] conversation reset (idle >{IDLE_RESET_SEC:.0f}s)")
-                self._ui.add_system_text("conversation reset (idle).")
-                self.seal_and_refresh()
-
-            # First turn of a (possibly new) session — capture its language.
-            if not self._history:
-                self._session_language = language or "en"
-                self._session_started_at = datetime.now().isoformat(timespec="seconds")
-
-            print(f"\n[user, {language}] {text}")
-            print("[jarvis] ", end="", flush=True)
-            self._ui.add_user_text(text, language)
-
-            # Build user-message content. With attachments: list of blocks
-            # (each attachment first so Claude has the doc/image in context
-            # before the question text). Without: plain string (cheaper).
-            if attachments:
-                content: list[dict] | str = list(attachments)
-                if text:
-                    content.append({"type": "text", "text": text})
-            else:
-                content = text
-
-            self._history.append({"role": "user", "content": content})
+            # Seal any stale session, capture session language, surface + append
+            # the user message. (Boundary logic lives in _begin_turn.)
+            self._begin_turn(text, language, attachments)
 
             response_chunks: list[str] = []
 
@@ -539,100 +716,17 @@ class TurnRunner:
                 and not pc_silent
             )
             interrupt_event = threading.Event() if barge_enabled else None
-            monitor_stop = threading.Event()
-            monitor_thread: threading.Thread | None = None
 
-            # Mark "PC is speaking out loud" for the audible portion of this
-            # turn so the always-on voice-capture loop (esp. the M51 follow-up
-            # window) discards anything it picks up while we talk — that's how
-            # the mic stops self-capturing our own reply (the omni-mic echo,
-            # 2026-05-29). Silent turns (mute / phone) never set it; cleared in
-            # `finally` the instant our audio ends.
-            speaking_aloud = not pc_silent
-            if speaking_aloud:
-                self._pc_speaking.set()
-                # Make the armed CPU loops (PANNs inference, YOLO watcher) defer
-                # for the spoken portion of this turn, exactly as they do for a
-                # proactive announce — otherwise a reply spoken while armed
-                # stutters (2026-06-01: only announces were gated). Mirrors the
-                # pc_speaking lifetime; cleared in the same `finally`.
-                self._announce_speaking.set()
-
-            try:
-                if pc_silent:
-                    # Drain the LLM stream silently. response_chunks gets
-                    # populated inside llm_stream via the print + append, so
-                    # the rest of the function (full_response assembly,
-                    # history append, persist) works unchanged. State stays
-                    # THINKING throughout — caller flips to IDLE after we
-                    # return.
-                    for _ in llm_stream():
-                        pass
-                else:
-                    # M52: run the barge-in monitor for the duration of
-                    # playback. It reads the mic on its own thread and, on a
-                    # "Hey Jarvis", just sets interrupt_event — speak_streaming
-                    # polls it and performs the sd.stop() cut on its own
-                    # (stream-owning) thread, the WASAPI thread-affinity fix.
-                    if barge_enabled:
-                        monitor_thread = threading.Thread(
-                            target=monitor_for_wake_word,
-                            args=(session, interrupt_event, monitor_stop),
-                            kwargs={"threshold": self._cfg.wake_word_threshold},
-                            name="BargeInMonitor",
-                            daemon=True,
-                        )
-                        monitor_thread.start()
-                    speak_streaming(
-                        llm_stream(),
-                        language=language,
-                        on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
-                        on_amplitude=self._ui.set_amplitude,
-                        interrupt_event=interrupt_event,
-                    )
-            except Exception as exc:
-                self._history.pop()  # keep history alternating user/assistant cleanly
-                print(f"\n[main] LLM/TTS failed: {exc}")
-                # M20: don't leave the user in silence after a partial reply.
-                # Speak a brief apology in their language via the simpler Tier
-                # A path (no streaming pipeline that could fail again). Wrap
-                # in defensive try/except so the apology itself can't break
-                # the loop. Add to transcript too so the console reflects it.
-                # When silent (muted OR phone-text origin), skip the spoken
-                # apology but still surface its text — the phone/console sees
-                # the hiccup, the PC stays quiet to its empty room.
-                apology = (
-                    "Disculpe, tuve un problema técnico. ¿Podría intentarlo de nuevo?"
-                    if language == "es"
-                    else "Apologies, a technical hiccup. Could you try that again?"
-                )
-                if not pc_silent:
-                    self._ui.set_state(State.SPEAKING)
-                    try:
-                        speak(apology, language=language)
-                    except Exception as apology_exc:
-                        print(f"[main] apology TTS also failed: {apology_exc}")
-                # Phone-audio turns: the apology TEXT still reaches the phone
-                # via the fan-out below; we deliberately don't synth audio on
-                # the error path (extra failure surface for little gain — the
-                # text is enough to convey the hiccup).
-                self._ui.add_jarvis_text(apology)
-                _emit_remote_reply(apology)
+            # Run the stream and (when audible) speak it — holds the speech
+            # gates + barge-in monitor; on error it surfaces an apology, pops
+            # the orphan user message, and returns True so we bail here.
+            if self._stream_and_speak(
+                llm_stream=llm_stream, pc_silent=pc_silent,
+                barge_enabled=barge_enabled, session=session,
+                interrupt_event=interrupt_event, language=language,
+                reply_text=reply_text,
+            ):
                 return False
-            finally:
-                # Stop suppressing voice capture + release the speech gate the
-                # instant our audio ends (so the armed loops resume promptly).
-                if speaking_aloud:
-                    self._pc_speaking.clear()
-                    self._announce_speaking.clear()
-                # M52: always wind the barge-in monitor down — normal end,
-                # exception, OR barge-in. monitor_stop makes its next
-                # session.read() (≤80ms away) the last; the join is instant
-                # on a clean turn and capped short otherwise (daemon thread).
-                if monitor_thread is not None:
-                    monitor_stop.set()
-                    monitor_thread.join(timeout=1.0)
-            print()
 
             # M52: did the user barge in? interrupt_event survives the monitor
             # join (Events don't auto-reset), so this read is stable. A
@@ -643,42 +737,12 @@ class TurnRunner:
             if interrupted:
                 print("[main] turn interrupted by barge-in", file=sys.stderr)
 
-            full_response = "".join(response_chunks).strip()
-            if not full_response:
-                self._history.pop()  # nothing came back; drop the orphan user message
-                return interrupted
-
-            self._history.append({"role": "assistant", "content": full_response})
-            _trim_history(self._history)
-            self._last_turn_time = time.time()
-
-            # Persist the completed exchange to today's transcript file.
-            self._memory.record_turn(text, full_response, language)
-
-            self._ui.add_jarvis_text(full_response)
-            _emit_remote_reply(full_response)
-
-            # M48.2b: speak the reply to the phone that asked (UNICAST,
-            # mute-independent). Whole-reply-at-completion v1 — matches the
-            # at-completion text parity; streamed audio is a documented
-            # deferrable. Same edge-tts voice as the PC (VOICE_BY_LANG).
-            # Defensive: the text already reached the phone via the fan-out
-            # above, so a synth/transport hiccup must NEVER break the turn.
-            if reply_audio is not None:
-                try:
-                    import asyncio  # noqa: PLC0415 — lazy per main.py convention
-                    from src.text_to_speech import (  # noqa: PLC0415
-                        DEFAULT_VOICE, VOICE_BY_LANG, _fetch_mp3_with_retry,
-                    )
-
-                    voice = VOICE_BY_LANG.get(language, DEFAULT_VOICE)
-                    mp3 = asyncio.run(_fetch_mp3_with_retry(full_response, voice))
-                    reply_audio(mp3)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[main] phone reply audio failed: {exc}",
-                          file=sys.stderr)
-            print()
-            return interrupted
+            # Assemble + persist + relay the reply (and synth phone audio).
+            return self._finalize_turn(
+                response_chunks=response_chunks, interrupted=interrupted,
+                text=text, language=language,
+                reply_text=reply_text, reply_audio=reply_audio,
+            )
 
 
 def listen_loop(
@@ -1621,9 +1685,13 @@ def _register_status(
         from src.reminders import list_pending  # noqa: PLC0415 — lazy
         items = list_pending()
         n = len(items)
-        briefings = sum(1 for r in items if r.get("action") == "briefing")
-        if briefings:
-            return f"Reminders: {n} pending ({briefings} scheduled briefing(s))"
+        # Any non-empty action is a scheduled composition (M59 briefing, M63
+        # good_night, and whatever _COMPOSITION_ACTIONS grows to next) — count
+        # them all, not just "briefing" (the old check drifted when M63 added
+        # good_night as a second schedulable action).
+        scheduled = sum(1 for r in items if r.get("action"))
+        if scheduled:
+            return f"Reminders: {n} pending ({scheduled} scheduled briefing/wrap-up(s))"
         return f"Reminders: {n} pending"
 
     def _status_memory() -> str:
