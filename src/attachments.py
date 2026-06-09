@@ -59,9 +59,9 @@ def load_attachment(path: str) -> tuple[dict | None, str | None]:
 
     size = p.stat().st_size
     if size > MAX_FILE_BYTES:
-        mb = size // (1024 * 1024)
+        mb = size / (1024 * 1024)  # float: a 25.3 MB file shouldn't read as "25 MB (limit 25 MB)"
         cap = MAX_FILE_BYTES // (1024 * 1024)
-        return None, f"{p.name} is {mb} MB (limit {cap} MB)"
+        return None, f"{p.name} is {mb:.1f} MB (limit {cap} MB)"
 
     suffix = p.suffix.lower()
     mime, _ = mimetypes.guess_type(str(p))

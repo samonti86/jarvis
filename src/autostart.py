@@ -96,7 +96,7 @@ def _write_shortcut(
     if not _VENV_PYTHONW.exists():
         raise RuntimeError(f"venv pythonw not found at {_VENV_PYTHONW}")
     if not _LAUNCHER.exists():
-        raise RuntimeError(f"jarvis.pyw not found at {_LAUNCHER}")
+        raise RuntimeError(f"launcher not found at {_LAUNCHER}")
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
 

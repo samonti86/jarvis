@@ -646,6 +646,19 @@ class TurnRunner:
             full_response = "".join(response_chunks).strip()
             if not full_response:
                 self._history.pop()  # nothing came back; drop the orphan user message
+                # Don't leave a REMOTE user in silence wondering if the turn
+                # even landed — Claude can legitimately return an empty turn
+                # (e.g. a tool-only turn that yields no prose). Emit a short
+                # acknowledgement to the originating surface, mirroring the
+                # apology path's fan-out. The PC/voice path stays silent (the
+                # user is present and saw the state indicators); nothing is
+                # appended to history (nothing was actually said).
+                if not interrupted and (reply_text is not None or reply_audio is not None):
+                    ack = ("Disculpe, no tengo nada que añadir."
+                           if language == "es"
+                           else "I didn't have anything to add, sir.")
+                    self._ui.add_jarvis_text(ack)
+                    _emit_remote_reply(ack)
                 return interrupted
 
             self._history.append({"role": "assistant", "content": full_response})
@@ -1621,9 +1634,13 @@ def _register_status(
         from src.reminders import list_pending  # noqa: PLC0415 — lazy
         items = list_pending()
         n = len(items)
-        briefings = sum(1 for r in items if r.get("action") == "briefing")
-        if briefings:
-            return f"Reminders: {n} pending ({briefings} scheduled briefing(s))"
+        # Any non-empty action is a scheduled composition (M59 briefing, M63
+        # good_night, and whatever _COMPOSITION_ACTIONS grows to next) — count
+        # them all, not just "briefing" (the old check drifted when M63 added
+        # good_night as a second schedulable action).
+        scheduled = sum(1 for r in items if r.get("action"))
+        if scheduled:
+            return f"Reminders: {n} pending ({scheduled} scheduled briefing/wrap-up(s))"
         return f"Reminders: {n} pending"
 
     def _status_memory() -> str:

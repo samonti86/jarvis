@@ -340,7 +340,8 @@ def _do_events(filter_str: str, limit: int) -> str:
         f"@{{Name='level';Expression={{$_.LevelDisplayName}}}}, "
         f"@{{Name='source';Expression={{$_.ProviderName}}}}, "
         f"@{{Name='id';Expression={{$_.Id}}}}, "
-        f"@{{Name='msg';Expression={{$_.Message.Substring(0,[Math]::Min(160,$_.Message.Length))}}}} | "
+        f"@{{Name='msg';Expression={{if ($_.Message) "
+        f"{{$_.Message.Substring(0,[Math]::Min(160,$_.Message.Length))}} else {{''}}}}}} | "
         f"ConvertTo-Json -Compress"
     )
     try:

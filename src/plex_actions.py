@@ -182,7 +182,9 @@ if ($serving) {{
 }}
 """
     try:
-        rc, out, err = client.run(_ps_encoded(script))
+        # retry=False: these are non-idempotent mutating actions — a silent
+        # auto-retry on a connection drop could double-fire (see run()'s note).
+        rc, out, err = client.run(_ps_encoded(script), retry=False)
     except Exception as exc:
         return f"Plex laptop unreachable: {exc}"
     if rc != 0:
@@ -270,7 +272,9 @@ try {{
 }}
 """
     try:
-        rc, out, err = client.run(_ps_encoded(script))
+        # retry=False: these are non-idempotent mutating actions — a silent
+        # auto-retry on a connection drop could double-fire (see run()'s note).
+        rc, out, err = client.run(_ps_encoded(script), retry=False)
     except Exception as exc:
         return f"Plex laptop unreachable: {exc}"
     if rc != 0:
@@ -301,7 +305,9 @@ try {{
 }}
 """
     try:
-        rc, out, err = client.run(_ps_encoded(script))
+        # retry=False: these are non-idempotent mutating actions — a silent
+        # auto-retry on a connection drop could double-fire (see run()'s note).
+        rc, out, err = client.run(_ps_encoded(script), retry=False)
     except Exception as exc:
         return f"Plex laptop unreachable: {exc}"
     if rc != 0:

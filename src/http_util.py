@@ -55,6 +55,7 @@ def http_get_with_retry(
     tag: str,
     timeout: float = _HTTP_TIMEOUT_SEC,
     backoff: float = _RETRY_BACKOFF_SEC,
+    follow_redirects: bool = True,
 ) -> httpx.Response | None:
     """GET with one retry on transport errors. Returns None on final failure
     or any non-2xx response. Caller checks for None.
@@ -63,11 +64,19 @@ def http_get_with_retry(
     `[tmdb]`, ...). Keyword-only and required so every caller is identifiable
     in the log — a shared helper with anonymous failures would be a debugging
     regression vs. the per-tool copies it replaces.
+
+    `follow_redirects` defaults True: httpx does NOT follow redirects by
+    default, and a feed/endpoint that 301/302-redirects (e.g. an http→https
+    upgrade) would otherwise raise HTTPStatusError and be silently dropped —
+    the exact M47 landmine the news tool already hit once. Following redirects
+    is the expected behaviour for every consumer of this helper; the
+    "retry transport errors only, never 4xx/5xx" contract is unaffected.
     """
     last_exc: Exception | None = None
     for attempt in (1, 2):
         try:
-            r = httpx.get(url, params=params, timeout=timeout)
+            r = httpx.get(url, params=params, timeout=timeout,
+                          follow_redirects=follow_redirects)
             r.raise_for_status()
             return r
         except httpx.HTTPStatusError as exc:

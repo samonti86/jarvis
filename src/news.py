@@ -117,7 +117,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.npr.org/1004/rss.xml",
     ],
     "tech": [
-        "http://feeds.arstechnica.com/arstechnica/index",
+        "https://feeds.arstechnica.com/arstechnica/index",
         "https://www.theverge.com/rss/index.xml",
         "https://hnrss.org/frontpage",
     ],
@@ -340,8 +340,8 @@ def execute_news_tool(params: dict) -> str:
     category = _category(params.get("category"))
     if category is None:
         return (
-            "I cover top headlines, world, tech, business, and science "
-            "news. Which would you like?"
+            "I cover top headlines, world, tech, business, science, sports, "
+            "and gaming news. Which would you like?"
         )
 
     topic = (params.get("topic") or "").strip()

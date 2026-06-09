@@ -34,7 +34,9 @@ mutating verb added in the future):
   Claude call again with `confirmed=true`. Server-side gating means a
   misbehaving prompt or a hallucinated tool call can't bypass it.
 - Elevation gate enforced HERE for actions that require it (flush_dns,
-  restart_service, dhcp_cycle). `_IS_ADMIN` is cached at import via
+  restart_service, stop_service, start_service, dhcp_cycle — the three
+  service verbs share one admin-gated `_do_service_action`). `_IS_ADMIN`
+  is cached at import via
   `autostart.is_admin()`; the gate fails fast with a "needs admin"
   message rather than discovering Access Denied from subprocess output.
   Aligns with the "Jarvis stays Jarvis, not Ultron" least-privilege

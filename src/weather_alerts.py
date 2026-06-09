@@ -88,6 +88,15 @@ _POLL_SECONDS = _env_int("JARVIS_WEATHER_POLL_SECONDS", 600, 60)
 # who wants advisories too can drop the floor to "moderate".
 _SEVERITY_RANK = {"unknown": 0, "minor": 1, "moderate": 2, "severe": 3, "extreme": 4}
 
+# How long the dedupe set keeps an alert ID. UNLIKE calendar events (whose ID
+# encodes start_local and so can never recur once started — 24 h is plenty
+# there), an NWS alert keeps a STABLE id for its whole life, and warnings
+# routinely run multi-day (winter storm, hurricane). If the dedupe pruned at
+# 24 h the still-active warning would re-fire — a 3 AM repeat of the no-UPS
+# shutdown nudge. 7 days comfortably outlives any realistic alert; IDs are
+# unique (URN-style) so a long window only bounds the file, never mis-dedupes.
+_DEDUPE_RETAIN_HOURS = 168
+
 
 def _announce_severities() -> set[str]:
     """The set of NWS severity strings to announce proactively, from
@@ -194,8 +203,14 @@ def _should_announce(alert: WeatherAlert, announced: set[str],
                      severities: set[str]) -> bool:
     """Pure: announce this alert iff its severity is in the announce set AND
     it hasn't already been announced. Isolated from fetch / announce / disk so
-    the firing rule is structurally testable."""
-    if alert.severity not in severities:
+    the firing rule is structurally testable.
+
+    Severity is compared case-insensitively: NWS emits Title-case today, but
+    the on-demand path (execute_weather_alerts_tool) already lowercases, and a
+    casing drift here would silently take the *proactive* monitor dark — the
+    worse failure mode. Match the two paths so a string change can't do that."""
+    sev_lower = {s.lower() for s in severities}
+    if alert.severity.lower() not in sev_lower:
         return False
     if alert.id in announced:
         return False
@@ -254,7 +269,7 @@ class WeatherAlertMonitor:
     ) -> None:
         self._announce = announce
         self._discord = (discord_webhook_url or "").strip()
-        self._store = DedupeStore(_store_path())
+        self._store = DedupeStore(_store_path(), retain_hours=_DEDUPE_RETAIN_HOURS)
         self._severities = _announce_severities()
 
         # Geocoded home point, resolved lazily on the first poll and cached.

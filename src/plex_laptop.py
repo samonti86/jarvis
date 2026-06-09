@@ -251,25 +251,32 @@ class PlexLaptopClient:
                 pass
             self._client = None
 
-    def run(self, command: str, timeout: float = _COMMAND_TIMEOUT) -> tuple[int, str, str]:
+    def run(self, command: str, timeout: float = _COMMAND_TIMEOUT,
+            *, retry: bool = True) -> tuple[int, str, str]:
         """Execute `command` on the laptop. Returns (exit_code, stdout, stderr).
 
         Auto-reconnects ONCE on a dropped connection. Raises on the second
         consecutive failure — caller is expected to catch and return a
         voice-friendly error string.
+
+        `retry=False` disables the auto-retry. The retry re-runs the WHOLE
+        command, which is safe for idempotent read-only diagnostics (the
+        default) but NOT for a non-idempotent mutating action: if the channel
+        drops after the command was dispatched but before the exit status is
+        read, a retry would fire it twice. The confirmation-gated mutating
+        callers in plex_actions.py pass retry=False so a drop surfaces as an
+        error the user can consciously re-issue, never a silent double-fire.
         """
         with self._lock:
             if self._closed:
                 raise RuntimeError("PlexLaptopClient is closed")
 
             last_exc: Exception | None = None
-            for attempt in (1, 2):
+            for attempt in ((1, 2) if retry else (1,)):
                 if self._client is None:
-                    try:
-                        self._connect()
-                    except Exception as exc:
-                        # Connect itself failed — no point retrying immediately.
-                        raise
+                    # Connect failure propagates directly — no point retrying
+                    # immediately, and the caller turns it into an error string.
+                    self._connect()
 
                 try:
                     _stdin, stdout, stderr = self._client.exec_command(
