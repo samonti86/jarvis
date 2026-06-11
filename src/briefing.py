@@ -15,7 +15,7 @@ Design decisions (settled with the user before the build):
     and world news are draining, and a *morning* briefing should set the day
     up, not weigh it down. The news section is `get_news`'s sports (NHL /
     NFL / WWE) and gaming (PlayStation / Nintendo) categories — added to
-    `news.py` for exactly this.
+    `news.py` for exactly this. (Sports = NBA / NHL / NFL / WWE.)
   - **Fail-soft per section.** Each section is gathered independently and
     wrapped — a dead news feed or a weather outage degrades that one line,
     never blanks the briefing. Same never-raises contract as every tool.

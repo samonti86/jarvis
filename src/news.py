@@ -58,7 +58,7 @@ NEWS_TOOL = {
         "'what's happening today', or 'what's the latest <topic> news' "
         "questions — it returns fresh structured headlines and is faster "
         "and more reliable than scraping. Categories: top (general "
-        "headlines), world, tech, business, science, sports (NHL/NFL/WWE), "
+        "headlines), world, tech, business, science, sports (NBA/NHL/NFL/WWE), "
         "gaming (PlayStation/Nintendo). Use web_search "
         "instead when the user wants to dig into one specific story, names "
         "a specific outlet/URL (then web_fetch), or asks about a niche "
@@ -76,7 +76,8 @@ NEWS_TOOL = {
                 "description": (
                     "Which feed bucket. 'top' = general headlines (default "
                     "if the user just asks for 'the news'). 'sports' covers "
-                    "NHL / NFL / WWE; 'gaming' covers PlayStation / Nintendo."
+                    "NBA / NHL / NFL / WWE; 'gaming' covers PlayStation / "
+                    "Nintendo."
                 ),
             },
             "topic": {
@@ -136,6 +137,7 @@ _FEEDS: dict[str, list[str]] = {
     # candidates were dropped for 301/308 redirects (httpx doesn't follow
     # them; the M47 landmine). https-canonical, no-redirect URLs only.
     "sports": [
+        "https://www.espn.com/espn/rss/nba/news",
         "https://www.espn.com/espn/rss/nhl/news",
         "https://www.espn.com/espn/rss/nfl/news",
         "https://www.wrestlinginc.com/feed/",
@@ -165,7 +167,7 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "space": "science", "research": "science", "environment": "science",
     "sports": "sports", "sport": "sports", "nhl": "sports", "hockey": "sports",
     "nfl": "sports", "football": "sports", "wwe": "sports",
-    "wrestling": "sports",
+    "wrestling": "sports", "nba": "sports", "basketball": "sports",
     "gaming": "gaming", "games": "gaming", "game": "gaming",
     "video games": "gaming", "videogames": "gaming",
     "playstation": "gaming", "nintendo": "gaming",
