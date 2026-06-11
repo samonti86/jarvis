@@ -49,6 +49,7 @@ from src.llm import TelemetryRecord, stream_response
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.plex_laptop import DEFAULT_LOG_PATH as DEFAULT_PLEX_LAPTOP_LOG, PlexLaptopClient
 from src.plex_mcp import PlexMCPClient
+from src import quiet_hours
 from src import speaker_id
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
@@ -1477,8 +1478,20 @@ def _build_announcer(ui: JarvisUI, pc_speaking: threading.Event) -> _Announcer:
         prompt-playback time eats into the response budget.
 
         label (optional) tags the console line — 🚨 for the default
-        (security) announce, ⏰ for an M53 reminder firing."""
+        (security) announce, ⏰ for an M53 reminder firing. It is ALSO the
+        severity signal the M79 quiet-hours policy reads: during the configured
+        DND window a routine status-monitoring label (🖥) is held back and
+        recorded for the morning briefing's catch-up, while everything else
+        pierces (the safe default). DND off ⇒ unchanged behaviour."""
         if not text:
+            return
+        if quiet_hours.decide(label) == "defer":
+            # Held back by quiet hours — record it for the briefing catch-up,
+            # don't speak, don't fire on_done (on_done is a timing callback used
+            # only by the critical security path, which always pierces).
+            quiet_hours.record_deferred(text, label)
+            print(f"[announce] quiet hours — deferred ({label}): {text!r}",
+                  file=sys.stderr)
             return
         try:
             announce_queue.put_nowait((text, on_done, label))

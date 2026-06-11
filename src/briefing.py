@@ -173,6 +173,18 @@ def _calendar_section() -> str:
     return "\n".join(lines)
 
 
+def _quiet_catchup_section() -> str:
+    """M79 — "while you were away": announcements held back by quiet hours
+    (currently routine homelab-monitor chatter) surface here, then clear. Lazy
+    import + fail-soft; returns "" when DND is off or nothing was deferred."""
+    try:
+        from src import quiet_hours  # noqa: PLC0415 — lazy
+        return quiet_hours.format_deferred(quiet_hours.take_deferred())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[briefing] quiet-hours catch-up section failed: {exc}", file=sys.stderr)
+        return ""
+
+
 def _predictions_section() -> str:
     """M78.2 — "you called it" follow-ups: any sports prediction Jarvis made
     that has since been decided. Mines recent transcripts, resolves due ones
@@ -221,6 +233,7 @@ def execute_briefing_tool(params: dict) -> str:  # noqa: ARG001 — param-less t
     sections = [
         _weather_section(),
         _security_section(),
+        _quiet_catchup_section(),  # M79 — "while you were away" deferred announces
         _calendar_section(),    # M62 — silent skip when Outlook isn't configured
         _reminders_section(),
         _predictions_section(), # M78.2 — silent skip when nothing's resolved
