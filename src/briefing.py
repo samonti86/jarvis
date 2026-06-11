@@ -173,6 +173,21 @@ def _calendar_section() -> str:
     return "\n".join(lines)
 
 
+def _predictions_section() -> str:
+    """M78.2 — "you called it" follow-ups: any sports prediction Jarvis made
+    that has since been decided. Mines recent transcripts, resolves due ones
+    via web search, and surfaces newly-decided ones (each at most once) — all
+    inside src/predictions.py. Lazy import (it pulls anthropic +
+    conversation_recall) and fail-soft: a dead section never breaks the
+    briefing, and it returns "" when disabled / unconfigured / nothing's ready."""
+    try:
+        from src.predictions import briefing_followups  # noqa: PLC0415 — lazy
+        return briefing_followups()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[briefing] predictions section failed: {exc}", file=sys.stderr)
+        return ""
+
+
 def _reminders_section() -> str:
     """The pending reminders whose next fire is today (M53/M54 store)."""
     try:
@@ -201,12 +216,14 @@ def execute_briefing_tool(params: dict) -> str:  # noqa: ARG001 — param-less t
     """Compose the morning briefing. Never raises — every section fails soft
     on its own, so one dead feed or outage costs a line, not the briefing.
     Section order: practical first (weather, overnight security, the day's
-    reminders), the lighter sports + gaming to finish on."""
+    reminders), then the lighter "you called it" prediction follow-ups and
+    sports + gaming to finish on."""
     sections = [
         _weather_section(),
         _security_section(),
         _calendar_section(),    # M62 — silent skip when Outlook isn't configured
         _reminders_section(),
+        _predictions_section(), # M78.2 — silent skip when nothing's resolved
         _news_section("sports", "Sports"),
         _news_section("gaming", "Gaming"),
     ]
