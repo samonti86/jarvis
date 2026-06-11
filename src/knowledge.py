@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from src import embeddings as _embeddings
 from src.memory import default_base_dir
 
 
@@ -174,10 +175,9 @@ _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 10
 
 # --- M46 hybrid semantic search --------------------------------------------
-# Local embedding model: all-MiniLM-L6-v2 — 384-dim, ~80 MB, CPU-fast on the
-# Ryzen. Local by REQUIREMENT, not convenience: an API embedding endpoint
-# would ship the private corpus to a third party, violating privacy-by-design.
-_EMBED_MODEL = "all-MiniLM-L6-v2"
+# The local embedding model (all-MiniLM-L6-v2) now lives in the shared
+# src/embeddings.py module (extracted M78.1 when conversation_recall became the
+# second consumer — see _get_embedder below).
 # Per-retriever candidate depth fed into the rank fusion — well above
 # _MAX_LIMIT so fusion has real material to merge.
 _CANDIDATES = 25
@@ -301,58 +301,21 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-# --- M46 embedding layer ---------------------------------------------------
-# Lazy: sentence-transformers pulls in torch, far too heavy to import at
-# module load (knowledge.py is imported by llm.py on every startup). Loaded
-# on first use and cached. Sentinel: None = not yet tried, False = load
-# failed (→ permanent keyword-only fallback for the process), else the model.
-_embedder: object | None = None
-
-
+# --- M46 embedding layer (M78.1: delegated to the shared src/embeddings) ----
+# The embedder was extracted into src/embeddings.py when conversation_recall
+# became the second consumer — one shared SentenceTransformer instance instead
+# of two independent ~80 MB loaders. These thin wrappers keep knowledge.py's
+# internal call sites (_vector_candidates, reindex) byte-identical while the
+# actual model lives in the shared module. Same fail-soft contract: a None
+# return ⇒ keyword-only search.
 def _get_embedder():
-    """The embedding model, lazily loaded and cached. Returns None if
-    sentence-transformers isn't installed or the model can't load — callers
-    then fall back to keyword-only search. The optional-component contract:
-    M46 must never break M45."""
-    global _embedder
-    if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-            print(
-                f"[knowledge] loading embedding model ({_EMBED_MODEL})…",
-                file=sys.stderr,
-            )
-            _embedder = SentenceTransformer(_EMBED_MODEL)
-            print("[knowledge] embedding model ready", file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001 — degrade, never crash
-            print(
-                f"[knowledge] embeddings unavailable "
-                f"({type(exc).__name__}: {exc}) — keyword-only search",
-                file=sys.stderr,
-            )
-            _embedder = False
-    return _embedder or None
+    """The shared embedding model (src/embeddings.py). None ⇒ keyword-only."""
+    return _embeddings.get_embedder()
 
 
 def _embed(texts: list[str]):
-    """Encode texts → an (N, 384) float32 array, L2-normalized so cosine
-    similarity reduces to a plain dot product. Returns None on any failure
-    (caller falls back to keyword-only)."""
-    model = _get_embedder()
-    if model is None or not texts:
-        return None
-    try:
-        import numpy as np  # noqa: PLC0415
-        vecs = model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return np.asarray(vecs, dtype=np.float32)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[knowledge] encode failed ({exc})", file=sys.stderr)
-        return None
+    """Encode texts via the shared embedder. None on any failure."""
+    return _embeddings.embed(texts)
 
 
 @dataclass

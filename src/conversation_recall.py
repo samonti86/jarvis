@@ -25,14 +25,19 @@ DESIGN — direct scan, NOT an index (the load-bearing decision):
   ago" works, which a stale index would miss. At personal scale (a year of text
   is a few MB) a linear scan is microseconds.
 
-  Keyword (token) matching is v1. Recall queries are keyword-friendly: the user
-  asks about a concrete noun (a team, film, person, decision) that appears
-  verbatim in the transcript, and crude prefix-stemming covers
-  predict/predicted/prediction. The semantic (embedding) half is a deliberate,
-  MEASURED follow-on — the M45→M46 progression repeated: ship the simple correct
-  thing, add vectors only once keyword recall is the measured limiter. The
-  ranking is structured around an RRF fusion seam (_rank_exchanges) so that
-  later addition is a clean drop-in over the same candidate set, no rearchitecting.
+  Retrieval is HYBRID (M78.1): keyword (token) matching fused with local-
+  embedding cosine via Reciprocal Rank Fusion — the same shape as
+  src/knowledge.py's M46 layer. Keyword carries the concrete nouns recall
+  queries usually contain (a team, film, person, decision) plus crude prefix-
+  stemming (predict/predicted/prediction); the vector pass catches paraphrases
+  keyword structurally misses. Unlike the knowledge corpus there is NO
+  persistent embedding index — the vector pass embeds a BOUNDED candidate set
+  (keyword hits ∪ a recent-history window) at query time, so recall stays
+  always-current (a new exchange is searchable the moment a query includes it)
+  while the embed cost stays bounded. If sentence-transformers is absent the
+  vector list is empty and search degrades cleanly to keyword-only. A full-
+  corpus embedding cache (to catch paraphrases of OLD, non-keyword, out-of-
+  window exchanges) is the measured follow-on if real use shows that gap.
 
 Defensive contract, identical to src/knowledge.py / src/tmdb.py: every public
 entry point never raises and always returns a readable string Claude can
@@ -49,6 +54,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from src import embeddings
 from src.memory import default_base_dir, format_relative_time
 
 
@@ -129,6 +135,30 @@ _STOP = frozenset(
 # Below this length a token must match EXACTLY (prefix-stemming short tokens
 # produces noise — 'in' would prefix-match 'india').
 _MIN_PREFIX_LEN = 4
+
+# --- M78.1 semantic layer ---------------------------------------------------
+# Hybrid retrieval: keyword scoring fused with local-embedding cosine via RRF
+# (the same shape as src/knowledge.py's M46 layer). Unlike the knowledge corpus,
+# transcripts are append-only and there is NO persistent embedding index — we
+# embed a BOUNDED candidate set at query time (keyword hits ∪ a recent-history
+# window), which preserves the direct-scan property (always-current — a brand-new
+# exchange is embedded the moment a query includes it) AND keeps the per-query
+# embed cost bounded. The deliberate v1 limitation: a paraphrase of an OLD
+# exchange that shares no keywords and falls outside the recent window won't be
+# found semantically — a full-corpus embedding cache is the MEASURED follow-on
+# if real use shows that gap (the M45→M46 discipline, repeated). Embeddings
+# unavailable ⇒ vector list is empty ⇒ clean keyword-only fallback.
+_CANDIDATES = 25            # top-N from each retriever fed into the fusion
+_RRF_K = 60                 # Reciprocal Rank Fusion damping (canonical default)
+_RECENT_VECTOR_WINDOW = 80  # most-recent exchanges always eligible for vectors
+_MAX_EMBED = 150            # hard cap on exchanges embedded per query (latency)
+# Cosine floor: only genuinely-similar exchanges enter the vector list. Without
+# it, the recent-window candidates would all fuse in at low similarity and
+# surface irrelevant recent chatter as "relevant". MiniLM puts related text
+# ~0.4-0.7 and unrelated ~0.0-0.2, so 0.30 cleanly separates them. (knowledge.py
+# omits this because its small curated corpus wants max recall; recall over a
+# large transcript history wants precision instead.)
+_VECTOR_SIM_FLOOR = 0.30
 
 
 def _sessions_dir() -> Path:
@@ -267,25 +297,84 @@ def _flatten_content(content) -> str:
     return str(content) if content is not None else ""
 
 
-def _rank_exchanges(exchanges: list[dict], terms: list[str]) -> list[dict]:
-    """Score each exchange by how many distinct query terms it matches (in
-    either side), drop zero-score, rank by score then recency.
+def _rrf_fuse(keyword_ids: list[int], vector_ids: list[int]) -> list[int]:
+    """Reciprocal Rank Fusion of two ranked index lists (mirrors
+    src/knowledge.py._rrf_fuse). Each list contributes 1/(_RRF_K + rank) per
+    item; an item both retrievers surface rises. With one list empty this
+    degrades cleanly to the other's order — exactly the keyword-only fallback
+    when embeddings are unavailable."""
+    scores: dict[int, float] = {}
+    for ranked in (keyword_ids, vector_ids):
+        for rank, idx in enumerate(ranked):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (_RRF_K + rank + 1)
+    return sorted(scores, key=lambda i: scores[i], reverse=True)
 
-    This is the FUSION SEAM: today it returns a single keyword-ranked list. A
-    future semantic layer would compute a second (embedding-ranked) list over
-    the SAME `exchanges` and merge the two by Reciprocal Rank Fusion here —
-    exactly how src/knowledge.py._rrf_fuse combines its keyword and vector
-    lists. The callers below depend only on the ranked output, so dropping that
-    in changes nothing downstream."""
-    scored: list[tuple[int, str, dict]] = []
-    for ex in exchanges:
+
+def _vector_rank(
+    exchanges: list[dict], query: str, keyword_ids: list[int]
+) -> list[int]:
+    """Top exchange indices by cosine similarity to the query, over a BOUNDED
+    candidate set (keyword hits ∪ the most-recent window, capped at _MAX_EMBED)
+    and above _VECTOR_SIM_FLOOR. Returns [] when embeddings are unavailable
+    (→ the caller runs keyword-only) or nothing clears the floor. Never raises."""
+    if not exchanges:
+        return []
+    # Most-recent-by-ts indices (ISO ts strings sort lexicographically).
+    recent = sorted(
+        range(len(exchanges)), key=lambda i: exchanges[i]["ts"], reverse=True
+    )[:_RECENT_VECTOR_WINDOW]
+    # Keyword hits first (keep their order), then the recent window; de-duped,
+    # capped. dict.fromkeys preserves first-seen order.
+    cand = list(dict.fromkeys(list(keyword_ids) + recent))[:_MAX_EMBED]
+    if not cand:
+        return []
+    texts = [f'{exchanges[i]["user"]} {exchanges[i]["assistant"]}' for i in cand]
+    mat = embeddings.embed([query] + texts)  # one batched call; row 0 = query
+    if mat is None or len(mat) != len(texts) + 1:
+        return []
+    try:
+        import numpy as np  # noqa: PLC0415
+        qv = mat[0]
+        sims = mat[1:] @ qv                   # both L2-normalized → cosine
+        out: list[int] = []
+        for j in np.argsort(-sims):
+            if sims[j] < _VECTOR_SIM_FLOOR:
+                break                          # sorted desc — nothing better left
+            out.append(cand[int(j)])
+            if len(out) >= _CANDIDATES:
+                break
+        return out
+    except Exception as exc:  # noqa: BLE001 — degrade to keyword-only
+        print(f"[recall] vector rank failed ({exc})", file=sys.stderr)
+        return []
+
+
+def _rank_exchanges(
+    exchanges: list[dict], terms: list[str], query: str
+) -> list[dict]:
+    """Hybrid rank: a keyword pass fused with a semantic (embedding) pass by
+    RRF. The keyword pass scores each exchange by how many distinct query terms
+    it matches (either side), ranked score-then-recency. The vector pass
+    (_vector_rank) ranks by cosine over a bounded candidate set. When the
+    embedder is unavailable the vector list is empty and this returns the pure
+    keyword ranking — identical to the pre-M78.1 behaviour."""
+    # Keyword pass — index-based so it can fuse with the vector pass.
+    kw_scored: list[tuple[int, str, int]] = []
+    for i, ex in enumerate(exchanges):
         tokens = set(_tokenize(ex["user"])) | set(_tokenize(ex["assistant"]))
         score = sum(1 for term in terms if _term_matches(term, tokens))
         if score > 0:
-            scored.append((score, ex["ts"], ex))
+            kw_scored.append((score, ex["ts"], i))
     # Higher score first; within a score, newer (larger ISO ts) first.
-    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    return [ex for _score, _ts, ex in scored]
+    kw_scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    keyword_ids = [i for _score, _ts, i in kw_scored]
+
+    vector_ids = _vector_rank(exchanges, query, keyword_ids)
+    if not vector_ids:
+        return [exchanges[i] for i in keyword_ids]  # keyword-only fallback
+
+    fused = _rrf_fuse(keyword_ids, vector_ids)
+    return [exchanges[i] for i in fused]
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -325,7 +414,7 @@ def _search(query: str, days_back: int | None, limit: int) -> str:
             f"I don't have any recorded conversations{window} to search, sir."
         )
 
-    ranked = _rank_exchanges(exchanges, terms)
+    ranked = _rank_exchanges(exchanges, terms, query)
     if not ranked:
         window = f" from the last {days_back} days" if days_back else ""
         return (

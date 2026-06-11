@@ -26,7 +26,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np  # noqa: E402
+
 from src import conversation_recall as cr  # noqa: E402
+from src import embeddings as _emb  # noqa: E402
+
+# Force embeddings OFF for the keyword tests below. Real sentence-transformers
+# (if installed) would make ranking slow and nondeterministic; the semantic
+# tests at the bottom swap in a controlled concept-embed via _semantic().
+_emb.embed = lambda texts: None
 
 _passed = 0
 _failed = 0
@@ -280,6 +288,91 @@ with tempfile.TemporaryDirectory() as tmp:
     except Exception:  # noqa: BLE001
         raised = True
     check("never raises even when a session 'file' is unreadable", not raised)
+
+
+# === M78.1 semantic layer =================================================
+# A deterministic concept-embed stub: words mapping to the same concept get
+# identical vectors, so cosine reflects synonymy without the real model. This
+# lets us prove the vector pass catches what keyword misses, and that the
+# similarity floor keeps unrelated chatter out — hermetically.
+_CONCEPTS = {
+    "car": 0, "automobile": 0, "vehicle": 0, "sedan": 0,
+    "dog": 1, "puppy": 1, "canine": 1,
+    "space": 2, "cosmos": 2, "astronomy": 2,
+}
+
+
+def _fake_embed(texts):
+    rows = []
+    for t in texts:
+        v = np.zeros(3, dtype=np.float32)
+        for w in t.lower().split():
+            w = "".join(ch for ch in w if ch.isalnum())
+            if w in _CONCEPTS:
+                v[_CONCEPTS[w]] += 1.0
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v /= n
+        rows.append(v)
+    return np.asarray(rows, dtype=np.float32)
+
+
+@contextmanager
+def _semantic():
+    old = _emb.embed
+    _emb.embed = _fake_embed
+    try:
+        yield
+    finally:
+        _emb.embed = old
+
+
+# --- Test 15: semantic catch — finds a paraphrase keyword structurally misses
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session(base, datetime.now() - timedelta(days=1), [
+        (_iso(1.0), "What did you think of my new automobile?",
+         "A fine automobile, sir."),
+        (_iso(1.1), "Tell me about the dog", "A loyal canine."),
+    ])
+    with _localappdata(tmp), _semantic():
+        out = cr.execute_recall_tool({"query": "vehicle"})
+    # 'vehicle' shares no prefix with 'automobile' (keyword miss), but the
+    # concept-embed makes them identical -> the vector pass surfaces it.
+    check("semantic catch: 'vehicle' finds the 'automobile' exchange",
+          "automobile" in out.lower() and "canine" not in out.lower())
+
+
+# --- Test 16: similarity floor — unrelated recent chatter is NOT surfaced --
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session(base, datetime.now() - timedelta(days=1), [
+        (_iso(1), "Tell me about the dog", "A loyal canine."),
+    ])
+    with _localappdata(tmp), _semantic():
+        out = cr.execute_recall_tool({"query": "automobile"})
+    # query concept 0, only exchange concept 1 -> cosine 0, below the floor;
+    # keyword misses too -> nothing surfaced.
+    check("vector floor keeps a semantically-unrelated exchange out",
+          "couldn't find" in out.lower())
+
+
+# --- Test 17: embeddings unavailable -> clean keyword-only fallback --------
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session(base, datetime.now() - timedelta(days=1), [
+        (_iso(1), "Tell me about robots", "Robots are mechanical."),
+    ])
+    # NB: NOT inside _semantic(), so embeddings.embed is the None-stub.
+    with _localappdata(tmp):
+        out = cr.execute_recall_tool({"query": "robots"})
+    check("embeddings unavailable -> keyword-only still works",
+          "mechanical" in out.lower())
+
+
+# --- Test 18: RRF fusion math — an item in both lists outranks one in either
+check("rrf_fuse: item present in both ranked lists wins",
+      cr._rrf_fuse([5, 1], [5, 2])[0] == 5)
 
 
 # --- summary --------------------------------------------------------------
