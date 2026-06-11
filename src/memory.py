@@ -167,6 +167,7 @@ INCLUDE:
 - The topic and what the user wanted ("asked about", "checked", "discussed", "wanted help with")
 - Names of people, places, films, songs, products, books mentioned
 - Decisions made or recommendations given (e.g. "Jarvis suggested a name for the new pet")
+- Predictions, picks, opinions, or stances Jarvis expressed (e.g. "Jarvis predicted the Spurs would win the Finals in six", "Jarvis thought the metric system was the better choice"). These are durable facts about what was SAID in the conversation — unlike a looked-up value, a stance does not go stale, and future sessions need them to answer "what did you predict?" / "what did you think about X?"
 - That a tool was used, in general terms ("checked the weather in Denver", "looked up NFL scores")
 
 OMIT (these become stale and pollute future memory):
@@ -176,6 +177,8 @@ OMIT (these become stale and pollute future memory):
 - Current standings, rosters, "who is the current X"
 - "Today's" news details (the date the news was current is already in the timestamp)
 - Any exact figure or fact that changes over time
+
+The dividing line between OMIT and INCLUDE is whether the fact is a VALUE that was looked up (omit — it goes stale) or a STANCE Jarvis took (include — what was said never changes). "The Spurs were favored at -194" or "the Knicks won Game 1" are looked-up values → OMIT. "Jarvis predicted the Spurs in six" is Jarvis's own stated pick → INCLUDE.
 
 Mention that the user *asked about* a time-sensitive thing, but never the specific value that was returned. Future sessions need to know the topic was raised, not what the answer was at that moment.
 
