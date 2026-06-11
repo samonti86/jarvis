@@ -50,6 +50,9 @@ from src.diagnostics_collector import (
 )
 from src.file_reader import READ_LOCAL_FILE_TOOL, execute_read_local_file
 from src.games import GAMES_TOOL, execute_games_tool
+from src.conversation_recall import (
+    RECALL_CONVERSATION_TOOL, execute_recall_tool,
+)
 from src.knowledge import (
     KNOWLEDGE_REMEMBER_TOOL, KNOWLEDGE_SEARCH_TOOL,
     execute_knowledge_remember, execute_knowledge_tool,
@@ -136,6 +139,12 @@ Memory of past sessions:
   again is itself a signal they want a current answer, not a memory recall.
 - Don't volunteer the summaries unsolicited — only reference them when relevant to the question.
 - If a memory isn't there, say so plainly. Don't invent or guess at past discussions.
+- For a SPECIFIC detail the summaries above don't capture — what you predicted, what was
+  decided, what you recommended, the exact thing someone said — use the recall_conversation
+  tool. It searches the full VERBATIM transcript of past chats, not just these lossy
+  summaries (which deliberately omit specifics). The staleness rule still applies to what it
+  returns: a recalled time-sensitive VALUE may be out of date, but a recalled stance,
+  prediction, decision, or recommendation is exactly what it's for.
 
 Personal knowledge base (the user's private, curated facts — distinct from memory above):
 - You have a knowledge_search tool over a private store of things the user has personally
@@ -330,6 +339,13 @@ Personal knowledge (your private store — two tools, READ + WRITE):
     reads it back later. For EPHEMERAL "remind me at 5pm" use set_reminder
     (a different store). The episodic memory of THIS conversation is
     separate and automatic — don't write conversational context here.
+14c. recall_conversation — search the full VERBATIM text of PAST conversations
+    (episodic memory — distinct from the curated knowledge_search store above).
+    Use it when the user asks about a specific detail from an earlier chat that
+    your short "Recent conversations" summaries don't contain: "what did you
+    predict for the Finals?", "what did we decide about X?", "what did I say
+    about Y last week?". Optional `days_back` scopes it ("last week" = 7);
+    optional `limit`. See the "Memory of past sessions" routing rules above.
 
 Current news (one tool):
 15. get_news — current headlines by topic from curated reputable RSS feeds
@@ -830,6 +846,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "run_code":                     _ClientTool(execute_code_tool, "code"),
     "knowledge_search":             _ClientTool(execute_knowledge_tool, "knowledge"),
     "knowledge_remember":           _ClientTool(execute_knowledge_remember, "knowledge_write"),
+    "recall_conversation":          _ClientTool(execute_recall_tool, "recall"),
     "get_calendar_events":          _ClientTool(execute_calendar_tool, "calendar"),
     "set_reminder":                 _ClientTool(execute_set_reminder, "reminder_set"),
     "list_reminders":               _ClientTool(execute_list_reminders, "reminder_list"),
@@ -1032,7 +1049,8 @@ def stream_response(
         GAMES_TOOL, GAME_LENGTH_TOOL,
         TMDB_TOOL, GET_PERSON_INFO_TOOL,
         NEWS_TOOL, WOLFRAM_TOOL, CODE_EXEC_TOOL,
-        KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, GET_CALENDAR_TOOL,
+        KNOWLEDGE_SEARCH_TOOL, KNOWLEDGE_REMEMBER_TOOL, RECALL_CONVERSATION_TOOL,
+        GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, GOOD_NIGHT_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
         WHAT_DID_YOU_HEAR_TOOL,

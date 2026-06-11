@@ -136,9 +136,17 @@ class MemoryStore:
 
     # ---------- Retention ----------
 
-    def prune(self, retain_raw_days: int = 30) -> None:
+    def prune(self, retain_raw_days: int = 365) -> None:
         """Delete daily transcript files older than retain_raw_days. Summaries
-        are kept forever (they're tiny). Called from main on startup."""
+        are kept forever (they're tiny). Called from main on startup.
+
+        retain_raw_days <= 0 means KEEP FOREVER — raw transcripts are now the
+        searchable episodic memory behind recall_conversation (C/M78), so the
+        user can opt into unbounded recall depth via RETAIN_RAW_DAYS=0. The
+        default (365) bounds the on-disk privacy surface while still giving a
+        year of recall; text is cheap (a year is a few MB)."""
+        if retain_raw_days <= 0:
+            return  # keep-forever: never prune
         cutoff = datetime.now() - timedelta(days=retain_raw_days)
         try:
             for path in self.sessions_dir.glob("*.jsonl"):

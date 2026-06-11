@@ -81,7 +81,7 @@ def load() -> Config:
         wake_word_threshold=float(os.getenv("WAKE_WORD_THRESHOLD", "0.5")),
         sample_rate=16_000,  # required by both openWakeWord and Whisper
         memory_recall_count=int(os.getenv("MEMORY_RECALL_COUNT", "25")),
-        retain_raw_days=int(os.getenv("RETAIN_RAW_DAYS", "30")),
+        retain_raw_days=int(os.getenv("RETAIN_RAW_DAYS", "365")),
         plex_url=os.getenv("PLEX_URL", "").strip(),
         plex_token=os.getenv("PLEX_TOKEN", "").strip(),
         plex_laptop_host=os.getenv("PLEX_LAPTOP_HOST", "").strip(),
