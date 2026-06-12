@@ -150,6 +150,17 @@ _DEBUG_MIN_SCORE = 0.10  # only log a window whose strongest label clears this
 # Env-tunable per setup.
 _EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.02)
 
+# M81 — armed intrusion-by-voice. While security is ARMED (away), human speech
+# in the house is an anomaly worth a look: the voice_while_armed rule fires the
+# same M72 visual alert (photo + Claude description → Discord) as the sound
+# rules. This is the summed-score threshold for the "Speech"/"Conversation"/
+# "Shout" AudioSet labels; uncertain until live-tuned (the M58/M72 lesson —
+# read JARVIS_ACOUSTIC_DEBUG=1 with someone speaking while armed, then set this
+# to sit above the room's quiet/TV-bleed floor but below clear speech). 0.45 is
+# a starting point. The rule is armed_only (below), so it NEVER fires at home —
+# only away, where a voice should not be there.
+_VOICE_THRESHOLD = _env_float("JARVIS_ACOUSTIC_VOICE_THRESHOLD", 0.45)
+
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
 # uncapped torch inference pins all cores and starves the real-time audio
@@ -196,6 +207,10 @@ class ClassRule:
     experimental: bool = False             # logs "experimental" on activate
     rms_floor: float = 0.0                 # min window RMS to fire (0 = no floor);
                                            # rejects model hallucinations on silence
+    armed_only: bool = False               # M81 — only count windows while
+                                           # security is ARMED (away). For the
+                                           # voice-intrusion rule: speech is
+                                           # normal at home, anomalous away.
 
 
 # The active allowlist — the THREE the user wants while armed (2026-06-03):
@@ -244,6 +259,26 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         push="💥 Glass breaking",
         rms_floor=_EVENT_RMS_FLOOR,
     ),
+    # M81 — armed intrusion-by-voice. ARMED_ONLY: it never counts a window at
+    # home (where talking is normal), only while away — so a voice in the
+    # supposedly-empty house fires the same M72 look-and-push as a glass break.
+    # sustain=2 (~4 s of sustained speech) rejects a one-off blip (a single
+    # notification read aloud, a passing car stereo); the RMS floor rejects
+    # faint TV/adjacent unit bleed and the model's hallucinated speech on near-
+    # silence. cooldown 120 s ⇒ at most one photo every 2 min during a
+    # continuous intrusion. Jarvis's OWN announces/replies are already gated out
+    # of inference by the speech gate (`_is_announcing`), so he can't self-fire
+    # on his reply. experimental: thresholds want a live tune (the M58 lesson).
+    ClassRule(
+        name="voice_while_armed",
+        aliases=("Speech", "Conversation", "Shout"),
+        threshold=_VOICE_THRESHOLD, sustain=2, cooldown_seconds=120.0,
+        speak="Sir — I'm hearing a voice, and the house is armed.",
+        push="🗣 Voice heard while armed — check the snapshot.",
+        rms_floor=_EVENT_RMS_FLOOR,
+        armed_only=True,
+        experimental=True,
+    ),
 )
 
 
@@ -286,6 +321,24 @@ _OTHER_RULES: tuple[ClassRule, ...] = (
         experimental=True,
     ),
 )
+
+
+def _rule_window_passes(rule: ClassRule, score: float, rms: float,
+                        armed: bool) -> bool:
+    """Pure per-window gate for ONE rule: does this window count toward the
+    rule's sustain streak? Applies, in order, the score threshold, the loudness
+    floor (rejects the model's hallucinated high score on near-silence), the
+    running-water volume guard, and (M81) the armed-only gate. No model, no
+    state, no I/O — trivially unit-testable (like _ClassTracker)."""
+    if score < rule.threshold:
+        return False
+    if rule.rms_floor > 0.0 and rms < rule.rms_floor:
+        return False
+    if rule.needs_volume_guard and rms < _RUNNING_WATER_RMS_FLOOR:
+        return False
+    if rule.armed_only and not armed:
+        return False
+    return True
 
 
 # --- Per-class state machine ----------------------------------------------
@@ -427,9 +480,15 @@ class SoundDetector:
         device: int | None = None,
         speaking_event: "threading.Event | None" = None,
         on_visual_alert: "Callable[[str], None] | None" = None,
+        is_armed: "Callable[[], bool] | None" = None,
     ) -> None:
         self._announce = announce
         self._discord = (discord_webhook_url or "").strip()
+        # M81 — armed-state getter (SecurityWatcher.is_armed). An armed_only rule
+        # (voice_while_armed) only counts windows when this returns True. None or
+        # a raising getter ⇒ treated as NOT armed (fail-safe: never fire an
+        # intrusion alert when we can't confirm the house is armed).
+        self._is_armed = is_armed
         # M72 — multimodal alert hook: on a fired event, ALSO look through the
         # camera and push a photo + Claude description to Discord. main.py wires
         # this to a function that's a no-op unless armed (the camera is the
@@ -765,26 +824,24 @@ class SoundDetector:
         # Cheap (one argmax); skips silence and near-quiet so the soundscape
         # reflects real events, not the floor. Never breaks the loop.
         self._record_observation(scores, rms, now)
+        # M81 — armed state, sampled ONCE per window (not per rule). An
+        # armed_only rule (voice_while_armed) only counts a window while armed;
+        # a missing/raising getter ⇒ NOT armed (fail-safe — no intrusion alert
+        # unless we can confirm the house is armed).
+        armed = False
+        if self._is_armed is not None:
+            try:
+                armed = bool(self._is_armed())
+            except Exception as exc:  # noqa: BLE001 — never break the loop
+                print(f"[acoustic] is_armed() raised: {exc}", file=sys.stderr)
         for r in self._resolved:
             # Aggregate score across all of this rule's matched class indices
             # (a logical alert often corresponds to multiple AudioSet labels —
             # e.g. smoke_alarm = "Smoke detector, smoke alarm" + "Fire alarm").
             score = float(sum(scores[i] for i in r.indices))
-            above = score >= r.rule.threshold
-            # Loudness floor (knock/doorbell/glass): reject a window whose
-            # score clears the threshold but is too QUIET to be a real event —
-            # the model hallucinates e.g. "Knock"=0.43 on near-silence (rms
-            # ~0.002). Live data put real events at rms ≥ 0.076, so a 0.03
-            # floor kills the false fires without touching genuine ones.
-            if above and r.rule.rms_floor > 0.0 and rms < r.rule.rms_floor:
-                above = False
-            # Volume guard for running_water. Even if the model says
-            # "running water," refuse to count the window unless the room
-            # is actually loud enough — keeps the pet fountain (a soft
-            # continuous trickle, below the floor) from triggering an alert
-            # the way a sink left on full would.
-            if above and r.rule.needs_volume_guard and rms < _RUNNING_WATER_RMS_FLOOR:
-                above = False
+            # Threshold + loudness floor + running-water volume guard + the
+            # M81 armed-only gate, all in the pure _rule_window_passes helper.
+            above = _rule_window_passes(r.rule, score, rms, armed)
             if r.tracker.observe(above, now):
                 self._fire(r.rule, score, rms)
 

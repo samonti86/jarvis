@@ -2143,6 +2143,9 @@ def main() -> None:
         discord_webhook_url=cfg.discord_webhook_url,
         device=mic_device_index,
         on_visual_alert=_acoustic_visual_alert,
+        # M81 — armed intrusion-by-voice: the voice_while_armed rule only counts
+        # windows while away. Same getter good_night + the visual hook use.
+        is_armed=security_watcher.is_armed,
         # Cooperative speech gate (same Event the SecurityWatcher uses): the
         # PANNs inference loop defers while a proactive announce plays so it
         # can't starve the TTS path. M58 coupled acoustic to armed mode but
