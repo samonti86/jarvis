@@ -379,7 +379,8 @@ class TurnRunner:
     def _finalize_turn(self, *, response_chunks: list[str], interrupted: bool,
                        text: str, language: str,
                        reply_text: "Callable[[str], None] | None",
-                       reply_audio: "Callable[[bytes], None] | None") -> bool:
+                       reply_audio: "Callable[[bytes], None] | None",
+                       speaker: "str | None" = None) -> bool:
         """Assemble the streamed reply, persist + relay it, and (for a phone
         turn) synthesize the reply audio. Returns `interrupted` (the value the
         voice loop uses to decide whether to open a follow-up window). Runs
@@ -409,8 +410,10 @@ class TurnRunner:
         _trim_history(self._history)
         self._last_turn_time = time.time()
 
-        # Persist the completed exchange to today's transcript file.
-        self._memory.record_turn(text, full_response, language)
+        # Persist the completed exchange to today's transcript file. M82 —
+        # tag the user side with the voice-identified speaker so
+        # recall_conversation can answer "what did Alice ask me to do?".
+        self._memory.record_turn(text, full_response, language, speaker=speaker)
 
         self._ui.add_jarvis_text(full_response)
         self._emit_remote_reply(reply_text, full_response)
@@ -754,6 +757,7 @@ class TurnRunner:
                 response_chunks=response_chunks, interrupted=interrupted,
                 text=text, language=language,
                 reply_text=reply_text, reply_audio=reply_audio,
+                speaker=speaker_name,
             )
 
 

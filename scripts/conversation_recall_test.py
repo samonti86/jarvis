@@ -375,6 +375,95 @@ check("rrf_fuse: item present in both ranked lists wins",
       cr._rrf_fuse([5, 1], [5, 2])[0] == 5)
 
 
+# === M82 — speaker-tagged memory ==========================================
+
+# --- Test 19: pure helpers (_speaker_matches / _who_label) -----------------
+check("speaker match: case-insensitive same name",
+      cr._speaker_matches("Alice", "alice") is True)
+check("speaker match: different name -> no",
+      cr._speaker_matches("Saul", "Alice") is False)
+check("speaker match: untagged (None) never matches a filter",
+      cr._speaker_matches(None, "Alice") is False)
+check("speaker match: empty filter passes everything",
+      cr._speaker_matches("Saul", "") is True
+      and cr._speaker_matches(None, "") is True)
+check("who label: known name surfaces the name", cr._who_label("Alice") == "Alice")
+check("who label: None -> 'You'", cr._who_label(None) == "You")
+check("who label: blank -> 'You'", cr._who_label("   ") == "You")
+
+
+# --- Test 20: speaker tag round-trips through record_turn + recall ----------
+# A speaker-aware session writer (the user line carries a "speaker" field, as
+# MemoryStore.record_turn now writes it).
+def _write_session_spk(base, day, rows):
+    """rows = [(ts_iso, speaker_or_None, user, assistant), ...]."""
+    sessions = base / "Jarvis" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"{day:%Y-%m-%d}.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        for ts, spk, user, asst in rows:
+            urec = {"ts": ts, "role": "user", "language": "en", "content": user}
+            if spk:
+                urec["speaker"] = spk
+            f.write(json.dumps(urec) + "\n")
+            f.write(json.dumps({"ts": ts, "role": "assistant",
+                                "content": asst}) + "\n")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session_spk(base, datetime.now(), [
+        (_iso(0.5), "Alice", "remind me to water the plants",
+         "Of course — reminder set."),
+        (_iso(0.4), "Saul", "what's the score of the spurs game",
+         "They won 110 to 104."),
+        (_iso(0.3), "Alice", "add milk to the grocery list",
+         "Added milk."),
+    ])
+    with _localappdata(tmp):
+        # Unfiltered: surfaces BOTH speakers, each labelled by name.
+        allout = cr.execute_recall_tool({"query": "plants milk spurs"})
+        # Filtered to Alice: only her turns, never Saul's.
+        mon = cr.execute_recall_tool({"query": "plants milk spurs",
+                                      "speaker": "Alice"})
+
+check("M82: unfiltered recall labels a Alice turn by name",
+      "Alice asked:" in allout)
+check("M82: speaker filter returns Alice's turns",
+      "plants" in mon.lower() or "milk" in mon.lower())
+check("M82: speaker=Alice EXCLUDES Saul's spurs turn",
+      "spurs" not in mon.lower() and "Saul" not in mon)
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session_spk(base, datetime.now(), [
+        (_iso(0.2), "Alice", "did I leave the oven on", "No, sir."),
+    ])
+    with _localappdata(tmp):
+        lc = cr.execute_recall_tool({"query": "oven", "speaker": "alice"})
+        none_hit = cr.execute_recall_tool({"query": "oven", "speaker": "Bob"})
+check("M82: lowercase 'alice' filter still matches", "oven" in lc.lower())
+check("M82: filter on an unknown speaker -> no turns message",
+      "don't have any recorded turns from Bob" in none_hit)
+
+
+# --- Test 21: MemoryStore.record_turn actually writes the speaker tag -------
+from src.memory import MemoryStore  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    store = MemoryStore(base_dir=Path(tmp))
+    store.record_turn("hola", "buenas", "es", speaker="Bob")
+    store.record_turn("typed message", "ok", "en")  # no speaker
+    day = Path(tmp) / "sessions" / f"{datetime.now():%Y-%m-%d}.jsonl"
+    recs = [json.loads(l) for l in day.read_text(encoding="utf-8").splitlines()]
+    users = [r for r in recs if r.get("role") == "user"]
+check("M82: record_turn tags the user record with the speaker",
+      users[0].get("speaker") == "Bob")
+check("M82: record_turn omits speaker when None (backward-compatible)",
+      "speaker" not in users[1])
+check("M82: assistant records are never speaker-tagged",
+      all("speaker" not in r for r in recs if r.get("role") == "assistant"))
+
+
 # --- summary --------------------------------------------------------------
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)

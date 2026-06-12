@@ -105,8 +105,8 @@ class FakeMemory:
     def recent_summaries(self, n) -> list:
         return list(FakeMemory.summaries_to_return)
 
-    def record_turn(self, text, response, language) -> None:
-        self.turns.append((text, response, language))
+    def record_turn(self, text, response, language, speaker=None) -> None:
+        self.turns.append((text, response, language, speaker))
 
     def append_summary(self, rec) -> None:
         self.sealed.append(rec)
@@ -210,7 +210,8 @@ check("normal turn -> returns False (no barge-in)", ret is False)
 check("normal turn -> history has user+assistant", len(runner._history) == 2)
 check("normal turn -> assistant content assembled from chunks",
       runner._history[1]["content"] == "Hello, sir.")
-check("normal turn -> recorded to memory", runner._memory.turns == [("hi", "Hello, sir.", "en")])
+check("normal turn -> recorded to memory",
+      runner._memory.turns == [("hi", "Hello, sir.", "en", None)])
 check("normal turn -> jarvis text surfaced", ui.jarvis_texts == ["Hello, sir."])
 check("phone_text is silent -> speak_streaming NOT called", _speak_streaming_calls == [])
 check("now has an active conversation", runner.has_active_conversation())
@@ -243,6 +244,9 @@ check("voice turn -> stream_response got speaker_name",
       stream.last_kwargs.get("speaker_name") == "Bob")
 check("voice turn -> stream_response got speaker_lang",
       stream.last_kwargs.get("speaker_lang") == "es")
+# M82: the same speaker must be tagged onto the persisted turn (record_turn).
+check("M82: voice turn -> speaker tagged on the recorded turn",
+      runner._memory.turns == [("hola", "ok", "es", "Bob")])
 
 ui = FakeUI()
 runner = _new_runner(ui)

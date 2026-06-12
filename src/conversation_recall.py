@@ -72,11 +72,15 @@ RECALL_CONVERSATION_TOOL = {
         "values and details on purpose); this tool searches the actual "
         "transcript. It is your EPISODIC memory of past chats — distinct from "
         "knowledge_search (the user's curated facts about their setup) and from "
-        "web_search (public facts). Staleness rule still applies: a recalled "
-        "time-sensitive VALUE (an old score, price, weather) may be out of date "
-        "— but a recalled STANCE, prediction, decision, or recommendation is "
-        "exactly what this tool is for. If it finds nothing, say so plainly — "
-        "don't invent a past conversation."
+        "web_search (public facts). Each past turn is tagged with WHO said it "
+        "(the household member whose voice was recognized), so you can scope a "
+        "search to a specific person via the `speaker` argument — use it when "
+        "the user asks what a NAMED person said or asked ('what did Alice ask "
+        "me to do?', 'what did Alice want?'). Staleness rule still applies: a "
+        "recalled time-sensitive VALUE (an old score, price, weather) may be out "
+        "of date — but a recalled STANCE, prediction, decision, or "
+        "recommendation is exactly what this tool is for. If it finds nothing, "
+        "say so plainly — don't invent a past conversation."
     ),
     "input_schema": {
         "type": "object",
@@ -105,6 +109,16 @@ RECALL_CONVERSATION_TOOL = {
                     "Optional. Max past exchanges to return (default 4, max "
                     "10). Voice replies want few; raise only if the first "
                     "search was too narrow."
+                ),
+            },
+            "speaker": {
+                "type": "string",
+                "description": (
+                    "Optional. Restrict the search to turns spoken by a "
+                    "specific enrolled person, by name (e.g. 'Alice'). Use "
+                    "when the user asks what a NAMED person said or asked. Omit "
+                    "for the user's own history or when no specific person is "
+                    "named — an omitted value searches everyone."
                 ),
             },
         },
@@ -272,6 +286,9 @@ def _collect_exchanges(days_back: int | None) -> list[dict]:
                         pending_user.get("content"), str
                     ) else _flatten_content(pending_user.get("content")),
                     "assistant": content,
+                    # M82 — who spoke this turn (None for old/typed/remote
+                    # records that carry no speaker tag).
+                    "speaker": pending_user.get("speaker"),
                 })
                 pending_user = None
     return exchanges
@@ -377,6 +394,30 @@ def _rank_exchanges(
     return [exchanges[i] for i in fused]
 
 
+def _norm_speaker(name) -> str:
+    """Normalize a speaker name for case-insensitive matching."""
+    return str(name or "").strip().lower()
+
+
+def _speaker_matches(exchange_speaker, wanted: str) -> bool:
+    """M82 — does this exchange's tagged speaker match the wanted name?
+    Case-insensitive. An exchange with NO speaker tag (None — old/typed/remote
+    turns) never matches a specific-speaker filter, so 'what did Alice ask?'
+    returns only turns actually tagged Alice, never untagged ones."""
+    if not wanted:
+        return True  # no filter → everything passes
+    es = _norm_speaker(exchange_speaker)
+    return bool(es) and es == _norm_speaker(wanted)
+
+
+def _who_label(speaker) -> str:
+    """How to introduce the asker in a result line. The tagged name when known
+    (so a recalled Alice turn reads 'Alice asked'), else the neutral 'You'
+    (untagged turns are the user's own typed/remote history)."""
+    name = str(speaker or "").strip()
+    return name if name else "You"
+
+
 def _truncate(text: str, limit: int) -> str:
     """Collapse whitespace for voice and cap length at a word boundary."""
     text = " ".join((text or "").split())
@@ -387,8 +428,10 @@ def _truncate(text: str, limit: int) -> str:
     return (cut[:sp] if sp > limit // 2 else cut) + " …"
 
 
-def _search(query: str, days_back: int | None, limit: int) -> str:
-    """Direct-scan keyword recall. Never raises."""
+def _search(query: str, days_back: int | None, limit: int,
+            speaker: str = "") -> str:
+    """Direct-scan keyword recall. Never raises. `speaker` (M82) optionally
+    restricts the search to exchanges spoken by that enrolled person."""
     sessions = _sessions_dir()
     if not sessions.is_dir():
         return (
@@ -414,11 +457,23 @@ def _search(query: str, days_back: int | None, limit: int) -> str:
             f"I don't have any recorded conversations{window} to search, sir."
         )
 
+    # M82 — speaker filter applied BEFORE ranking, so a per-person query only
+    # ranks (and embeds) that person's turns.
+    if speaker:
+        exchanges = [ex for ex in exchanges
+                     if _speaker_matches(ex.get("speaker"), speaker)]
+        if not exchanges:
+            return (
+                f"I don't have any recorded turns from {speaker} to search, "
+                f"sir."
+            )
+
     ranked = _rank_exchanges(exchanges, terms, query)
     if not ranked:
+        who = f" from {speaker}" if speaker else ""
         window = f" from the last {days_back} days" if days_back else ""
         return (
-            f"I couldn't find anything in our past conversations{window} "
+            f"I couldn't find anything{who} in our past conversations{window} "
             f"about '{query}', sir."
         )
 
@@ -430,9 +485,10 @@ def _search(query: str, days_back: int | None, limit: int) -> str:
     ]
     for ex in hits:
         when = format_relative_time(ex["ts"], now) if ex["ts"] else "earlier"
+        who = _who_label(ex.get("speaker"))
         user = _truncate(ex["user"], _USER_EXCERPT_CHARS)
         asst = _truncate(ex["assistant"], _ASSISTANT_EXCERPT_CHARS)
-        out.append(f'- [{when}] You asked: "{user}" — I replied: "{asst}"')
+        out.append(f'- [{when}] {who} asked: "{user}" — I replied: "{asst}"')
     return "\n".join(out)
 
 
@@ -462,4 +518,6 @@ def execute_recall_tool(params: dict) -> str:
         limit = _DEFAULT_LIMIT
     limit = max(1, min(limit, _MAX_LIMIT))
 
-    return _search(query, days_back, limit)
+    speaker = (params.get("speaker") or "").strip()
+
+    return _search(query, days_back, limit, speaker=speaker)

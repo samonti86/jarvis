@@ -84,18 +84,27 @@ class MemoryStore:
 
     # ---------- Raw turn recording ----------
 
-    def record_turn(self, user_text: str, assistant_text: str, language: str) -> None:
-        """Append both sides of a completed exchange to today's transcripts."""
+    def record_turn(self, user_text: str, assistant_text: str, language: str,
+                    speaker: str | None = None) -> None:
+        """Append both sides of a completed exchange to today's transcripts.
+
+        `speaker` (M82): the voice-identified person who spoke this turn (from
+        M69/M80), tagged onto the USER record so recall_conversation can filter
+        by who said it ("what did Alice ask me to do?"). Omitted when unknown
+        (remote/typed/unrecognized turns) — old records have no speaker field,
+        and a None speaker writes none, so the tag is fully backward-compatible.
+        The assistant side is always Jarvis, so it's never tagged."""
         if not user_text and not assistant_text:
             return
         try:
             ts = datetime.now().isoformat(timespec="seconds")
             path = self.sessions_dir / f"{datetime.now():%Y-%m-%d}.jsonl"
+            user_rec = {"ts": ts, "role": "user", "language": language,
+                        "content": user_text}
+            if speaker:
+                user_rec["speaker"] = speaker
             with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(
-                    {"ts": ts, "role": "user", "language": language, "content": user_text},
-                    ensure_ascii=False,
-                ) + "\n")
+                f.write(json.dumps(user_rec, ensure_ascii=False) + "\n")
                 f.write(json.dumps(
                     {"ts": ts, "role": "assistant", "content": assistant_text},
                     ensure_ascii=False,
