@@ -2092,7 +2092,7 @@ def main() -> None:
         discord_webhook_url=cfg.discord_webhook_url,
     )
     if cfg.homelab_monitor_enabled:
-        homelab_monitor.activate()
+        homelab_monitor.activate(announce=False)  # silent at boot (status pills suffice)
     ui.set_on_homelab_toggle(
         on_activate=homelab_monitor.activate,
         on_deactivate=homelab_monitor.deactivate,

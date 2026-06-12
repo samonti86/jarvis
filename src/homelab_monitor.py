@@ -301,7 +301,7 @@ class HomelabMonitor:
     # Lifecycle.
     # ------------------------------------------------------------------
 
-    def activate(self) -> None:
+    def activate(self, announce: bool = True) -> None:
         """Start the background poll loop. Idempotent. Resets every tracker so
         a re-activation begins from a clean slate, never a stale verdict."""
         if self._active.is_set():
@@ -324,7 +324,12 @@ class HomelabMonitor:
         print(f"[homelab] monitoring activated — checks: {names}, "
               f"poll {_POLL_SECONDS}s, threshold {_FAIL_THRESHOLD}",
               file=sys.stderr)
-        self._safe_announce("I'll keep an eye on the homelab, sir.")
+        # announce=False at startup (the boot path) — the console status pills
+        # already show homelab health, so the spoken "I'll keep an eye…" at every
+        # launch is noise. A MANUAL tray toggle still announces (deliberate user
+        # action wants audible confirmation).
+        if announce:
+            self._safe_announce("I'll keep an eye on the homelab, sir.")
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(
                 target=self._watch_loop, name="HomelabMonitor", daemon=True

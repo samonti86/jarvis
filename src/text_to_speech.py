@@ -80,6 +80,13 @@ def _strip_markdown_for_tts(text: str) -> str:
     text = _MD_INLINE_CODE.sub(r"\1", text)
     text = _MD_HEADER.sub("", text)
     text = _MD_BULLET.sub("", text)
+    # Drop URL noise that sounds terrible spoken — the http(s):// scheme and a
+    # "www." prefix — so TTS reads a site as "espn.com", not "h-t-t-p-s colon
+    # slash slash www dot espn dot com". Scheme first, then www. Only a literal
+    # "www." (followed by a dot) is removed — a bare "www" with no dot is left
+    # alone.
+    text = re.sub(r"https?://", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwww\.", "", text, flags=re.IGNORECASE)
     # Defensive sweep: orphan asterisks/backticks left after sentence-splits
     # inside a bold or code span. Voice context very rarely has legitimate
     # isolated asterisks or backticks.
