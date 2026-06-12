@@ -85,6 +85,10 @@ class JarvisConsole:
         self._state = State.IDLE
         self._anim_start = time.time()
         self._destroyed = False
+        # M84 — the ambient HUD overlay (None until built, if JARVIS_HUD is on).
+        # Initialised here so any early setter call sees the attribute.
+        self._hud = None
+        self._armed_on = False   # mirrored from _apply_armed so the HUD can show it
         # Submit callback receives (text, attachments) where attachments is a
         # list of (filename, content_block) tuples — possibly empty. None means
         # not wired yet.
@@ -391,11 +395,39 @@ class JarvisConsole:
         # delay so winfo_id() is valid). Best-effort; cosmetic.
         self.root.after(80, self._apply_dark_titlebar)
 
+        # M84 — the ambient Iron Man HUD overlay (opt-in via JARVIS_HUD). Built
+        # on this shared root so it rides this mainloop; fully fail-soft (a setup
+        # failure disables it and never touches the console). Deferred slightly so
+        # the root is realized before the overlay reads screen geometry + HWND.
+        try:
+            from src.hud import is_enabled as _hud_enabled  # noqa: PLC0415
+            if _hud_enabled():
+                self.root.after(150, self._build_hud)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[hud] not available: {exc}", file=sys.stderr)
+
     # ------------------------------------------------------------------
     # Public API — all thread-safe (schedule on Tk thread via .after()).
     # ------------------------------------------------------------------
 
+    def _build_hud(self) -> None:
+        """Create the ambient HUD overlay (M84). Runs on the Tk thread via the
+        deferred .after() in __init__. Fail-soft: any error just leaves
+        self._hud None and the console is unaffected."""
+        try:
+            from src.hud import JarvisHUD  # noqa: PLC0415
+            hud = JarvisHUD(self.root)
+            if hud.is_active():
+                hud.set_state(self._state)
+                hud.set_armed(self._armed_on)
+                self._hud = hud
+        except Exception as exc:  # noqa: BLE001
+            print(f"[hud] build failed: {exc}", file=sys.stderr)
+            self._hud = None
+
     def set_state(self, state: State) -> None:
+        if self._hud is not None:
+            self._hud.set_state(state)
         if not self._destroyed:
             self.root.after(0, self._apply_state, state)
 
@@ -425,6 +457,8 @@ class JarvisConsole:
         Called ~30x/s by speak_streaming's envelope ticker thread. Latest
         reading replaces the stored value; _wave_tick handles smoothing +
         decay between updates so bars don't snap."""
+        if self._hud is not None:
+            self._hud.set_amplitude(level)
         if self._destroyed:
             return
         clamped = max(0.0, min(1.0, float(level)))
@@ -446,6 +480,8 @@ class JarvisConsole:
         """Thread-safe: show/hide the '🛡 ARMED' security-mode indicator (M34).
         Called from SecurityWatcher's on_armed_changed callback whenever the
         state flips via voice intent OR the tray toggle."""
+        if self._hud is not None:
+            self._hud.set_armed(bool(on))
         if not self._destroyed:
             self.root.after(0, self._apply_armed, bool(on))
 
@@ -735,6 +771,7 @@ class JarvisConsole:
             pass
 
     def _apply_armed(self, on: bool) -> None:
+        self._armed_on = on
         try:
             if on:
                 self._armed_label.pack(side="left", padx=(8, 0))
