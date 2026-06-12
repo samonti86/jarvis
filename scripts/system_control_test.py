@@ -252,6 +252,84 @@ finally:
     restore()
 
 
+# === M86 — workshop verbs (open_url / focus_window / show_desktop / media) ===
+# These fire real side effects (a browser launch, a key-press, a window move),
+# so the tests either hit VALIDATION/error paths (no fire) or fake the seam —
+# we must NEVER press a real media key or rearrange the user's windows here.
+
+# Schema: the new verbs are in the enum + the description.
+_enum2 = SYSTEM_CONTROL_TOOL["input_schema"]["properties"]["action"]["enum"]
+for _v in ("open_url", "focus_window", "show_desktop", "media"):
+    check(f"enum includes {_v}", _v in _enum2)
+check("description mentions open_url / media",
+      "open_url" in SYSTEM_CONTROL_TOOL["description"]
+      and "media" in SYSTEM_CONTROL_TOOL["description"])
+
+# _normalize_url (pure).
+check("bare domain -> https", sc._normalize_url("espn.com") == "https://espn.com")
+check("http passes through", sc._normalize_url("http://x.com/y") == "http://x.com/y")
+check("no-dot word -> None", sc._normalize_url("hello") is None)
+check("spaces -> None", sc._normalize_url("two words") is None)
+
+# Error paths fire NOTHING.
+check("open_url bad url -> error, no fire",
+      "valid web address" in call("open_url", target="not a url"))
+check("media bad control -> error, no fire",
+      "one of" in call("media", target="frobnicate"))
+check("focus_window empty title -> error, no fire",
+      "required" in call("focus_window", target=""))
+
+# media success — fake ctypes so NO real key is pressed.
+_orig_ctypes = sc.ctypes
+
+
+class _FakeU32:
+    def __init__(self):
+        self.events = []
+
+    def keybd_event(self, vk, scan, flags, extra):
+        self.events.append((vk, flags))
+
+
+class _FakeWindll:
+    def __init__(self, u):
+        self.user32 = u
+
+
+class _FakeCtypes:
+    def __init__(self, u):
+        self.windll = _FakeWindll(u)
+
+
+_u = _FakeU32()
+sc.ctypes = _FakeCtypes(_u)
+try:
+    out = call("media", target="play_pause")
+    # down (flags 0) + up (flags KEYUP=2) of VK_MEDIA_PLAY_PAUSE (0xB3).
+    check("media play_pause -> down+up of VK 0xB3, returns Done",
+          _u.events == [(0xB3, 0), (0xB3, 0x0002)] and "Done" in out)
+    _u.events.clear()
+    out = call("show_desktop")
+    # Win down, D down, D up, Win up.
+    check("show_desktop -> Win+D sequence, returns confirmation",
+          _u.events == [(0x5B, 0), (0x44, 0), (0x44, 0x0002), (0x5B, 0x0002)]
+          and "Cleared" in out)
+finally:
+    sc.ctypes = _orig_ctypes
+
+# open_url success — fake subprocess.Popen so NO real browser launches.
+_orig_popen = sc.subprocess.Popen
+_popen_calls = []
+sc.subprocess.Popen = lambda args, **kw: _popen_calls.append(args)
+try:
+    out = call("open_url", target="espn.com/nba")
+    check("open_url launches the normalized url via cmd start",
+          _popen_calls and _popen_calls[-1] == ["cmd.exe", "/c", "start", "", "https://espn.com/nba"]
+          and "Opened" in out)
+finally:
+    sc.subprocess.Popen = _orig_popen
+
+
 # --- summary --------------------------------------------------------------
 
 print(f"\n{_passed} passed, {_failed} failed")

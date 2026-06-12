@@ -86,7 +86,11 @@ SYSTEM_CONTROL_TOOL = {
     "name": "system_control",
     "description": (
         "Control THIS Windows PC with a fixed allowlist of safe actions: "
-        "open an app, lock the workstation, set or mute system volume, "
+        "open an app, open a web page (open_url — 'pull that up'), bring a "
+        "window to the front (focus_window), minimize everything "
+        "(show_desktop — 'clear my screen'), a media/transport key (media: "
+        "play_pause / next / previous / stop — 'put on music', 'pause', 'skip "
+        "this'), lock the workstation, set or mute system volume, "
         "turn off the display, kill a running process, flush the DNS "
         "resolver cache, restart / stop / start a Windows service, or "
         "cycle the DHCP lease (release + renew). "
@@ -102,7 +106,8 @@ SYSTEM_CONTROL_TOOL = {
         "stop_service, start_service, and "
         "dhcp_cycle additionally require Jarvis to be running as "
         "Administrator — the tool returns a clear error if not, which "
-        "you should relay to the user. Other actions (open_app, lock, "
+        "you should relay to the user. Other actions (open_app, open_url, "
+        "focus_window, show_desktop, media, lock, "
         "volume, screen_off) are low-impact and can run without explicit "
         "confirmation, but always announce what you're about to do."
     ),
@@ -112,7 +117,8 @@ SYSTEM_CONTROL_TOOL = {
             "action": {
                 "type": "string",
                 "enum": [
-                    "open_app", "lock_workstation",
+                    "open_app", "open_url", "focus_window", "show_desktop",
+                    "media", "lock_workstation",
                     "volume_set", "volume_mute", "volume_unmute",
                     "screen_off", "kill_process",
                     "flush_dns", "restart_service", "stop_service",
@@ -124,7 +130,13 @@ SYSTEM_CONTROL_TOOL = {
                 "description": (
                     "For open_app: app name (edge, chrome, firefox, notepad, "
                     "calculator, file explorer, vs code, terminal, task "
-                    "manager, settings, control panel, powershell, cmd). "
+                    "manager, settings, control panel, powershell, cmd, "
+                    "spotify, discord). "
+                    "For open_url: a web address (build a sensible URL, e.g. a "
+                    "team's schedule page or a search). "
+                    "For focus_window: a fragment of the target window's title "
+                    "(e.g. 'chrome', 'code', 'plex'). "
+                    "For media: one of play_pause / next / previous / stop. "
                     "For kill_process: process name ('chrome.exe' or 'chrome'). "
                     "For restart_service / stop_service / start_service: the "
                     "Windows service name as it "
@@ -337,6 +349,115 @@ def _do_screen_off() -> str:
         return "Display turned off."
     except (AttributeError, OSError) as exc:
         return f"Could not turn off display: {exc}"
+
+
+# --- M86 workshop verbs ----------------------------------------------------
+# "Pull that up" / "put on music" / "clear my screen". All low-impact and
+# reversible, like open_app — no confirmation gate. Local-only via the
+# system_control _RESTRICTED_DENY membership (a phone/Discord turn can't reach
+# them). This tool still NEVER closes/kills/deletes — those stay gated above.
+
+# Media/transport virtual-key codes (play_pause/next/previous/stop).
+_MEDIA_VK: dict[str, int] = {
+    "play_pause": 0xB3, "play": 0xB3, "pause": 0xB3,
+    "next": 0xB0, "previous": 0xB1, "prev": 0xB1, "stop": 0xB2,
+}
+
+
+def _normalize_url(url: str) -> "str | None":
+    """Add an https:// scheme if missing; reject a non-URL (a bare word, or a
+    phrase with spaces). Claude is asked to build a real URL."""
+    u = (url or "").strip()
+    if not u or " " in u:
+        return None
+    if not u.startswith(("http://", "https://")):
+        if "." not in u:
+            return None
+        u = "https://" + u
+    return u
+
+
+def _do_open_url(target: str) -> str:
+    url = _normalize_url(target)
+    if not url:
+        return "A valid web address is required for open_url."
+    # Same Windows-native launch as open_app: cmd /c start "" <url> opens the
+    # user's default browser. `url` is normalized + space-free; passed as a
+    # SEPARATE argv element (no shell-string compose), so no injection surface.
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", "start", "", url],
+            shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return f"Opened {url}."
+    except OSError as exc:
+        return f"Could not open {url}: {exc}"
+
+
+def _do_media(target: str) -> str:
+    vk = _MEDIA_VK.get((target or "").lower().strip())
+    if vk is None:
+        return ("media requires control one of play_pause / next / previous / "
+                f"stop (got '{target}').")
+    try:
+        KEYUP = 0x0002
+        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, KEYUP, 0)
+        return "Done."
+    except (AttributeError, OSError) as exc:
+        return f"Could not send the media key: {exc}"
+
+
+def _do_show_desktop() -> str:
+    """Win+D — minimize everything ('clear my screen' / focus mode). Reversible
+    (Win+D again restores)."""
+    try:
+        VK_LWIN, VK_D, KEYUP = 0x5B, 0x44, 0x0002
+        u = ctypes.windll.user32
+        u.keybd_event(VK_LWIN, 0, 0, 0)
+        u.keybd_event(VK_D, 0, 0, 0)
+        u.keybd_event(VK_D, 0, KEYUP, 0)
+        u.keybd_event(VK_LWIN, 0, KEYUP, 0)
+        return "Cleared the screen."
+    except (AttributeError, OSError) as exc:
+        return f"Could not clear the screen: {exc}"
+
+
+def _do_focus_window(target: str) -> str:
+    """Bring the first visible top-level window whose title contains `target`
+    (case-insensitive) to the front. Best-effort — Windows' foreground-lock can
+    refuse SetForegroundWindow from a background process."""
+    if not target:
+        return "A window title fragment is required for focus_window."
+    try:
+        from ctypes import wintypes  # noqa: PLC0415
+        u = ctypes.windll.user32
+        needle = target.lower()
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not u.IsWindowVisible(hwnd):
+                return True
+            n = u.GetWindowTextLengthW(hwnd)
+            if n == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, buf, n + 1)
+            if needle in buf.value.lower():
+                found.append(hwnd)
+                return False
+            return True
+
+        u.EnumWindows(_cb, 0)
+        if not found:
+            return f"No open window matches '{target}'."
+        u.ShowWindow(found[0], 9)            # SW_RESTORE
+        u.SetForegroundWindow(found[0])
+        return f"Brought '{target}' to the front."
+    except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+        return f"Could not focus '{target}': {exc}"
 
 
 def _do_kill_process(target: str, confirmed: bool) -> str:
@@ -661,6 +782,14 @@ def execute_system_control_tool(params: dict) -> str:
     try:
         if action == "open_app":
             return _do_open_app(target)
+        if action == "open_url":
+            return _do_open_url(target)
+        if action == "focus_window":
+            return _do_focus_window(target)
+        if action == "show_desktop":
+            return _do_show_desktop()
+        if action == "media":
+            return _do_media(target)
         if action == "lock_workstation":
             return _do_lock_workstation()
         if action == "volume_set":
