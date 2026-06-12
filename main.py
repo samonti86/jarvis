@@ -551,6 +551,8 @@ class TurnRunner:
         reply_text: "Callable[[str], None] | None" = None,
         reply_image: "Callable[[bytes, str], None] | None" = None,
         session: AudioSession | None = None,
+        speaker_name: "str | None" = None,
+        speaker_lang: "str | None" = None,
     ) -> bool:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
@@ -584,6 +586,13 @@ class TurnRunner:
         pc_shell / collector / plex_action; no file/screen/camera) —
         enforced server-side in stream_response, NOT prompt-only
         ([[feedback-jarvis-least-privilege]], [[feedback-diag-vs-action-split]]).
+
+        `speaker_name` / `speaker_lang` (M80): the voice-identified speaker for
+        this turn (from M69's identify on the captured clip), or None. Only the
+        PC-voice path supplies them; they thread into stream_response as a small
+        uncached system note so Claude knows WHO it's talking to (addresses them
+        by name) and their usual language. Absent ⇒ no speaker block (unchanged
+        behaviour for remote/unrecognized turns).
 
         When attachments is non-empty, the user message becomes a list of
         content blocks (attachments first, then a text block) instead of a
@@ -679,6 +688,8 @@ class TurnRunner:
                     engineer_mode=engineer,
                     restricted=restricted,
                     origin=origin,
+                    speaker_name=speaker_name,
+                    speaker_lang=speaker_lang,
                     interrupt_event=interrupt_event,
                 ):
                     response_chunks.append(chunk)
@@ -1150,13 +1161,24 @@ def listen_loop(
                 # the drop. (The typed/console path is never gated — placed
                 # BEFORE the security + enroll intents so a locked-out voice
                 # can't drive them either.)
+                # M80: the recognized speaker for THIS turn, threaded into the
+                # LLM call so Jarvis addresses them by name + knows their usual
+                # language. Resolved here (cfg is in scope): the primary enrolls
+                # under the "you" sentinel, so map it to cfg.user_name for a
+                # natural display name without re-enrolling the voice. None when
+                # unrecognized or no registry → no speaker block downstream.
+                speaker_name: "str | None" = None
+                speaker_lang: "str | None" = None
                 if transcript.audio is not None:
                     _speakers = speaker_id.load_registry(default_base_dir() / "speakers")
                     if _speakers:
                         _who = speaker_id.identify(
                             transcript.audio, _speakers, cfg.speaker_threshold)
                         if _who.recognized:
-                            print(f"[speaker] recognized {_who.name} "
+                            speaker_name = (cfg.user_name if _who.name == "you"
+                                            else _who.name)
+                            speaker_lang = _who.lang
+                            print(f"[speaker] recognized {speaker_name} "
                                   f"(score={_who.score:.2f})", file=sys.stderr)
                         else:
                             print(f"[speaker] unrecognized voice "
@@ -1269,6 +1291,7 @@ def listen_loop(
                 # cut Jarvis off mid-reply with "Hey Jarvis".
                 interrupted = runner.process_question(
                     transcript.text, transcript.language, session=session,
+                    speaker_name=speaker_name, speaker_lang=speaker_lang,
                 )
                 # M51/M52: open the follow-up window so the next utterance
                 # needs no wake word. A barge-in ALWAYS opens it — the user

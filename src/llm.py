@@ -817,6 +817,35 @@ def build_system_prompt(
     )
 
 
+def _speaker_context_block(name: str, lang: "str | None") -> str:
+    """M80 — a tiny per-turn note telling Claude WHO it is speaking with, from
+    the M69 voice identification. Deliberately kept OUT of the cached system
+    prefix (the caller appends it as a second, un-cache_controlled system block)
+    so a speaker handoff between turns doesn't invalidate the whole prompt cache.
+
+    Identity (the name) is the load-bearing half. The language line is added
+    ONLY for a non-English speaker, and is phrased as a SOFT tie-breaker
+    subordinate to the per-turn detected language — Whisper still owns the
+    actual reply/TTS language; this just nudges a short/ambiguous utterance.
+    Returns '' for an empty name so the caller can skip the block entirely."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    block = (
+        f"You are currently speaking with {name}, identified by voice. "
+        "Address them by name when it feels natural — sparingly, not every line. "
+        "If another enrolled person was speaking a moment ago, this is a handoff: "
+        "respond to {name} now."
+    ).replace("{name}", name)
+    if lang and lang != "en":
+        lang_word = {"es": "Spanish"}.get(lang, lang)
+        block += (
+            f" {name} usually speaks {lang_word}; if a short or ambiguous "
+            f"utterance's language is unclear, lean toward {lang_word}."
+        )
+    return block
+
+
 class _ClientTool(NamedTuple):
     """A built-in client-side tool Jarvis runs locally (vs. the server-side
     web_search / web_fetch that Anthropic executes)."""
@@ -990,6 +1019,8 @@ def stream_response(
     engineer_mode: bool = False,
     restricted: bool = False,
     origin: str = "",
+    speaker_name: "str | None" = None,
+    speaker_lang: "str | None" = None,
     interrupt_event: threading.Event | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
@@ -1043,6 +1074,17 @@ def stream_response(
             "cache_control": {"type": "ephemeral"},
         }
     ]
+    # M80 — per-turn speaker identity (voice path only). Appended as a SECOND
+    # system block WITHOUT cache_control: the large block above keeps its cache
+    # breakpoint and stays a stable cached prefix across turns, while this tiny
+    # note (~20 tokens) is re-read each turn — so a speaker change costs nothing
+    # but a few fresh tokens, never a full-prompt cache miss. Only the PC-voice
+    # path has a mic clip to identify a speaker from, so remote origins never
+    # set this and the block is simply absent for them.
+    if speaker_name:
+        speaker_block = _speaker_context_block(speaker_name, speaker_lang)
+        if speaker_block:
+            system_param.append({"type": "text", "text": speaker_block})
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GET_WEATHER_ALERTS_TOOL,

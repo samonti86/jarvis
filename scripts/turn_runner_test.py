@@ -229,6 +229,32 @@ check("console turn -> stream_response got restricted=False",
       stream.last_kwargs.get("restricted") is False)
 
 
+# --- Test 3b: M80 — speaker identity threads through to stream_response ----
+# The voice path resolves the recognized speaker and passes it in; it must
+# reach stream_response so the per-turn speaker block can be built. Default
+# (no speaker) must be None so remote/unrecognized turns add no block.
+ui = FakeUI()
+runner = _new_runner(ui)
+stream = FakeStream(); stream.chunks = ["ok"]
+main.stream_response = stream
+runner.process_question("hola", "es", origin="voice",
+                        speaker_name="Bob", speaker_lang="es")
+check("voice turn -> stream_response got speaker_name",
+      stream.last_kwargs.get("speaker_name") == "Bob")
+check("voice turn -> stream_response got speaker_lang",
+      stream.last_kwargs.get("speaker_lang") == "es")
+
+ui = FakeUI()
+runner = _new_runner(ui)
+stream = FakeStream(); stream.chunks = ["ok"]
+main.stream_response = stream
+runner.process_question("hi", "en", origin="phone_text")
+check("turn with no speaker -> stream_response speaker_name defaults None",
+      stream.last_kwargs.get("speaker_name") is None)
+check("turn with no speaker -> stream_response speaker_lang defaults None",
+      stream.last_kwargs.get("speaker_lang") is None)
+
+
 # --- Test 4: the speak path (console, unmuted) consumes the stream --------
 ui = FakeUI(); ui.muted = False
 runner = _new_runner(ui)
