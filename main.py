@@ -1757,7 +1757,7 @@ def _register_status(
 
 def _shutdown_subsystems(
     *, security_watcher, homelab_monitor, sound_detector, calendar_monitor,
-    weather_monitor,
+    weather_monitor, anticipation_engine,
     announcer: _Announcer, reminder_stop: threading.Event,
     worker: threading.Thread, plex_client, plex_laptop_client,
 ) -> None:
@@ -1774,6 +1774,8 @@ def _shutdown_subsystems(
     sound_detector.shutdown()
     # M62.2: stop the calendar reminder monitor.
     calendar_monitor.shutdown()
+    # M83: stop the anticipation synthesis loop.
+    anticipation_engine.shutdown()
     # M77: stop the severe-weather alerts monitor.
     weather_monitor.shutdown()
     # M34: stop the Announcer thread (sets stop + wakes its blocked get()).
@@ -2199,6 +2201,58 @@ def main() -> None:
     )
     weather_monitor.activate()  # internally a no-op when not configured / disabled
 
+    # M83 — anticipatory intelligence ("Sir, I've taken the liberty…"). The
+    # SYNTHESIS layer over every single-signal monitor above: a background pass
+    # fuses the live world-state (calendar + weather + alerts + reminders +
+    # homelab + security) and asks Claude, as an extremely-selective chief-of-
+    # staff, whether ONE cross-domain insight is worth surfacing. Tagged 🧠 so it
+    # DEFERS in quiet hours (→ the morning catch-up). Default OFF — it makes a
+    # recurring (small) LLM call, so it's opt-in via JARVIS_ANTICIPATION=1.
+    from src.anticipation import AnticipationEngine, is_enabled as _anticip_enabled
+    from src import briefing as _brief
+    from src.weather_alerts import execute_weather_alerts_tool as _wx_alerts
+
+    def _anticipation_snapshot() -> dict:
+        """Compose the live world-state for the engine — each section fail-soft
+        (a hiccup just drops that section). Reuses the briefing gatherers so the
+        weather/reminders/calendar wording stays consistent across surfaces."""
+        def _safe(fn):
+            try:
+                v = fn()
+                return v.strip() if isinstance(v, str) else v
+            except Exception as exc:  # noqa: BLE001 — a section must never break the tick
+                print(f"[anticipation] snapshot section failed: {exc}", file=sys.stderr)
+                return None
+        snap: dict = {
+            "Calendar": _safe(_brief._calendar_section),
+            "Weather": _safe(_brief._weather_section),
+            "Reminders": _safe(_brief._reminders_section),
+        }
+        alerts = _safe(lambda: _wx_alerts({}))
+        if alerts and "no active" not in alerts.lower() and "isn't configured" not in alerts.lower():
+            snap["Weather alerts"] = alerts
+        if homelab_monitor.is_active():
+            snap["Homelab"] = _safe(homelab_monitor.status_report)
+        try:
+            snap["Security"] = ("Armed — Saul is away from home"
+                                if security_watcher.is_armed()
+                                else "Disarmed — home")
+        except Exception:  # noqa: BLE001
+            pass
+        return snap
+
+    anticipation_engine = AnticipationEngine(
+        announce=lambda t: _announce(t, label="🧠"),
+        snapshot_fn=_anticipation_snapshot,
+        api_key=cfg.anthropic_api_key,
+        model=cfg.claude_model,
+    )
+    if _anticip_enabled():
+        anticipation_engine.activate()
+    from src.self_status import register as _ss_anticip_reg
+    _ss_anticip_reg("Anticipation",
+                    lambda: "active" if anticipation_engine.is_active() else "off")
+
     # M63 — "good night" wrap. Wire the security-state getter so the
     # composition tool can report current armed/standing-down state without
     # needing security_watcher threaded through stream_response. Same
@@ -2285,6 +2339,7 @@ def main() -> None:
         sound_detector=sound_detector,
         calendar_monitor=calendar_monitor,
         weather_monitor=weather_monitor,
+        anticipation_engine=anticipation_engine,
         announcer=_ann,
         reminder_stop=reminder_stop,
         worker=worker,

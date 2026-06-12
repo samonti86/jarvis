@@ -47,7 +47,12 @@ from src.memory import format_relative_time
 
 # Routine status-monitoring labels that DEFER during quiet hours. Everything
 # else pierces (the safe default). Inverted on purpose: silence is opt-in.
-_DEFERRABLE_LABELS: frozenset[str] = frozenset({"🖥"})
+#   🖥 — homelab status monitoring (M79)
+#   🧠 — anticipatory-intelligence insights (M83): valuable but rarely so urgent
+#        they can't wait for the morning "while you were away" catch-up; truly
+#        urgent single-signal events (a severe storm) have their own piercing
+#        monitor, so anticipation can defer cleanly.
+_DEFERRABLE_LABELS: frozenset[str] = frozenset({"🖥", "🧠"})
 
 # Deferred announces older than this when the briefing reads them are dropped as
 # stale (an overnight item is a few hours old by morning; a multi-day-old one is
