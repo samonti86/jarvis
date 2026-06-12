@@ -123,6 +123,11 @@ Language:
 - When replying in Spanish, use the formal usted form, and Mexican conventions (not Castilian).
 - Match the cultural register: dry-witty British butler in English; formal, courteous gentleman in Spanish.
 
+Tone awareness:
+- You may receive a "Vocal delivery" note describing HOW the user sounded this turn — volume, pace, pauses — separate from his words. It appears only when his delivery is notable; most turns have none, which is normal.
+- Use it to calibrate your MANNER, not to diagnose him aloud. If he sounds tired or subdued, be gentler, warmer, and more concise — a brief, natural check-in ("Long day, sir?") is welcome but only if it fits; never force it. If he sounds rushed, be fast and to the point. If he's animated, match the energy.
+- Never robotically restate his mood ("You sound tired") turn after turn, and never make him feel analyzed or watched. The cue shapes your tone; it is not something to announce.
+
 Conversation:
 - You may receive prior turns of the current conversation. Treat them as ongoing context —
   the user can reference earlier exchanges with pronouns or follow-ups ("and what about Madrid?").
@@ -1021,6 +1026,7 @@ def stream_response(
     origin: str = "",
     speaker_name: "str | None" = None,
     speaker_lang: "str | None" = None,
+    vocal_cue: "str | None" = None,
     interrupt_event: threading.Event | None = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
@@ -1074,17 +1080,26 @@ def stream_response(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    # M80 — per-turn speaker identity (voice path only). Appended as a SECOND
-    # system block WITHOUT cache_control: the large block above keeps its cache
-    # breakpoint and stays a stable cached prefix across turns, while this tiny
-    # note (~20 tokens) is re-read each turn — so a speaker change costs nothing
-    # but a few fresh tokens, never a full-prompt cache miss. Only the PC-voice
-    # path has a mic clip to identify a speaker from, so remote origins never
-    # set this and the block is simply absent for them.
+    # M80 + M85 — per-turn context (speaker identity + vocal-delivery cue),
+    # appended as a SECOND system block WITHOUT cache_control: the large block
+    # above keeps its cache breakpoint and stays a stable cached prefix across
+    # turns, while this small note varies per turn (a speaker handoff / a tone
+    # cue) and is re-read each turn — a few fresh tokens, never a full-prompt
+    # cache miss. Both come from the PC-voice mic clip, so remote origins set
+    # neither and the block is simply absent for them. Combined so a turn adds
+    # at most ONE extra block.
+    _per_turn: list[str] = []
     if speaker_name:
-        speaker_block = _speaker_context_block(speaker_name, speaker_lang)
-        if speaker_block:
-            system_param.append({"type": "text", "text": speaker_block})
+        _blk = _speaker_context_block(speaker_name, speaker_lang)
+        if _blk:
+            _per_turn.append(_blk)
+    if vocal_cue:
+        _per_turn.append(
+            "Vocal delivery this turn — how he SOUNDED, not stated in his words: "
+            f"{vocal_cue}. Use it ONLY to calibrate your manner (see Tone awareness)."
+        )
+    if _per_turn:
+        system_param.append({"type": "text", "text": "\n\n".join(_per_turn)})
     tools = [
         WEB_SEARCH_TOOL, WEB_FETCH_TOOL,
         SPORTS_TOOL, WEATHER_TOOL, GET_WEATHER_ALERTS_TOOL,

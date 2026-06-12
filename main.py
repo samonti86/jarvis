@@ -556,6 +556,7 @@ class TurnRunner:
         session: AudioSession | None = None,
         speaker_name: "str | None" = None,
         speaker_lang: "str | None" = None,
+        vocal_cue: "str | None" = None,
     ) -> bool:
         """Run one full turn: reset/idle checks, LLM stream, TTS, persist.
 
@@ -693,6 +694,7 @@ class TurnRunner:
                     origin=origin,
                     speaker_name=speaker_name,
                     speaker_lang=speaker_lang,
+                    vocal_cue=vocal_cue,
                     interrupt_event=interrupt_event,
                 ):
                     response_chunks.append(chunk)
@@ -794,6 +796,12 @@ def listen_loop(
     # instance (its lock keeps them from overlapping). See the TurnRunner class.
     runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client,
                         pc_speaking, announce_speaking)
+
+    # M85 — tonal awareness. One analyzer per session; it holds a rolling
+    # loudness baseline so "softer/louder than usual" is judged against the
+    # user's own voice. Only the voice path feeds it (it needs the audio clip).
+    from src.voice_tone import ToneAnalyzer, is_enabled as _tone_enabled
+    tone_analyzer = ToneAnalyzer() if _tone_enabled() else None
 
     # Text-submission queue. Tk's submit handler puts (text, attachments)
     # tuples here; the text_input_loop worker pops them and calls
@@ -1173,6 +1181,15 @@ def listen_loop(
                 # unrecognized or no registry → no speaker block downstream.
                 speaker_name: "str | None" = None
                 speaker_lang: "str | None" = None
+                # M85: a short vocal-delivery cue (how he sounded — volume/pace/
+                # pauses) from the SAME clip, threaded into the LLM call so Claude
+                # can calibrate its tone. None on most turns (only notable
+                # delivery produces a cue) and whenever tone awareness is off.
+                vocal_cue: "str | None" = None
+                if tone_analyzer is not None and transcript.audio is not None:
+                    vocal_cue = tone_analyzer.analyze(transcript.audio, transcript.text)
+                    if vocal_cue:
+                        print(f"[tone] {vocal_cue}", file=sys.stderr)
                 if transcript.audio is not None:
                     _speakers = speaker_id.load_registry(default_base_dir() / "speakers")
                     if _speakers:
@@ -1296,6 +1313,7 @@ def listen_loop(
                 interrupted = runner.process_question(
                     transcript.text, transcript.language, session=session,
                     speaker_name=speaker_name, speaker_lang=speaker_lang,
+                    vocal_cue=vocal_cue,
                 )
                 # M51/M52: open the follow-up window so the next utterance
                 # needs no wake word. A barge-in ALWAYS opens it — the user
