@@ -154,12 +154,26 @@ _EVENT_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_RMS_FLOOR", 0.02)
 # in the house is an anomaly worth a look: the voice_while_armed rule fires the
 # same M72 visual alert (photo + Claude description → Discord) as the sound
 # rules. This is the summed-score threshold for the "Speech"/"Conversation"/
-# "Shout" AudioSet labels; uncertain until live-tuned (the M58/M72 lesson —
-# read JARVIS_ACOUSTIC_DEBUG=1 with someone speaking while armed, then set this
-# to sit above the room's quiet/TV-bleed floor but below clear speech). 0.45 is
-# a starting point. The rule is armed_only (below), so it NEVER fires at home —
-# only away, where a voice should not be there.
-_VOICE_THRESHOLD = _env_float("JARVIS_ACOUSTIC_VOICE_THRESHOLD", 0.45)
+# "Shout" AudioSet labels. Raised 0.45 → 0.60 (2026-06-15) after a live armed
+# session false-fired repeatedly on adjacent unit/hallway voices bleeding through
+# the walls — but note the SCORE is the weak lever here: that bleed IS genuine
+# speech, so it scores high (0.65–1.15 in the log); raising this further barely
+# helps. The real discriminator is loudness — see _VOICE_RMS_FLOOR below.
+_VOICE_THRESHOLD = _env_float("JARVIS_ACOUSTIC_VOICE_THRESHOLD", 0.60)
+
+# Loudness floor SPECIFIC to the voice rule — the through-the-wall discriminator.
+# A voice in the room is physically louder than a adjacent unit's voice through a
+# wall or down the hallway. Live data (2026-06-15, armed, space empty, no TV)
+# showed adjacent unit/hallway bleed firing at rms 0.020–0.044 — right on top of the
+# shared transient-event floor (_EVENT_RMS_FLOOR=0.02, tuned for the doorbell at
+# 0.033). The voice rule needs its OWN, higher floor sitting ABOVE that bleed
+# ceiling: 0.06 rejects the observed bleed with margin, while a person actually
+# standing in the room talking near the omni boundary mic clears it easily. If a
+# real in-room voice is ever missed while armed, lower this (calibrate with
+# JARVIS_ACOUSTIC_DEBUG=1 — speak in the room while armed and read the real rms).
+# A missed fire only costs a photo, not a deterrent, so we bias slightly toward
+# fewer false pings. Generalises the running-water volume guard to the voice rule.
+_VOICE_RMS_FLOOR = _env_float("JARVIS_ACOUSTIC_VOICE_RMS_FLOOR", 0.06)
 
 # Cap torch's intra-op thread pool for PANNs inference. Same rationale as the
 # armed watcher's JARVIS_YOLO_THREADS cap (2026-05-19 stutter post-mortem): an
@@ -275,7 +289,9 @@ _DEFAULT_RULES: tuple[ClassRule, ...] = (
         threshold=_VOICE_THRESHOLD, sustain=2, cooldown_seconds=120.0,
         speak="Sir — I'm hearing a voice, and the house is armed.",
         push="🗣 Voice heard while armed — check the snapshot.",
-        rms_floor=_EVENT_RMS_FLOOR,
+        # Its OWN loudness floor (above the adjacent unit-bleed ceiling), NOT the
+        # shared transient-event floor — see _VOICE_RMS_FLOOR.
+        rms_floor=_VOICE_RMS_FLOOR,
         armed_only=True,
         experimental=True,
     ),
