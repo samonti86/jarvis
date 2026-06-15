@@ -16,6 +16,7 @@ pyttsx3>=2.90         # fallback: offline Windows SAPI
 sounddevice>=0.4.6
 numpy>=1.24
 miniaudio>=1.59     # MP3 decoder (edge-tts returns mp3) — pure pip, no ffmpeg needed
+pyaec>=1.0.1        # M88 Phase 2 — SpeexDSP acoustic echo canceller (prebuilt native DLL, Windows py3.12); cancels Jarvis's own playback from the mic so hands-free barge-in can VAD on the user. De-risked via scripts/aec_spike.py (19 dB pure-AEC ERLE, user preserved). WebRTC APM sdist would not build on Windows.
 
 # System tray icon
 pystray>=0.19.5
