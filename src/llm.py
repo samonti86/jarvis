@@ -1018,6 +1018,32 @@ def _execute_client_tool(
         return f"Tool error: {exc}"
 
 
+def stream_translation(
+    *, api_key: str, text: str, target_lang: str,
+    model: str = "claude-sonnet-4-6",
+) -> Iterator[str]:
+    """M87 — interpreter mode: stream a faithful translation of `text` into
+    `target_lang`. Deliberately MINIMAL and isolated from stream_response's
+    agentic machinery: a tiny translate-only system prompt, no tools, no
+    conversation history, no persona, no caching. That keeps interpreter
+    latency low and means a translation can never trip the full tool loop or
+    leak the Jarvis persona into the relay. Yields text chunks so the caller
+    can pipe them straight into speak_streaming (TTS starts on the first
+    sentence). Raises on a transport error — the caller (TurnRunner.interpret)
+    swallows it so the interpreter loop keeps going."""
+    from src.interpreter import build_translation_prompt  # noqa: PLC0415
+
+    client = anthropic.Anthropic(api_key=api_key)
+    with client.messages.stream(
+        model=model,
+        max_tokens=1024,  # ample for one spoken utterance
+        system=build_translation_prompt(target_lang),
+        messages=[{"role": "user", "content": text}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            yield chunk
+
+
 def stream_response(
     api_key: str,
     messages: list[dict],

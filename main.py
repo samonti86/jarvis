@@ -45,7 +45,7 @@ from typing import Callable, NamedTuple
 
 from src.audio import AudioSession, resolve_input_device
 from src.config import Config, load
-from src.llm import TelemetryRecord, stream_response
+from src.llm import TelemetryRecord, stream_response, stream_translation
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
 from src.plex_laptop import DEFAULT_LOG_PATH as DEFAULT_PLEX_LAPTOP_LOG, PlexLaptopClient
 from src.plex_mcp import PlexMCPClient
@@ -183,6 +183,13 @@ def _seal_session(
 # Long enough to gather a follow-up thought, short enough to bound the
 # no-wake-word false-capture window (ambient speech / TV).
 _FOLLOWUP_WINDOW_SEC = 12.0
+
+# M87 — interpreter mode. While interpreting, the listen loop waits this long
+# for the next person to start speaking before re-arming (no wake word ever).
+# Longer than the follow-up window: two people taking turns through an
+# interpreter pause naturally, and on elapse we simply re-listen (still in
+# interpreter mode), so this is just the silence cadence, not a timeout.
+_INTERPRETER_WINDOW_SEC = 30.0
 
 # M51 — conversation sign-offs. When the user's turn ENDS with one of these,
 # the follow-up window is NOT opened — an explicit "that's all" should close
@@ -762,6 +769,71 @@ class TurnRunner:
                 speaker=speaker_name,
             )
 
+    def interpret(self, text: str, language: str) -> None:
+        """M87 — one interpreter-mode turn: translate `text` (spoken in
+        `language`) into the OTHER language of the configured pair and speak it
+        in that language's voice. A faithful relay — NO history, memory, tools,
+        persona, or barge-in (it's not a conversation). Holds the speech gates
+        for the spoken portion exactly like a normal turn (so the omni-mic
+        doesn't self-capture the translation and the armed CPU loops defer).
+        Fail-soft: a translation/TTS error logs and is swallowed so the
+        interpreter loop keeps running. Runs under self._lock so a typed turn
+        can't overlap its audio."""
+        from src import interpreter as _interp  # noqa: PLC0415
+        target = _interp.other_language(language)
+        self._ui.add_user_text(text, language)
+        print(f"\n[interpret {language}->{target}] {text}", file=sys.stderr)
+
+        chunks: list[str] = []
+
+        def translation_stream():
+            for chunk in stream_translation(
+                api_key=self._cfg.anthropic_api_key,
+                text=text, target_lang=target,
+                model=self._cfg.claude_model,
+            ):
+                chunks.append(chunk)
+                yield chunk
+
+        with self._lock:
+            self._pc_speaking.set()
+            self._announce_speaking.set()
+            try:
+                speak_streaming(
+                    translation_stream(),
+                    language=target,
+                    on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
+                    on_amplitude=self._ui.set_amplitude,
+                )
+            except Exception as exc:  # noqa: BLE001 — never break the interpreter loop
+                print(f"[interpret] failed: {exc}", file=sys.stderr)
+            finally:
+                self._pc_speaking.clear()
+                self._announce_speaking.clear()
+
+        translation = "".join(chunks).strip()
+        if translation:
+            self._ui.add_jarvis_text(translation)
+
+    def speak_line(self, text: str, language: str = "en") -> None:
+        """Speak a fixed line aloud on the calling (audio-owning) thread,
+        holding the speech gates so the mic doesn't self-capture it and the
+        armed CPU loops defer. Used for interpreter mode's start/stop
+        confirmations. Runs under self._lock so it can't overlap a turn's audio.
+        Fail-soft."""
+        self._ui.add_jarvis_text(text)
+        with self._lock:
+            self._pc_speaking.set()
+            self._announce_speaking.set()
+            try:
+                self._ui.set_state(State.SPEAKING)
+                speak(text, language=language)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[main] speak_line failed: {exc}", file=sys.stderr)
+            finally:
+                self._pc_speaking.clear()
+                self._announce_speaking.clear()
+
 
 def listen_loop(
     cfg: Config,
@@ -1068,6 +1140,12 @@ def listen_loop(
             # question. We must NOT drain it (draining is correct after a
             # normal wake word, where the user pauses) — see below.
             barged = False
+            # M87: interpreter mode. When set, the loop skips the wake word and
+            # runs a continuous capture→translate→speak cycle (handled in the
+            # dedicated branch at the top of the loop) until "stop interpreting".
+            # A local Event — activation/exit both happen inside this loop, so
+            # nothing outside needs a handle (a tray toggle is a clean follow-on).
+            interpreter_mode = threading.Event()
             while not ui.shutdown.is_set():
                 # M52: skip the drain on the post-barge-in iteration so the
                 # already-spoken follow-up survives into capture; otherwise
@@ -1086,6 +1164,55 @@ def listen_loop(
                 # to the wake-word path below, which handles the reset.
                 if followup and reset_event.is_set():
                     followup = False
+
+                # M87 — interpreter mode: a self-contained continuous loop that
+                # supersedes the normal wake-word/follow-up path entirely. It
+                # listens with NO wake word, translates whatever it hears, speaks
+                # it in the other language's voice, and re-listens — until the
+                # user says "stop interpreting". Kept as a separate branch (a
+                # full capture cycle that `continue`s) so the normal hot path
+                # below is untouched. Self-speech is already gated out of capture
+                # by `pc_speaking` (set by interpret()), so the mic won't
+                # transcribe Jarvis's own translation.
+                if interpreter_mode.is_set():
+                    followup = False  # interpreter supersedes the follow-up window
+                    ui.set_state(State.LISTENING)
+                    try:
+                        transcript = transcribe_after_wake(
+                            session,
+                            model_name=cfg.whisper_model,
+                            on_speech_ended=lambda: ui.set_state(State.THINKING),
+                            on_amplitude=ui.set_amplitude,
+                            server_url=cfg.stt_server_url,
+                            backend=cfg.stt_backend,
+                            max_pre_speech_sec=_INTERPRETER_WINDOW_SEC,
+                            suppress_event=pc_speaking,
+                        )
+                    except Exception as exc:
+                        print(f"[main] interpreter STT failed: {exc}",
+                              file=sys.stderr)
+                        continue
+                    if ui.shutdown.is_set():
+                        break
+                    if not transcript.text:
+                        # Window elapsed with no speech — stay in interpreter
+                        # mode and keep listening (this is the silence cadence,
+                        # not an exit).
+                        ui.set_state(State.IDLE)
+                        continue
+                    from src import interpreter as _interp  # noqa: PLC0415
+                    if _interp.is_stop_intent(transcript.text):
+                        ui.add_user_text(transcript.text, transcript.language)
+                        interpreter_mode.clear()
+                        print("[interpreter] mode OFF (voice)", file=sys.stderr)
+                        runner.speak_line(_interp.STOP_CONFIRM_EN, "en")
+                        if "es" in _interp.LANG_PAIR:
+                            runner.speak_line(_interp.STOP_CONFIRM_ES, "es")
+                        ui.set_state(State.IDLE)
+                        continue
+                    runner.interpret(transcript.text, transcript.language)
+                    ui.set_state(State.IDLE)
+                    continue
 
                 if followup:
                     # Follow-up window: skip the wake word, capture (below)
@@ -1285,6 +1412,25 @@ def listen_loop(
                         ui.set_state(State.IDLE)
                         followup = False
                         continue
+
+                # M87 — interpreter-mode activation ("Jarvis, be my
+                # interpreter"). Checked among the intents (after security /
+                # enroll / knowledge so those win first) and BEFORE the LLM turn
+                # so the request isn't answered conversationally. Engages the
+                # continuous loop handled at the top of this loop; the start
+                # confirmation is spoken in both languages so the other party
+                # hears it too.
+                from src import interpreter as _interp_start  # noqa: PLC0415
+                if _interp_start.is_start_intent(transcript.text):
+                    ui.add_user_text(transcript.text, transcript.language)
+                    interpreter_mode.set()
+                    print("[interpreter] mode ON (voice)", file=sys.stderr)
+                    runner.speak_line(_interp_start.START_CONFIRM_EN, "en")
+                    if "es" in _interp_start.LANG_PAIR:
+                        runner.speak_line(_interp_start.START_CONFIRM_ES, "es")
+                    ui.set_state(State.IDLE)
+                    followup = False
+                    continue
 
                 # 2026-06-02: a FOLLOW-UP utterance that is a pure sign-off
                 # ("thank you, that is all") must not run a full LLM turn. With
