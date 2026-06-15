@@ -191,6 +191,15 @@ _FOLLOWUP_WINDOW_SEC = 12.0
 # interpreter mode), so this is just the silence cadence, not a timeout.
 _INTERPRETER_WINDOW_SEC = 30.0
 
+# M88 — conversation mode (full-duplex, Phase 1). While in conversation mode the
+# loop listens hands-free with this pre-speech window; on silence it re-arms
+# (stays in the mode) rather than dropping to the wake word — UNTIL this many
+# consecutive empty windows elapse, at which point it auto-exits to standby (so
+# Jarvis isn't left listening to an empty room indefinitely). 25s × 3 ≈ 75s of
+# silence before auto-exit.
+_CONVERSATION_WINDOW_SEC = 25.0
+_CONVERSATION_IDLE_EXITS = 3
+
 # M51 — conversation sign-offs. When the user's turn ENDS with one of these,
 # the follow-up window is NOT opened — an explicit "that's all" should close
 # the conversation cleanly, not leave the mic listening for 12s. Matched by
@@ -1146,6 +1155,11 @@ def listen_loop(
             # A local Event — activation/exit both happen inside this loop, so
             # nothing outside needs a handle (a tray toggle is a clean follow-on).
             interpreter_mode = threading.Event()
+            # M88: conversation mode — persistent hands-free Q&A (no wake word
+            # between turns). Local Event like interpreter_mode; idle_empties
+            # counts consecutive silent windows toward the auto-exit-to-standby.
+            conversation_mode = threading.Event()
+            idle_empties = 0
             while not ui.shutdown.is_set():
                 # M52: skip the drain on the post-barge-in iteration so the
                 # already-spoken follow-up survives into capture; otherwise
@@ -1161,9 +1175,14 @@ def listen_loop(
                     session.drain()
 
                 # M51: a queued reset cancels any open follow-up window — drop
-                # to the wake-word path below, which handles the reset.
-                if followup and reset_event.is_set():
+                # to the wake-word path below, which handles the reset. M88: a
+                # reset also exits conversation mode (a clean-slate request means
+                # back to standby).
+                if (followup or conversation_mode.is_set()) and reset_event.is_set():
                     followup = False
+                    if conversation_mode.is_set():
+                        conversation_mode.clear()
+                        print("[conversation] mode OFF (reset)", file=sys.stderr)
 
                 # M87 — interpreter mode: a self-contained continuous loop that
                 # supersedes the normal wake-word/follow-up path entirely. It
@@ -1214,11 +1233,12 @@ def listen_loop(
                     ui.set_state(State.IDLE)
                     continue
 
-                if followup:
-                    # Follow-up window: skip the wake word, capture (below)
-                    # directly with a longer pre-speech timeout. The blue
-                    # LISTENING pill is the visual cue; if the user says
-                    # nothing, the window simply elapses.
+                if followup or conversation_mode.is_set():
+                    # Follow-up window (M51) OR conversation mode (M88): skip the
+                    # wake word, capture (below) directly with a longer pre-speech
+                    # timeout. The blue LISTENING pill is the visual cue; if the
+                    # user says nothing, a follow-up window elapses to wake-word
+                    # mode while conversation mode re-arms (until the idle cap).
                     ui.set_state(State.LISTENING)
                 else:
                     ui.set_state(State.IDLE)
@@ -1260,10 +1280,13 @@ def listen_loop(
                         # Auto-fallback by default.
                         server_url=cfg.stt_server_url,
                         backend=cfg.stt_backend,
-                        # M51: a follow-up turn waits longer for the user to
-                        # start; the normal post-wake path uses the default.
+                        # M51/M88: a follow-up turn waits longer for the user to
+                        # start; conversation mode waits longer still (it re-arms
+                        # on silence rather than exiting); the normal post-wake
+                        # path uses the default.
                         max_pre_speech_sec=(
-                            _FOLLOWUP_WINDOW_SEC if followup else None
+                            _CONVERSATION_WINDOW_SEC if conversation_mode.is_set()
+                            else _FOLLOWUP_WINDOW_SEC if followup else None
                         ),
                         # 2026-05-29 omni-mic echo fix: abort + discard the
                         # capture if the PC starts speaking (a console-turn
@@ -1278,6 +1301,21 @@ def listen_loop(
                     continue
 
                 if not transcript.text:
+                    # M88: in conversation mode, silence re-arms (stay hands-free)
+                    # until enough consecutive empty windows accumulate, then
+                    # auto-exit to standby so we're not listening to an empty
+                    # room forever. Silent exit (no spoken note — the user has
+                    # likely stepped away).
+                    if conversation_mode.is_set():
+                        idle_empties += 1
+                        if idle_empties >= _CONVERSATION_IDLE_EXITS:
+                            print("[conversation] idle — mode OFF, back to wake "
+                                  "word\n", file=sys.stderr)
+                            conversation_mode.clear()
+                            followup = False
+                            idle_empties = 0
+                            ui.set_state(State.IDLE)
+                        continue
                     # M51: no speech. In a follow-up window that just means
                     # the window elapsed — fall back to wake-word mode.
                     if followup:
@@ -1287,6 +1325,9 @@ def listen_loop(
                     else:
                         print("[main] (no speech captured)\n")
                     continue
+
+                # M88: heard something — reset the conversation-mode idle counter.
+                idle_empties = 0
 
                 # M69: identify the speaker on the SAME audio STT just captured.
                 # Active only when at least one voice is enrolled. The per-turn
@@ -1432,6 +1473,36 @@ def listen_loop(
                     followup = False
                     continue
 
+                # M88 — conversation-mode toggle. If active, an explicit "exit
+                # conversation" leaves the mode (natural sign-offs are handled by
+                # the dismissal block below, which also exits it). If inactive,
+                # "let's talk" enters it. Checked here among the intents (after
+                # security/enroll/knowledge) and BEFORE the LLM turn so the
+                # request isn't answered conversationally.
+                from src import conversation_mode as _convo  # noqa: PLC0415
+                if conversation_mode.is_set():
+                    if _convo.is_stop_intent(transcript.text):
+                        ui.add_user_text(transcript.text, transcript.language)
+                        conversation_mode.clear()
+                        followup = False
+                        print("[conversation] mode OFF (voice)", file=sys.stderr)
+                        runner.speak_line(
+                            _convo.stop_confirmation(transcript.language),
+                            transcript.language)
+                        ui.set_state(State.IDLE)
+                        continue
+                elif _convo.is_start_intent(transcript.text):
+                    ui.add_user_text(transcript.text, transcript.language)
+                    conversation_mode.set()
+                    followup = True
+                    idle_empties = 0
+                    print("[conversation] mode ON (voice)", file=sys.stderr)
+                    runner.speak_line(
+                        _convo.start_confirmation(transcript.language),
+                        transcript.language)
+                    ui.set_state(State.IDLE)
+                    continue
+
                 # 2026-06-02: a FOLLOW-UP utterance that is a pure sign-off
                 # ("thank you, that is all") must not run a full LLM turn. With
                 # a freshly-set reminder still in context, Claude re-issued
@@ -1444,10 +1515,22 @@ def listen_loop(
                 # summoned him. Closes cleanly and silently: _announce isn't on
                 # this thread (so no gate-safe spoken reply here), and a quiet
                 # close after "that's all" is the expected sign-off behaviour.
-                if followup and _is_dismissal(transcript.text):
+                # M88: in conversation mode every turn is hands-free, so a
+                # natural sign-off here ("that's all", "goodbye") both closes the
+                # turn AND exits the mode — with a brief spoken acknowledgement
+                # (unlike the silent follow-up close, since the user explicitly
+                # ended a back-and-forth).
+                if (followup or conversation_mode.is_set()) and _is_dismissal(transcript.text):
                     ui.add_user_text(transcript.text, transcript.language)
-                    print("[main] follow-up sign-off — closing without an "
-                          "LLM turn\n", file=sys.stderr)
+                    print("[main] sign-off — closing without an LLM turn\n",
+                          file=sys.stderr)
+                    if conversation_mode.is_set():
+                        conversation_mode.clear()
+                        from src import conversation_mode as _convo_exit  # noqa: PLC0415
+                        print("[conversation] mode OFF (sign-off)", file=sys.stderr)
+                        runner.speak_line(
+                            _convo_exit.stop_confirmation(transcript.language),
+                            transcript.language)
                     ui.set_state(State.IDLE)
                     followup = False
                     continue
