@@ -78,9 +78,9 @@ class JarvisConsole:
 
         self.root = ctk.CTk()
         self.root.title("Jarvis")
-        self.root.geometry("560x800")
+        self.root.geometry("600x820")
         self.root.configure(fg_color=self.BG)
-        self.root.minsize(480, 660)
+        self.root.minsize(520, 680)
 
         self._state = State.IDLE
         self._anim_start = time.time()
@@ -334,7 +334,7 @@ class JarvisConsole:
         self._input = ctk.CTkEntry(
             self._entry_row,
             placeholder_text="type to Jarvis…  (Enter to send)",
-            font=("Consolas", 13),
+            font=("Consolas", 14),
             fg_color=self.PANEL_BG,
             text_color=self.USER_FG,
             border_width=1,
@@ -358,23 +358,42 @@ class JarvisConsole:
 
         self._transcript = ctk.CTkTextbox(
             transcript_frame,
-            font=("Consolas", 13),
+            font=("Consolas", 15),
             fg_color=self.PANEL_BG,
             text_color=self.USER_FG,
             wrap="word",
             corner_radius=6,
             border_width=0,
         )
-        self._transcript.pack(padx=12, pady=12, fill="both", expand=True)
+        self._transcript.pack(padx=14, pady=14, fill="both", expand=True)
 
         # Tag-color the underlying tk.Text widget. CTkTextbox doesn't proxy
         # tag_configure, so we reach into ._textbox — that attribute has been
         # stable since customtkinter 5.x.
+        #
+        # Readability layout (2026-06-15): each turn is a dim "HH:MM  SPEAKER"
+        # header line followed by the message body, indented (lmargin) and given
+        # breathing room (spacing3) so turns are scannable instead of a wall of
+        # one-line entries. Body bumped to 15pt; speaker labels are bold + colour-
+        # coded (you = soft white, jarvis = cyan) so the eye can find each turn.
         tb = self._transcript._textbox
         tb.tag_configure("dim", foreground=self.DIM_FG)
-        tb.tag_configure("user", foreground=self.USER_FG)
-        tb.tag_configure("jarvis", foreground=self.JARVIS_FG)
-        tb.tag_configure("system", foreground=self.DIM_FG)
+        tb.tag_configure("time", foreground=self.DIM_FG, font=("Consolas", 11),
+                         spacing1=12)
+        tb.tag_configure("you_label", foreground="#e6edf5",
+                         font=("Consolas", 12, "bold"))
+        tb.tag_configure("jarvis_label", foreground=self.ACCENT,
+                         font=("Consolas", 12, "bold"))
+        tb.tag_configure("user", foreground=self.USER_FG,
+                         lmargin1=18, lmargin2=18, spacing1=3, spacing3=6)
+        tb.tag_configure("jarvis", foreground=self.JARVIS_FG,
+                         lmargin1=18, lmargin2=18, spacing1=3, spacing3=6)
+        tb.tag_configure("system", foreground=self.DIM_FG,
+                         lmargin1=18, lmargin2=18, spacing1=6, spacing3=6)
+        # Dim metadata (telemetry chips, thumbnail labels) — indented to align
+        # under the message body above it.
+        tb.tag_configure("meta", foreground=self.DIM_FG,
+                         lmargin1=18, lmargin2=18)
         self._transcript.configure(state="disabled")
 
         # Initial empty-state hint
@@ -860,9 +879,9 @@ class JarvisConsole:
         try:
             self._transcript.configure(state="normal")
             tb = self._transcript._textbox
-            # Indent matches the timestamp prefix width so the chip lines up
-            # under "you:" / "jarvis:" labels visually.
-            tb.insert("end", "\n        " + text, "dim")
+            # Indented (meta tag's lmargin) to align under the response body
+            # above it; trailing newline so the next turn's header spacing is clean.
+            tb.insert("end", text + "\n", "meta")
             tb.see("end")
             self._transcript.configure(state="disabled")
         except tk.TclError:
@@ -1034,14 +1053,17 @@ class JarvisConsole:
         try:
             self._transcript.configure(state="normal")
             tb = self._transcript._textbox
-            tb.insert("end", f"\n[{ts}] ", "dim")
+            # Header line: dim timestamp + bold colour-coded speaker (the "time"
+            # tag's spacing1 separates this turn from the one above). Body on the
+            # next line, indented via the user/jarvis tags' lmargin.
+            tb.insert("end", f"{ts}  ", "time")
             if who == "you":
-                label = "you" + (f" ({language})" if language and language != "en" else "")
-                tb.insert("end", f"{label}: ", "dim")
-                tb.insert("end", text, "user")
+                label = "YOU" + (f"  ·  {language}" if language and language != "en" else "")
+                tb.insert("end", label + "\n", "you_label")
+                tb.insert("end", text + "\n", "user")
             else:
-                tb.insert("end", "jarvis: ", "dim")
-                tb.insert("end", text, "jarvis")
+                tb.insert("end", "JARVIS\n", "jarvis_label")
+                tb.insert("end", text + "\n", "jarvis")
             tb.see("end")
             self._transcript.configure(state="disabled")
         except tk.TclError:
