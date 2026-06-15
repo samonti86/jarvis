@@ -86,59 +86,73 @@ def main() -> None:
 
     print("\n>>> STAY SILENT for ~8 s while the test signal plays. <<<\n")
     try:
+        # latency='low' to shrink the play/capture buffering (the bulk delay we
+        # then compensate). Falls back to default if the backend refuses.
         rec = sd.playrec(far_play, samplerate=SR, channels=1,
-                         device=(device, None), dtype="float32")
+                         device=(device, None), dtype="float32", latency="low")
         sd.wait()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[probe] playrec failed: {exc}", file=sys.stderr)
-        print("  (try a specific output device, or check the mic index)")
-        sys.exit(1)
+    except Exception:
+        try:
+            rec = sd.playrec(far_play, samplerate=SR, channels=1,
+                             device=(device, None), dtype="float32")
+            sd.wait()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[probe] playrec failed: {exc}", file=sys.stderr)
+            print("  (try a specific output device, or check the mic index)")
+            sys.exit(1)
 
     mic = rec[:, 0].astype(np.float64) * 32768.0     # back to int16 scale
 
-    delay = _estimate_delay(mic, far, max_lag=int(0.30 * SR))
+    delay = _estimate_delay(mic, far, max_lag=int(0.50 * SR))
     print(f"  estimated play->capture delay: {delay} samples "
           f"({1000 * delay / SR:.0f} ms)")
 
-    # Feed pyaec the captured pair (preprocess=False — the barge-in config). The
-    # adaptive filter absorbs delay < filter_len, so we feed far un-shifted (as
-    # the real-time path would) and let it adapt.
-    far_i = np.clip(far, -32768, 32767).astype(np.int16)
-    mic_i = np.clip(mic, -32768, 32767).astype(np.int16)
-    aec = pyaec.Aec(FRAME, FILTER_LEN, SR, False)
-    out = np.zeros(n, dtype=np.float64)
-    for i in range(0, n - FRAME, FRAME):
+    # The 264 ms first-pass delay was almost all SYSTEM BUFFERING, not acoustics
+    # — and it exceeded the filter window, so the echo fell outside the filter's
+    # reach and nothing cancelled. The REAL integration compensates for this
+    # known delay by feeding the far-end reference time-aligned to the mic. We
+    # do the same here: drop the first `delay` mic samples so far[i] lines up
+    # with the echo it produced, leaving only the residual (acoustic + reverb +
+    # jitter) for the adaptive filter — which is what filter_len is actually for.
+    mic_a = mic[delay:]
+    far_a = far[: len(mic_a)]
+    m = min(len(mic_a), len(far_a))
+    far_i = np.clip(far_a[:m], -32768, 32767).astype(np.int16)
+    mic_i = np.clip(mic_a[:m], -32768, 32767).astype(np.int16)
+
+    aec = pyaec.Aec(FRAME, FILTER_LEN, SR, False)  # preprocess=False (barge config)
+    out = np.zeros(m, dtype=np.float64)
+    for i in range(0, m - FRAME, FRAME):
         cleaned = aec.cancel_echo(mic_i[i:i + FRAME], far_i[i:i + FRAME])
         out[i:i + FRAME] = np.asarray(cleaned, dtype=np.float64)
 
     # ERLE over the converged tail (skip ~2 s for adaptation), user-silent so
     # all mic energy is echo.
-    seg = slice(int(2.0 * SR), n - FRAME)
+    seg = slice(int(2.0 * SR), m - FRAME)
     erle = 10 * np.log10(
-        (np.mean(mic[seg] ** 2) + 1e-9) / (np.mean(out[seg] ** 2) + 1e-9))
-    echo_rms = float(np.sqrt(np.mean(mic[seg] ** 2)))
+        (np.mean(mic_a[seg] ** 2) + 1e-9) / (np.mean(out[seg] ** 2) + 1e-9))
+    echo_rms = float(np.sqrt(np.mean(mic_a[seg] ** 2)))
     res_rms = float(np.sqrt(np.mean(out[seg] ** 2)))
 
-    print(f"\n  real-room ERLE (pure AEC):   {erle:5.1f} dB")
+    print(f"\n  DELAY-ALIGNED real-room ERLE (pure AEC): {erle:5.1f} dB")
     print(f"  echo RMS -> residual RMS:    {echo_rms:.0f} -> {res_rms:.0f} (int16 scale)")
 
     print("\n=== VERDICT ===")
-    if delay >= FILTER_LEN:
-        print(f"  DELAY TOO LONG ({1000*delay/SR:.0f} ms > "
-              f"{1000*FILTER_LEN/SR:.0f} ms filter). The AEC can't bridge it as-is"
-              " — raise filter_len, or the play/capture buffering needs trimming.")
     if erle >= 12:
-        print(f"  STRONG. {erle:.0f} dB real-room cancellation — build hands-free "
-              "talk-over on pyaec with confidence.")
+        print(f"  STRONG. {erle:.0f} dB after delay alignment — AEC works in this "
+              "room. The integration just needs to compensate the ~"
+              f"{1000*delay/SR:.0f} ms play->capture delay (measure once, pre-delay"
+              " the far-end reference). Build hands-free talk-over on pyaec.")
     elif erle >= 6:
-        print(f"  MARGINAL. {erle:.0f} dB real-room — buildable, but the barge VAD "
-              "needs a conservative threshold on the cleaned signal to avoid "
-              "false interrupts; expect live tuning.")
+        print(f"  MARGINAL. {erle:.0f} dB after alignment — buildable, but the barge"
+              " VAD needs a conservative threshold; expect live tuning. The delay "
+              f"(~{1000*delay/SR:.0f} ms) is compensable.")
     else:
-        print(f"  WEAK. Only {erle:.0f} dB in this real room (nonlinearity/drift "
-              "the synthetic test didn't have). pyaec alone won't carry reliable "
-              "talk-over here — a headset removes the echo at the source and "
-              "makes it trivial; otherwise this is a heavier-AEC problem.")
+        print(f"  WEAK. Only {erle:.0f} dB even after delay alignment — the room "
+              "echo is nonlinear / drifting beyond what this AEC models. pyaec "
+              "alone won't carry reliable talk-over here. The clean answer is a "
+              "headset (kills echo at the source → barge-in becomes trivial); "
+              "otherwise it's a heavier-AEC problem not worth the complexity.")
 
 
 if __name__ == "__main__":
