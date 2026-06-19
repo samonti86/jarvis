@@ -157,11 +157,16 @@ class DuplexBargePlayer:
     refused → start() returns False. TTS is resampled to 16k for this path."""
 
     def __init__(self, mic_device: "int | None", interrupt_event: threading.Event,
-                 *, on_first_audio=None, on_amplitude=None) -> None:
+                 *, on_first_audio=None, on_amplitude=None, on_barge=None) -> None:
         self._device = mic_device
         self._interrupt = interrupt_event
         self._on_first_audio = on_first_audio
         self._on_amplitude = on_amplitude
+        # Fired (once) the instant a barge-in is DETECTED, so the UI can flip to
+        # LISTENING immediately — before the ~0.5-1s stream teardown completes,
+        # which otherwise leaves the orb lingering on SPEAKING after the cut.
+        self._on_barge = on_barge
+        self._barged = False
         # Playback queue (turn thread → callback): int16 16k arrays; None = end.
         self._pcm_q: "queue.Queue" = queue.Queue()
         self._cur = np.zeros(0, dtype=np.int16)
@@ -243,6 +248,13 @@ class DuplexBargePlayer:
             print(f"[barge-aec] BARGE-IN — user spoke over Jarvis (cleaned RMS "
                   f"{rms:.0f} > {THRESHOLD:.0f})", file=sys.stderr)
             self._interrupt.set()
+            if not self._barged:           # flip the UI to LISTENING at once
+                self._barged = True
+                if self._on_barge is not None:
+                    try:
+                        self._on_barge()
+                    except Exception:  # noqa: BLE001 — UI callback must not break audio
+                        pass
         if self._on_amplitude is not None:
             amp = min(1.0, float(np.sqrt(np.mean(np.square(out.astype(np.float64))))) / 8000.0)
             try:

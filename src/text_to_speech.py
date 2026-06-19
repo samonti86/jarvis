@@ -116,7 +116,7 @@ def speak(text: str, language: str = "en") -> None:
 
 
 def _play_via_duplex_aec(device, audio_q, interrupt_event, interrupted,
-                         on_first_audio, on_amplitude, t_prod, t_synth,
+                         on_first_audio, on_amplitude, on_barge, t_prod, t_synth,
                          producer_errors) -> bool:
     """M88 Phase 2 playback path. Feeds the synthesized reply (resampled to 16k)
     through a DuplexBargePlayer that cancels Jarvis's own echo + detects the user
@@ -127,7 +127,7 @@ def _play_via_duplex_aec(device, audio_q, interrupt_event, interrupted,
 
     player = aec_barge.DuplexBargePlayer(
         device, interrupt_event,
-        on_first_audio=on_first_audio, on_amplitude=on_amplitude,
+        on_first_audio=on_first_audio, on_amplitude=on_amplitude, on_barge=on_barge,
     )
     if not player.start():
         return False  # fail-soft → caller plays normally
@@ -176,6 +176,7 @@ def speak_streaming(
     on_amplitude: Callable[[float], None] | None = None,
     interrupt_event: "threading.Event | None" = None,
     aec_barge_device: "int | None" = None,
+    on_barge: Callable[[], None] | None = None,
 ) -> None:
     """Tier B: pipelined synth+playback as text chunks arrive from the LLM stream.
 
@@ -293,7 +294,7 @@ def speak_streaming(
     # the unchanged sd.play path below.
     if aec_barge_device is not None and _play_via_duplex_aec(
         aec_barge_device, audio_q, interrupt_event, _interrupted,
-        on_first_audio, on_amplitude, t_prod, t_synth, producer_errors,
+        on_first_audio, on_amplitude, on_barge, t_prod, t_synth, producer_errors,
     ):
         return
 

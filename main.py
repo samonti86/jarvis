@@ -527,6 +527,10 @@ class TurnRunner:
                     on_amplitude=self._ui.set_amplitude,
                     interrupt_event=interrupt_event,
                     aec_barge_device=(self._mic_device if aec_barge else None),
+                    # M88 Phase 2: on a hands-free cut, flip the orb to LISTENING
+                    # the instant we detect — not after the stream teardown — so
+                    # it doesn't linger on SPEAKING.
+                    on_barge=lambda: self._ui.set_state(State.LISTENING),
                 )
         except Exception as exc:
             self._history.pop()  # keep history alternating user/assistant cleanly
