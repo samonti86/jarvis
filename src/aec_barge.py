@@ -9,34 +9,39 @@ real-room cancellation leaving the user ~3.7x above the residual echo — a fixe
 threshold of ~1187 (int16 RMS) separates them (silent: 0 false fires; talk: fires
 every time).
 
-Pieces:
-  - FarEndBuffer  — what Jarvis is playing, wall-clock-stamped + resampled to the
-                    mic rate, so the canceller can pull the far-end DELAY-ALIGNED
-                    to each mic frame (the alignment is the whole ballgame —
-                    feeding an unaligned reference cancels nothing).
-  - BargeDetector — pure energy-gate VAD on the cleaned signal (windowed RMS +
-                    sustain). Unit-tested.
-  - AecBargeMonitor — the thread: read mic → pull aligned far-end → pyaec cancel
-                    → detect → set interrupt_event (the SAME M52 contract; it
-                    NEVER touches the audio API — speak_streaming does the cut on
-                    the stream-owning thread, the WASAPI thread-affinity rule).
+The alignment lesson (live-proven): the AEC needs SAMPLE-ACCURATE far↔mic
+alignment. Aligning two independent streams by Python wall-clock FAILED (jittery
+buffer latencies smear the reference → the adaptive filter never converges). The
+fix is a SINGLE DUPLEX stream — play + capture in one callback, one clock — so
+far and mic are sample-locked with a fixed offset. Validated live: silent 0 /
+talk 30.
 
-Drivable two ways: standalone (scripts/aec_barge_live.py, for live tuning) and
-in-Jarvis (TurnRunner wires session.read + a far-end sink on speak_streaming).
-Fully fail-soft — if pyaec is missing or anything raises, the monitor disables
-itself and the turn completes normally (worst case: no barge that turn).
+Pieces:
+  - BargeDetector     — pure energy-gate VAD on the cleaned signal (windowed RMS
+                        + sustain). Unit-tested.
+  - DuplexBargePlayer — plays Jarvis's TTS (resampled to 16k) through ONE duplex
+                        sd.Stream whose callback cancels the echo (pyaec, the
+                        far-end delayed by the stream's fixed offset) and detects
+                        a barge-in → sets interrupt_event. speak_streaming drives
+                        its lifecycle and closes the stream (WASAPI thread-
+                        affinity: the owner thread does the cut, not the callback).
+
+Fully fail-soft — if pyaec is missing or the duplex stream won't open (e.g. a
+second mic client is refused), start() returns False and the caller plays
+normally (no barge that turn). Opt-in via JARVIS_HANDS_FREE_BARGE (default off).
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import time
 from collections import deque
-from typing import Callable
 
 import numpy as np
+import sounddevice as sd
 
 SAMPLE_RATE = 16_000
 FRAME = 256                  # pyaec frame (16 ms) — must match Aec(frame_size)
@@ -115,8 +120,9 @@ class BargeDetector:
 
 def _resample_to_16k(samples: np.ndarray, sr: int) -> np.ndarray:
     """Mono int16 @ `sr` → mono int16 @ 16k via linear interpolation. Good
-    enough for an AEC reference (the adaptive filter models whatever it's fed;
-    minor resample artifacts are immaterial). Stereo → channel mean."""
+    enough for both playback and an AEC reference on the barge path (slight
+    quality dip vs the 24k native, accepted to reuse the validated 16k AEC
+    tuning). Stereo → channel mean."""
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
     samples = samples.astype(np.float64)
@@ -130,138 +136,178 @@ def _resample_to_16k(samples: np.ndarray, sr: int) -> np.ndarray:
     return np.interp(xq, xp, samples).astype(np.int16)
 
 
-class FarEndBuffer:
-    """Thread-safe record of what Jarvis is playing, resampled to 16k and
-    wall-clock-stamped, so the canceller can pull the far-end frame whose echo
-    is arriving at a given mic-capture time. Old segments are pruned."""
+class DuplexBargePlayer:
+    """Plays 16k PCM through ONE duplex sd.Stream while cancelling Jarvis's echo
+    from the mic (pyaec) and detecting a hands-free barge-in on the cleaned
+    signal — all in the stream callback, ONE clock (the sample-accurate
+    alignment the AEC needs). On a barge-in it sets interrupt_event; the OWNING
+    thread (speak_streaming) closes the stream (the callback only ever stops the
+    stream on a NATURAL end, via CallbackStop).
 
-    def __init__(self, retain_sec: float = 3.0) -> None:
-        self._segments: deque[tuple[float, np.ndarray]] = deque()
-        self._retain = retain_sec
-        self._lock = threading.Lock()
+    Lifecycle, driven by speak_streaming's playback consumer (the turn thread):
+        p = DuplexBargePlayer(mic_device, interrupt_event, ...)
+        if not p.start():       # fail-soft → caller plays normally instead
+            <plain sd.play path>
+        for (samples, sr) in audio:   p.feed(_resample_to_16k(samples, sr))
+        p.done_feeding()
+        p.wait(interrupt_event)       # blocks until drained or barge-in
+        p.close()
 
-    def push(self, samples: np.ndarray, sr: int, start_time: float) -> None:
-        """Record a played segment: `samples` begins playing at `start_time`
-        (monotonic). Called by speak_streaming right before sd.play."""
-        far = _resample_to_16k(np.asarray(samples), sr)
-        if far.size == 0:
-            return
-        with self._lock:
-            self._segments.append((start_time, far))
-            cutoff = start_time - self._retain
-            while self._segments and (
-                    self._segments[0][0] + len(self._segments[0][1]) / SAMPLE_RATE) < cutoff:
-                self._segments.popleft()
+    Fail-soft everywhere: pyaec missing / stream won't open / a second mic client
+    refused → start() returns False. TTS is resampled to 16k for this path."""
 
-    def clear(self) -> None:
-        with self._lock:
-            self._segments.clear()
+    def __init__(self, mic_device: "int | None", interrupt_event: threading.Event,
+                 *, on_first_audio=None, on_amplitude=None) -> None:
+        self._device = mic_device
+        self._interrupt = interrupt_event
+        self._on_first_audio = on_first_audio
+        self._on_amplitude = on_amplitude
+        # Playback queue (turn thread → callback): int16 16k arrays; None = end.
+        self._pcm_q: "queue.Queue" = queue.Queue()
+        self._cur = np.zeros(0, dtype=np.int16)
+        self._cur_pos = 0
+        self._saw_end = False        # the None sentinel was pulled
+        self._first = True
+        self._done = threading.Event()
+        self._stream: "sd.Stream | None" = None
+        self._aec = None
+        self._detector = BargeDetector()
+        self._delay_frames = max(0, round(DELAY_MS / 1000.0 * SAMPLE_RATE / FRAME))
+        self._far_hist: "deque[np.ndarray]" = deque(maxlen=self._delay_frames + 1)
+        self._tail_silent = 0        # silent frames since end → flush then stop
 
-    def frame_at(self, t_capture: float, n: int, delay_s: float) -> np.ndarray:
-        """The far-end frame (length `n`, int16 @16k) whose echo is arriving at
-        `t_capture`. The echo heard now was played `delay_s` ago, so we read the
-        far timeline at t_emit = t_capture - delay_s. Gaps between sentences →
-        silence (no echo expected there). Vectorized per segment."""
-        t_emit = t_capture - delay_s
-        out = np.zeros(n, dtype=np.int16)
-        with self._lock:
-            segs = list(self._segments)
-        for t0, arr in segs:
-            seg_end = t0 + len(arr) / SAMPLE_RATE
-            jlo = max(0, int(np.ceil((t0 - t_emit) * SAMPLE_RATE)))
-            jhi = min(n, int((seg_end - t_emit) * SAMPLE_RATE))
-            if jhi <= jlo:
-                continue
-            base = round((t_emit - t0) * SAMPLE_RATE)
-            aidx = base + np.arange(jlo, jhi)
-            valid = (aidx >= 0) & (aidx < len(arr))
-            j = np.arange(jlo, jhi)[valid]
-            out[j] = arr[aidx[valid]]
+    # ----- feeding (turn thread) -----
+    def feed(self, samples16k: np.ndarray) -> None:
+        if samples16k is not None and len(samples16k):
+            self._pcm_q.put(np.asarray(samples16k, dtype=np.int16))
+
+    def done_feeding(self) -> None:
+        self._pcm_q.put(None)
+
+    # ----- output assembly (pure; testable without a stream) -----
+    def _next_out(self, frames: int) -> np.ndarray:
+        """Pull `frames` int16 from the playback queue across array boundaries;
+        underrun or pre-end-of-feed gaps → trailing silence. Sets _saw_end when
+        the None sentinel surfaces."""
+        out = np.zeros(frames, dtype=np.int16)
+        filled = 0
+        while filled < frames:
+            if self._cur_pos >= len(self._cur):
+                try:
+                    item = self._pcm_q.get_nowait()
+                except queue.Empty:
+                    break  # underrun → rest is silence
+                if item is None:
+                    self._saw_end = True
+                    break
+                self._cur = item
+                self._cur_pos = 0
+                if len(self._cur) == 0:
+                    continue
+            take = min(frames - filled, len(self._cur) - self._cur_pos)
+            out[filled:filled + take] = self._cur[self._cur_pos:self._cur_pos + take]
+            self._cur_pos += take
+            filled += take
         return out
 
+    def _has_pending(self) -> bool:
+        return (self._cur_pos < len(self._cur)) or (not self._pcm_q.empty())
 
-class AecBargeMonitor:
-    """Hands-free barge-in monitor. Runs on its own thread for a TTS reply:
-    reads mic chunks, cancels Jarvis's echo (pyaec + the delay-aligned far-end),
-    and on sustained user speech in the CLEANED signal sets `interrupt_event` —
-    and nothing else (speak_streaming performs the sd.stop cut on the stream's
-    owning thread; the M52/WASAPI thread-affinity contract).
+    # ----- the duplex callback (PortAudio thread) -----
+    def _callback(self, indata, outdata, frames, _time, status) -> None:  # noqa: ANN001
+        if status:
+            print(f"[barge-aec] stream status: {status}", file=sys.stderr)
+        out = self._next_out(frames)
+        outdata[:, 0] = out
+        if self._first and out.any():
+            self._first = False
+            if self._on_first_audio is not None:
+                try:
+                    self._on_first_audio()
+                except Exception:  # noqa: BLE001 — UI callback must not break audio
+                    pass
+        # Far reference delayed by the stream's fixed in+out offset (jitter-free
+        # in a single duplex stream — the whole reason this works).
+        self._far_hist.append(out.copy())
+        if len(self._far_hist) > self._delay_frames and len(self._far_hist[0]) == frames:
+            far_ref = self._far_hist[0]
+        else:
+            far_ref = np.zeros(frames, dtype=np.int16)
+        mic = indata[:, 0].astype(np.int16)
+        try:
+            cleaned = np.asarray(self._aec.cancel_echo(mic, far_ref), dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            cleaned = mic.astype(np.float64)
+        rms = float(np.sqrt(np.mean(np.square(cleaned)))) if cleaned.size else 0.0
+        if self._detector.push_frame(rms):
+            print(f"[barge-aec] BARGE-IN — user spoke over Jarvis (cleaned RMS "
+                  f"{rms:.0f} > {THRESHOLD:.0f})", file=sys.stderr)
+            self._interrupt.set()
+        if self._on_amplitude is not None:
+            amp = min(1.0, float(np.sqrt(np.mean(np.square(out.astype(np.float64))))) / 8000.0)
+            try:
+                self._on_amplitude(amp)
+            except Exception:  # noqa: BLE001
+                pass
+        # Natural end: end sentinel pulled, nothing pending, output gone silent
+        # and the far history has flushed → stop the stream on its own thread.
+        if self._saw_end and not self._has_pending():
+            if not out.any():
+                self._tail_silent += 1
+                if self._tail_silent >= self._delay_frames + 2:
+                    self._done.set()
+                    raise sd.CallbackStop
+            else:
+                self._tail_silent = 0
 
-    `mic_read()` returns the next int16 mono 16k chunk (blocking) — in Jarvis,
-    session.read; standalone, an InputStream queue getter. Fail-soft: if pyaec
-    can't load or anything raises, it logs and returns (the turn completes; no
-    barge that round)."""
-
-    def __init__(self, mic_read: Callable[[], np.ndarray],
-                 interrupt_event: threading.Event, stop_event: threading.Event,
-                 far_buffer: FarEndBuffer, *, oneshot: bool = True,
-                 on_detect: "Callable[[float], None] | None" = None) -> None:
-        self._mic_read = mic_read
-        self._interrupt = interrupt_event
-        self._stop = stop_event
-        self._far = far_buffer
-        self._detector = BargeDetector()
-        self._delay_s = DELAY_MS / 1000.0
-        # oneshot=True (Jarvis): fire interrupt + stop on the first barge.
-        # oneshot=False (live validator): report each detection and keep
-        # counting — exercises the SAME loop, just doesn't stop.
-        self._oneshot = oneshot
-        self._on_detect = on_detect
-
-    def run(self) -> None:
+    # ----- lifecycle (turn thread) -----
+    def start(self) -> bool:
+        """Open the duplex stream + AEC. Returns False (fail-soft) if pyaec is
+        unavailable or the stream won't open — the caller then plays normally."""
         try:
             import pyaec  # noqa: PLC0415
+            self._aec = pyaec.Aec(FRAME, FILTER_LEN, SAMPLE_RATE, False)  # preprocess=False
         except Exception as exc:  # noqa: BLE001
-            print(f"[barge-aec] pyaec unavailable ({exc}); hands-free barge "
-                  "disabled this turn", file=sys.stderr)
-            return
-        try:
-            aec = pyaec.Aec(FRAME, FILTER_LEN, SAMPLE_RATE, False)  # preprocess=False
-        except Exception as exc:  # noqa: BLE001
-            print(f"[barge-aec] AEC init failed ({exc}); disabled", file=sys.stderr)
-            return
-
-        print("[barge-aec] hands-free barge-in monitoring during playback",
-              file=sys.stderr)
-        residual = np.zeros(0, dtype=np.int16)
-        dbg_last = time.monotonic()
-        dbg_peak = 0.0
-        try:
-            while not self._stop.is_set():
-                chunk = self._mic_read()
-                if self._stop.is_set():
-                    return
-                if chunk is None or len(chunk) == 0:
-                    continue
-                t_read = time.monotonic()
-                buf = np.concatenate([residual, np.asarray(chunk, dtype=np.int16)])
-                nframes = len(buf) // FRAME
-                for k in range(nframes):
-                    mic_f = buf[k * FRAME:(k + 1) * FRAME]
-                    # This frame's audio ended ~ t_read - (tail samples)/SR.
-                    tail = len(buf) - (k + 1) * FRAME
-                    t_frame = t_read - tail / SAMPLE_RATE
-                    far_f = self._far.frame_at(t_frame, FRAME, self._delay_s)
-                    cleaned = np.asarray(aec.cancel_echo(mic_f, far_f),
-                                         dtype=np.float64)
-                    rms = float(np.sqrt(np.mean(np.square(cleaned))))
-                    if DEBUG:
-                        dbg_peak = max(dbg_peak, rms)
-                    if self._detector.push_frame(rms):
-                        if self._on_detect is not None:
-                            self._on_detect(t_frame)
-                        if self._oneshot:
-                            print(f"[barge-aec] BARGE-IN detected (cleaned RMS "
-                                  f"{rms:.0f} > {THRESHOLD:.0f})", file=sys.stderr)
-                            self._interrupt.set()
-                            return
-                        self._detector.reset()  # validator: keep counting
-                residual = buf[nframes * FRAME:]
-                if DEBUG and (t_read - dbg_last) > 1.0:
-                    print(f"[barge-aec] cleaned-RMS peak last 1s: {dbg_peak:.0f} "
-                          f"(thresh {THRESHOLD:.0f}, delay {DELAY_MS}ms)",
-                          file=sys.stderr)
-                    dbg_last, dbg_peak = t_read, 0.0
-        except Exception as exc:  # noqa: BLE001 — never crash the turn
-            print(f"[barge-aec] monitor error ({exc}); disabled this turn",
+            print(f"[barge-aec] pyaec unavailable ({exc}); plain playback",
                   file=sys.stderr)
+            return False
+        try:
+            self._stream = sd.Stream(
+                samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16",
+                channels=1, device=(self._device, None),
+                callback=self._callback, latency="low",
+            )
+            self._stream.start()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[barge-aec] duplex stream open failed ({exc}); plain playback",
+                  file=sys.stderr)
+            self._stream = None
+            return False
+        print("[barge-aec] hands-free barge-in active (duplex AEC, "
+              f"delay {DELAY_MS}ms, thresh {THRESHOLD:.0f})", file=sys.stderr)
+        return True
+
+    def wait(self, interrupt_event: "threading.Event | None",
+             poll: float = 0.05, max_sec: float = 600.0) -> None:
+        """Block (turn thread) until playback drains, a barge-in fires, or the
+        stream goes inactive. A hard cap guards against a wedged stream."""
+        deadline = time.monotonic() + max_sec
+        while time.monotonic() < deadline:
+            if self._done.wait(poll):
+                return
+            if interrupt_event is not None and interrupt_event.is_set():
+                return
+            if self._stream is not None and not self._stream.active:
+                return
+
+    def close(self) -> None:
+        s, self._stream = self._stream, None
+        if s is not None:
+            try:
+                s.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass

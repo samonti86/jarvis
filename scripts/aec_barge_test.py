@@ -5,10 +5,10 @@ model-free logic is unit-tested here:
   - BargeDetector: windowed-RMS + sustain energy gate (the VAD on the cleaned
     signal) — fires once after `sustain` consecutive over-threshold windows,
     re-arms only after dropping below.
-  - FarEndBuffer.frame_at: the delay-aligned far-end lookup (the alignment that
-    makes the AEC actually cancel) — returns the right samples at the right
-    offset, silence in gaps.
-  - _resample_to_16k: far-end (24 kHz TTS) -> 16 kHz mic-rate reference.
+  - DuplexBargePlayer._next_out: the playback-buffer assembly fed to the duplex
+    stream — pulls frames across array boundaries, silence on underrun, sets
+    _saw_end at the feed sentinel.
+  - _resample_to_16k: TTS (24 kHz) -> 16 kHz duplex playback + AEC rate.
 
 Hermetic: no model, no audio, no pyaec, no threads.
 
@@ -18,6 +18,7 @@ Hermetic: no model, no audio, no pyaec, no threads.
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +26,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.aec_barge import (  # noqa: E402
-    SAMPLE_RATE, BargeDetector, FarEndBuffer, _resample_to_16k,
+    BargeDetector, DuplexBargePlayer, _resample_to_16k,
 )
 
 _passed = 0
@@ -43,7 +44,7 @@ def check(label: str, cond: bool) -> None:
 
 
 # --- BargeDetector ---------------------------------------------------------
-# win=4 frames, sustain=2 windows → fires after 2 consecutive over-threshold
+# win=4 frames, sustain=2 windows -> fires after 2 consecutive over-threshold
 # windows (8 frames), once, then re-arms after a below-threshold window.
 det = BargeDetector(threshold=1000.0, win_frames=4, sustain=2)
 fired = [det.push_frame(2000.0) for _ in range(7)]   # 1 full window (4) + 3
@@ -57,51 +58,61 @@ det2 = BargeDetector(threshold=1000.0, win_frames=4, sustain=2)
 check("quiet frames never fire",
       not any(det2.push_frame(200.0) for _ in range(40)))
 
-# Re-arm: loud→fire, drop quiet (a window below), then loud again → fires again.
+# Re-arm: loud->fire, drop quiet (a window below), then loud again -> fires again.
 det3 = BargeDetector(threshold=1000.0, win_frames=4, sustain=2)
 [det3.push_frame(2000.0) for _ in range(7)]
 check("det3 first fire", det3.push_frame(2000.0) is True)
-[det3.push_frame(100.0) for _ in range(4)]   # one quiet window → re-arm
+[det3.push_frame(100.0) for _ in range(4)]   # one quiet window -> re-arm
 [det3.push_frame(2000.0) for _ in range(7)]
 check("det3 re-fires after a quiet window re-arms it",
       det3.push_frame(2000.0) is True)
 
-# A single loud window (sustain not met) then quiet → never fires.
+# A single loud window (sustain not met) then quiet -> never fires.
 det4 = BargeDetector(threshold=1000.0, win_frames=4, sustain=2)
 [det4.push_frame(2000.0) for _ in range(4)]   # one loud window
 check("one loud window alone does not fire (sustain=2)",
       not any(det4.push_frame(100.0) for _ in range(8)))
 
 
-# --- FarEndBuffer.frame_at: delay-aligned lookup ---------------------------
-fb = FarEndBuffer()
-arr = np.arange(2000, dtype=np.int16)          # a ramp so indices are obvious
-t0 = 100.0
-fb.push(arr, SAMPLE_RATE, start_time=t0)
-delay = 0.16
+# --- DuplexBargePlayer._next_out: playback assembly + end detection --------
+# Pure buffer logic — no stream, no pyaec (start() lazy-imports those).
+p = DuplexBargePlayer(None, threading.Event())
+p.feed(np.arange(1, 257, dtype=np.int16))            # exactly one frame
+out = p._next_out(256)
+check("_next_out returns the fed frame", np.array_equal(out, np.arange(1, 257, dtype=np.int16)))
+check("_next_out: no end sentinel yet", p._saw_end is False)
 
-# Echo arriving at t0+delay was emitted at t0 → far frame = arr[0:n].
-f = fb.frame_at(t0 + delay, 256, delay)
-check("frame_at maps t_emit=t0 to the segment start", np.array_equal(f, arr[:256]))
+# Spanning two fed arrays in one frame.
+p2 = DuplexBargePlayer(None, threading.Event())
+p2.feed(np.full(100, 7, dtype=np.int16))
+p2.feed(np.full(300, 9, dtype=np.int16))
+out2 = p2._next_out(256)
+check("_next_out spans array boundaries",
+      np.array_equal(out2[:100], np.full(100, 7, np.int16))
+      and np.array_equal(out2[100:256], np.full(156, 9, np.int16)))
 
-# 160 samples (10 ms) later → arr[160:160+256].
-f2 = fb.frame_at(t0 + delay + 160 / SAMPLE_RATE, 256, delay)
-check("frame_at offsets by the elapsed time", np.array_equal(f2, arr[160:160 + 256]))
+# Underrun: nothing fed -> silence, NOT an end.
+p3 = DuplexBargePlayer(None, threading.Event())
+out3 = p3._next_out(256)
+check("_next_out underrun -> silence", np.array_equal(out3, np.zeros(256, np.int16)))
+check("_next_out underrun is not end-of-feed", p3._saw_end is False)
 
-# A time before anything was played → silence.
-f3 = fb.frame_at(t0 - 1.0, 256, delay)
-check("frame_at returns silence before any segment", np.array_equal(f3, np.zeros(256, np.int16)))
+# End sentinel: remaining samples, then trailing silence + _saw_end set.
+p4 = DuplexBargePlayer(None, threading.Event())
+p4.feed(np.full(50, 5, dtype=np.int16))
+p4.done_feeding()
+out4 = p4._next_out(256)
+check("_next_out drains remaining before end",
+      np.array_equal(out4[:50], np.full(50, 5, np.int16))
+      and np.array_equal(out4[50:], np.zeros(206, np.int16)))
+check("_next_out sets _saw_end at the sentinel", p4._saw_end is True)
+check("_has_pending false after full drain + end", p4._has_pending() is False)
 
-# A time well after the segment ended (a gap) → silence.
-f4 = fb.frame_at(t0 + delay + 10.0, 256, delay)
-check("frame_at returns silence in a gap", np.array_equal(f4, np.zeros(256, np.int16)))
-
-# Pruning: a segment far older than retain is dropped on the next push.
-fb2 = FarEndBuffer(retain_sec=1.0)
-fb2.push(np.ones(1000, np.int16), SAMPLE_RATE, start_time=10.0)
-fb2.push(np.ones(1000, np.int16), SAMPLE_RATE, start_time=20.0)  # 10s later
-check("old segments pruned past retain window",
-      len(fb2._segments) == 1)
+# _has_pending true while fed data remains.
+p5 = DuplexBargePlayer(None, threading.Event())
+p5.feed(np.full(500, 3, dtype=np.int16))
+p5._next_out(256)
+check("_has_pending true with remaining data", p5._has_pending() is True)
 
 
 # --- _resample_to_16k ------------------------------------------------------

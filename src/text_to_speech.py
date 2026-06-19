@@ -115,12 +115,67 @@ def speak(text: str, language: str = "en") -> None:
         print(f"[tts] pyttsx3 also failed ({exc}); audio dropped", file=sys.stderr)
 
 
+def _play_via_duplex_aec(device, audio_q, interrupt_event, interrupted,
+                         on_first_audio, on_amplitude, t_prod, t_synth,
+                         producer_errors) -> bool:
+    """M88 Phase 2 playback path. Feeds the synthesized reply (resampled to 16k)
+    through a DuplexBargePlayer that cancels Jarvis's own echo + detects the user
+    talking over him (sets interrupt_event). Returns True if it ran (incl.
+    teardown); False if the duplex stream / pyaec couldn't start, so the caller
+    falls back to the normal sd.play path. Teardown mirrors that path exactly."""
+    from src import aec_barge  # noqa: PLC0415
+
+    player = aec_barge.DuplexBargePlayer(
+        device, interrupt_event,
+        on_first_audio=on_first_audio, on_amplitude=on_amplitude,
+    )
+    if not player.start():
+        return False  # fail-soft → caller plays normally
+    try:
+        # Feed the reply into the player's queue as sentences synth (the player
+        # plays in real-time from there). Poll with a timeout so a barge-in is
+        # honoured promptly EVEN while blocked waiting on a slow next sentence
+        # from the LLM — otherwise the cut would lag until the in-flight sentence
+        # arrives. Resample each sentence to the 16k duplex/AEC rate.
+        while not interrupted():
+            try:
+                item = audio_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            samples, sample_rate = item
+            player.feed(aec_barge._resample_to_16k(np.asarray(samples), sample_rate))
+        player.done_feeding()
+        player.wait(interrupt_event)
+    finally:
+        player.close()
+
+    # On a barge-in the synth worker may be parked on a full audio_q (maxsize=2);
+    # drain to its None sentinel so the joins can't hang, then join. A producer
+    # error is surfaced only when we weren't barged in (an interrupt is normal).
+    if interrupted():
+        while True:
+            try:
+                drained = audio_q.get(timeout=5.0)
+            except queue.Empty:
+                break
+            if drained is None:
+                break
+    t_prod.join(timeout=1.0)
+    t_synth.join(timeout=1.0)
+    if producer_errors and not interrupted():
+        raise producer_errors[0]
+    return True
+
+
 def speak_streaming(
     text_iter: Iterable[str],
     language: str = "en",
     on_first_audio: Callable[[], None] | None = None,
     on_amplitude: Callable[[float], None] | None = None,
     interrupt_event: "threading.Event | None" = None,
+    aec_barge_device: "int | None" = None,
 ) -> None:
     """Tier B: pipelined synth+playback as text chunks arrive from the LLM stream.
 
@@ -153,6 +208,13 @@ def speak_streaming(
     the barge-in monitor thread is a cross-space violation that hard-
     crashes the process (cf. project_wasapi_thread_audio_owner). The monitor
     therefore only sets the event — it never touches the audio API.
+
+    `aec_barge_device` (optional, M88 Phase 2 hands-free barge-in) — when set,
+    playback goes through a single DUPLEX stream that cancels Jarvis's own echo
+    from the mic and detects the user talking OVER him, setting interrupt_event
+    (no wake word). TTS is resampled to 16k for this path. Fully fail-soft: if
+    the duplex stream / pyaec can't start, it falls back to the normal sd.play
+    path below. None ⇒ unchanged behaviour.
 
     On any exception in the text producer (e.g., LLM stream raising), this
     function re-raises it after threads drain, so the caller can roll back
@@ -224,6 +286,16 @@ def speak_streaming(
     t_synth = threading.Thread(target=synth_worker, daemon=True)
     t_prod.start()
     t_synth.start()
+
+    # M88 Phase 2: hands-free barge-in. Play via a duplex AEC stream that lets
+    # the user talk OVER Jarvis. Returns True if it handled playback (including
+    # teardown); False if it couldn't start, in which case we fall through to
+    # the unchanged sd.play path below.
+    if aec_barge_device is not None and _play_via_duplex_aec(
+        aec_barge_device, audio_q, interrupt_event, _interrupted,
+        on_first_audio, on_amplitude, t_prod, t_synth, producer_errors,
+    ):
+        return
 
     first = True
     while True:

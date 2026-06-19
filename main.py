@@ -53,6 +53,7 @@ from src import quiet_hours
 from src import speaker_id
 from src.speech_to_text import transcribe_after_wake
 from src.text_to_speech import speak, speak_streaming
+from src import aec_barge
 from src.tray import State
 from src.ui import JarvisUI
 from src.wake_word import monitor_for_wake_word, wait_for_wake_word
@@ -277,12 +278,17 @@ class TurnRunner:
         plex_laptop_client: PlexLaptopClient | None = None,
         pc_speaking: "threading.Event | None" = None,
         announce_speaking: "threading.Event | None" = None,
+        mic_device: "int | None" = None,
     ) -> None:
         self._cfg = cfg
         self._ui = ui
         self._reset_event = reset_event
         self._plex_client = plex_client
         self._plex_laptop_client = plex_laptop_client
+        # M88 Phase 2: the resolved mic device index for the hands-free barge-in
+        # duplex stream (None = default input). Only used when
+        # JARVIS_HANDS_FREE_BARGE is on; otherwise inert.
+        self._mic_device = mic_device
         # "PC is speaking out loud" gate — SET while this turn plays audio so
         # the always-on voice-capture loop discards self-audio (omni-mic echo
         # fix). Shared with the Announcer (announces set it too); a fresh local
@@ -460,6 +466,7 @@ class TurnRunner:
         self, *, llm_stream, pc_silent: bool, barge_enabled: bool,
         session: "AudioSession | None", interrupt_event: "threading.Event | None",
         language: str, reply_text: "Callable[[str], None] | None",
+        aec_barge: bool = False,
     ) -> bool:
         """Run the LLM stream and, when audible, speak it — holding the
         cooperative speech gates for the spoken portion and running the
@@ -496,11 +503,14 @@ class TurnRunner:
                 for _ in llm_stream():
                     pass
             else:
-                # M52: run the barge-in monitor for the duration of playback. It
-                # reads the mic on its own thread and, on a "Hey Jarvis", just
-                # sets interrupt_event — speak_streaming polls it and performs
-                # the sd.stop() cut on its own (stream-owning) thread, the
-                # WASAPI thread-affinity fix.
+                # M52: run the wake-word barge-in monitor for the duration of
+                # playback. It reads the mic on its own thread and, on a "Hey
+                # Jarvis", just sets interrupt_event — speak_streaming polls it
+                # and performs the sd.stop() cut on its own (stream-owning)
+                # thread, the WASAPI thread-affinity fix. M88 Phase 2: when
+                # `aec_barge` is on we do NOT start this monitor — the duplex AEC
+                # stream inside speak_streaming does the detection (hands-free
+                # talk-over) and sets the same interrupt_event.
                 if barge_enabled:
                     monitor_thread = threading.Thread(
                         target=monitor_for_wake_word,
@@ -516,6 +526,7 @@ class TurnRunner:
                     on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
                     on_amplitude=self._ui.set_amplitude,
                     interrupt_event=interrupt_event,
+                    aec_barge_device=(self._mic_device if aec_barge else None),
                 )
         except Exception as exc:
             self._history.pop()  # keep history alternating user/assistant cleanly
@@ -736,19 +747,26 @@ class TurnRunner:
             # must hear the answer they asked for, regardless of PC mute).
             pc_silent = silent or reply_audio is not None
 
-            # M52 — barge-in. Enabled only for a PC-voice turn that actually
-            # speaks aloud: we need the mic AudioSession (only the voice path
-            # passes it) and audible playback to interrupt. phone/console/
-            # muted turns leave interrupt_event None, so it threads through
-            # llm_stream → stream_response → speak_streaming as an inert
-            # no-op and those paths are byte-identical to pre-M52.
-            barge_enabled = (
-                _BARGE_IN_ENABLED
-                and session is not None
-                and origin == "voice"
-                and not pc_silent
+            # Barge-in eligibility: a PC-voice turn that actually speaks aloud
+            # (we need the mic + audible playback). M88 Phase 2 — hands-free
+            # talk-over (AEC duplex) takes precedence when enabled AND the mic is
+            # pinned to a known device (the duplex stream needs an explicit input
+            # index); otherwise fall back to M52 wake-word barge-in. Both set the
+            # same interrupt_event; phone/console/muted turns get neither.
+            _barge_eligible = (
+                session is not None and origin == "voice" and not pc_silent
             )
-            interrupt_event = threading.Event() if barge_enabled else None
+            aec_barge_on = (
+                _barge_eligible
+                and aec_barge.is_enabled()
+                and self._mic_device is not None
+            )
+            barge_enabled = (
+                not aec_barge_on and _BARGE_IN_ENABLED and _barge_eligible
+            )
+            interrupt_event = (
+                threading.Event() if (barge_enabled or aec_barge_on) else None
+            )
 
             # Run the stream and (when audible) speak it — holds the speech
             # gates + barge-in monitor; on error it surfaces an apology, pops
@@ -757,7 +775,7 @@ class TurnRunner:
                 llm_stream=llm_stream, pc_silent=pc_silent,
                 barge_enabled=barge_enabled, session=session,
                 interrupt_event=interrupt_event, language=language,
-                reply_text=reply_text,
+                reply_text=reply_text, aec_barge=aec_barge_on,
             ):
                 return False
 
@@ -876,7 +894,7 @@ def listen_loop(
     # MemoryStore and runs each turn end-to-end. Voice + text share this ONE
     # instance (its lock keeps them from overlapping). See the TurnRunner class.
     runner = TurnRunner(cfg, ui, reset_event, plex_client, plex_laptop_client,
-                        pc_speaking, announce_speaking)
+                        pc_speaking, announce_speaking, mic_device=mic_device)
 
     # M85 — tonal awareness. One analyzer per session; it holds a rolling
     # loudness baseline so "softer/louder than usual" is judged against the
