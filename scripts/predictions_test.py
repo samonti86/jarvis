@@ -122,6 +122,30 @@ with tempfile.TemporaryDirectory() as tmp:
     check("mining sets the last_mined_at watermark", store["last_mined_at"] is not None)
 
 
+# --- Test 4b: made_at FALLBACK uses the EARLIEST exchange, not the latest ---
+# When the miner returns no per-prediction date, an old backfilled prediction
+# must look OLD (earliest exchange), not fresh — else its first resolve check is
+# delayed _DEFAULT_RESOLVE_DELAY_DAYS. Two exchanges 9 and 2 days back; the
+# undated mined prediction should be stamped with the 9-day-old date.
+def _stub_miner_nodate(_transcript):
+    return [{"claim": "Jarvis predicted the Heat would take the series",
+             "subject": "NBA", "resolve_after": None}]  # no made_at
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session(base, datetime.now() - timedelta(days=9),
+                   [(_iso(9), "early take?", "I like the Heat.")])
+    _write_session(base, datetime.now() - timedelta(days=2),
+                   [(_iso(2), "still?", "Still the Heat.")])
+    with _env(LOCALAPPDATA=tmp):
+        pr.mine_predictions(miner=_stub_miner_nodate)
+        store = pr._load()
+    made = store["predictions"][0]["made_at"] if store["predictions"] else ""
+    check("undated mined prediction stamped with the EARLIEST exchange date",
+          made[:10] == _iso(9)[:10])
+
+
 # --- Test 5: mining with no transcripts is a clean no-op ------------------
 with tempfile.TemporaryDirectory() as tmp:
     with _env(LOCALAPPDATA=tmp):
@@ -283,6 +307,56 @@ check("_extract_json parses an array", pr._extract_json('noise [1,2,3] tail') ==
 check("_extract_json parses an object",
       pr._extract_json('x {"a": 1} y') == {"a": 1})
 check("_extract_json on junk -> None", pr._extract_json("no json here") is None)
+
+
+# --- Test 14: run_cycle=True surfaces instantly + mines in the BACKGROUND ---
+# 2026-06-21: a voice "good morning" runs the briefing inline in the agentic
+# loop. mine+resolve used to run there (up to ~2 min on the network). Now the
+# briefing surfaces already-resolved predictions immediately and kicks the cycle
+# onto a guarded daemon thread. Lock in: instant surface, the cycle runs once,
+# and a second cycle while one's in flight is a guarded no-op.
+import threading as _threading  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    with _env(LOCALAPPDATA=tmp, JARVIS_PREDICTION_FOLLOWUPS="1", ANTHROPIC_API_KEY="k"):
+        pr._save({"last_mined_at": None, "predictions": [
+            {"id": "bg1", "claim": "Jarvis predicted the Heat would win",
+             "status": "resolved", "correct": True, "actual": "The Heat won.",
+             "surfaced": False},
+        ]})
+        calls = {"mine": 0, "resolve": 0}
+        done = _threading.Event()
+        release = _threading.Event()
+
+        def _stub_mine(*a, **k):
+            calls["mine"] += 1
+            release.wait(3.0)   # hold the cycle so the guard can be tested
+            return 0
+
+        def _stub_resolve(*a, **k):
+            calls["resolve"] += 1
+            done.set()
+            return 0
+
+        _orig_mine, _orig_resolve = pr.mine_predictions, pr.resolve_due
+        pr.mine_predictions, pr.resolve_due = _stub_mine, _stub_resolve
+        try:
+            out = pr.briefing_followups(run_cycle=True)
+            check("run_cycle=True surfaces the resolved prediction immediately",
+                  "Heat won" in out)
+            check("a second cycle while one is in flight is a guarded no-op",
+                  pr.run_prediction_cycle_async() is False)
+            release.set()  # let the in-flight cycle finish
+            check("background cycle ran (mine then resolve)", done.wait(3.0))
+            check("mine ran exactly once", calls["mine"] == 1)
+            check("resolve ran exactly once", calls["resolve"] == 1)
+            # The lock must be free again once the cycle finishes.
+            check("cycle lock released after completion",
+                  pr._CYCLE_LOCK.acquire(blocking=False))
+            pr._CYCLE_LOCK.release()
+        finally:
+            release.set()
+            pr.mine_predictions, pr.resolve_due = _orig_mine, _orig_resolve
 
 
 # --- summary --------------------------------------------------------------

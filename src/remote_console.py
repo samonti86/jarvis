@@ -33,6 +33,7 @@ import base64
 import hmac
 import io
 import json
+import logging
 import ssl
 import sys
 import threading
@@ -226,6 +227,14 @@ class RemoteConsoleServer:
     async def _main(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop.set_exception_handler(self._swallow_proactor_resets)
+        # The websockets server logs a full multi-line EOFError/InvalidMessage
+        # traceback at ERROR every time a client opens a TCP/TLS connection and
+        # closes it without a valid HTTP request — i.e. an iOS/Tailscale health
+        # probe or a port scan. Cosmetic (the real client reconnects fine) but it
+        # clutters jarvis.log. Silence the library logger's ERROR stream; our own
+        # bind/connection failures surface via _log + the OSError catch below, so
+        # we don't depend on its logging for anything actionable.
+        logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
         try:
             async with serve(
                 self._handler,

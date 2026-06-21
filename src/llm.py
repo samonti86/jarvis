@@ -1271,16 +1271,22 @@ def stream_response(
         working.append({"role": "assistant", "content": final.content})
 
         tool_results = []
+        # A restricted origin's denied tools are refused by _execute_client_tool
+        # below; don't record them as "fired" — that would misreport a BLOCKED
+        # capability as used in the SRE telemetry / audit chip (e.g. a phone turn
+        # where Claude tried system_control would otherwise show sysctl=yes).
+        denied = _effective_deny(origin) if restricted else frozenset()
         for block in final.content:
             if getattr(block, "type", None) != "tool_use":
                 continue
             name = block.name
-            if name in _CLIENT_TOOLS:
-                fired_client.add(name)
-            elif name in _PLEX_LAPTOP_DISPATCH:
-                fired_plex_laptop.add(name)
-            elif plex_client is not None and name in plex_client.tool_names:
-                fired_plex_mcp.add(name)
+            if name not in denied:
+                if name in _CLIENT_TOOLS:
+                    fired_client.add(name)
+                elif name in _PLEX_LAPTOP_DISPATCH:
+                    fired_plex_laptop.add(name)
+                elif plex_client is not None and name in plex_client.tool_names:
+                    fired_plex_mcp.add(name)
             result_text = _execute_client_tool(
                 name,
                 block.input or {},
@@ -1294,8 +1300,10 @@ def stream_response(
             # is registered, surface the raw bytes so the console can render
             # an inline thumbnail of what Jarvis just saw. Detecting on the
             # generic shape (list with an image block) keeps this hook
-            # tool-agnostic — any future tool that returns an image gets
-            # thumbnailed for free.
+            # tool-agnostic — any tool that returns an image gets thumbnailed
+            # for free. NOTE: only the FIRST image block per result is surfaced
+            # (the `break` below) — every current vision tool returns exactly
+            # one; a future multi-image tool would need the break removed.
             if on_image_captured is not None and isinstance(result_text, list):
                 for sub in result_text:
                     if isinstance(sub, dict) and sub.get("type") == "image":

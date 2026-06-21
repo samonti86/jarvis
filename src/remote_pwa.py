@@ -526,9 +526,19 @@ PWA_HTML = r"""<!DOCTYPE html>
           setPill("connected", "#15803d"); break;
         case "auth_fail":
           clearWD();
-          localStorage.removeItem("jarvisToken"); token = "";
-          $("err").textContent = "Token rejected. Try again.";
-          $("setup").classList.add("show"); sock.close(); break;
+          if (m.reason === "timeout") {
+            // The SERVER timed out waiting for our first auth frame (slow
+            // cellular, a backgrounded tab) — our token is probably fine. Keep
+            // it and let onclose's backoff retry, instead of wiping a good
+            // token and forcing the user to re-enter it.
+            line("sys", "auth timed out — retrying");
+            sock.close();
+          } else {
+            localStorage.removeItem("jarvisToken"); token = "";
+            $("err").textContent = "Token rejected. Try again.";
+            $("setup").classList.add("show"); sock.close();
+          }
+          break;
         case "snapshot":
           setArmed(m.armed);
           setPill(m.state || "connected",

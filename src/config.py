@@ -3,11 +3,41 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _int_env(name: str, default: int) -> int:
+    """int from env `name`, falling back to `default` if unset or non-numeric.
+    A typo'd numeric in .env (e.g. SMTP_PORT=587x) must NOT take the whole
+    assistant down at import — the never-crash-on-config rule."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[config] {name}={raw!r} is not an integer; using {default}",
+              file=sys.stderr)
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    """float from env `name`, falling back to `default` if unset or non-numeric.
+    Same never-crash rationale as _int_env."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[config] {name}={raw!r} is not a number; using {default}",
+              file=sys.stderr)
+        return default
 
 
 @dataclass(frozen=True)
@@ -78,10 +108,10 @@ def load() -> Config:
         claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"),
         summary_model=os.getenv("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
         whisper_model=os.getenv("WHISPER_MODEL", "small"),
-        wake_word_threshold=float(os.getenv("WAKE_WORD_THRESHOLD", "0.5")),
+        wake_word_threshold=_float_env("WAKE_WORD_THRESHOLD", 0.5),
         sample_rate=16_000,  # required by both openWakeWord and Whisper
-        memory_recall_count=int(os.getenv("MEMORY_RECALL_COUNT", "25")),
-        retain_raw_days=int(os.getenv("RETAIN_RAW_DAYS", "365")),
+        memory_recall_count=_int_env("MEMORY_RECALL_COUNT", 25),
+        retain_raw_days=_int_env("RETAIN_RAW_DAYS", 365),
         plex_url=os.getenv("PLEX_URL", "").strip(),
         plex_token=os.getenv("PLEX_TOKEN", "").strip(),
         plex_laptop_host=os.getenv("PLEX_LAPTOP_HOST", "").strip(),
@@ -93,27 +123,27 @@ def load() -> Config:
         stt_backend=os.getenv("STT_BACKEND", "auto").strip().lower(),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com").strip(),
-        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_port=_int_env("SMTP_PORT", 587),
         smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
         # Password may contain meaningful trailing/leading whitespace? Gmail
         # App Passwords are alphanumeric 16-char strings — stripping is safe
         # and protects against an accidental newline in the .env value.
         smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
         smtp_to=os.getenv("SMTP_TO", "").strip(),
-        face_match_threshold=float(os.getenv("JARVIS_FACE_MATCH_THRESHOLD", "0.5")),
+        face_match_threshold=_float_env("JARVIS_FACE_MATCH_THRESHOLD", 0.5),
         # M48 remote console (LAN). Token blank → feature OFF (the server is
         # never started). This is the safe default: the remote surface — which
         # can arm/disarm security — only exists once you've deliberately set a
         # secret. Bind 0.0.0.0 so it's LAN-reachable; the token + a LAN-scoped
         # Windows Firewall rule are the security controls. Do NOT port-forward.
         remote_token=os.getenv("JARVIS_REMOTE_TOKEN", "").strip(),
-        remote_port=int(os.getenv("JARVIS_REMOTE_PORT", "8765")),
+        remote_port=_int_env("JARVIS_REMOTE_PORT", 8765),
         remote_bind=os.getenv("JARVIS_REMOTE_BIND", "0.0.0.0").strip(),
         # M70 — geofenced auto-arm (rides the token-gated /presence route on
         # the remote console; no separate enable flag — it exists iff the
         # console does, i.e. iff a token is set). Arm is deferred to damp
         # geofence boundary-flap; the greeting fires only on a real disarm.
-        presence_arm_delay=float(os.getenv("JARVIS_PRESENCE_ARM_DELAY", "60")),
+        presence_arm_delay=_float_env("JARVIS_PRESENCE_ARM_DELAY", 60.0),
         presence_greeting=os.getenv(
             "JARVIS_PRESENCE_GREETING", "Welcome home, sir."
         ).strip(),
@@ -154,7 +184,7 @@ def load() -> Config:
         # degraded clip of the real user still passes. The gate is opt-in and
         # OFF unless explicitly truthy — identification itself activates simply
         # by enrolling a voice (no flag), since labeling who spoke is harmless.
-        speaker_threshold=float(os.getenv("JARVIS_SPEAKER_THRESHOLD", "0.60")),
+        speaker_threshold=_float_env("JARVIS_SPEAKER_THRESHOLD", 0.60),
         speaker_gate_enabled=(
             os.getenv("JARVIS_SPEAKER_GATE", "").strip().lower()
             in ("1", "true", "yes", "on")

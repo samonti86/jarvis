@@ -51,15 +51,19 @@ def _redirect_to_logfile() -> Path:
     # Local import: happens after _ensure_correct_interpreter, so we're on
     # whichever Python can resolve src/. logfile.py is stdlib-only by design,
     # so this works on either system or venv pythonw.
-    from src.logfile import rotate_if_needed
+    from src.logfile import rotate_if_needed, TimestampStream
 
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "jarvis.log"
     rotate_if_needed(log_path)  # MUST happen before opening — Windows can't rename open files
     f = open(log_path, "a", encoding="utf-8", buffering=1)  # line-buffered
-    sys.stdout = f
-    sys.stderr = f
+    # One shared TimestampStream for both stdout and stderr so their interleaved
+    # writes share the same line-state machine (no spurious mid-line stamps), and
+    # so fileno() still resolves to the real log file for the Plex MCP child.
+    stamped = TimestampStream(f)
+    sys.stdout = stamped
+    sys.stderr = stamped
     print(f"\n--- Jarvis started {datetime.now().isoformat(timespec='seconds')} ---")
     return log_path
 

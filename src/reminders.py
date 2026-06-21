@@ -59,6 +59,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from src.atomic_io import atomic_write_text
+
 # ISO format used for every stored timestamp. Fixed-width and zero-padded, so
 # lexicographic string comparison of two of these IS chronological comparison
 # — pop_due relies on that to avoid parsing on the hot path.
@@ -100,13 +102,10 @@ def _load() -> list[dict]:
 
 
 def _save(reminders: list[dict]) -> None:
-    """Atomically overwrite the store — temp file + os.replace (atomic on
-    Windows). A crash mid-write leaves either the old file or the new one
-    intact, never a half-written one."""
-    path = _store_path()
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(reminders, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    """Atomically + durably overwrite the store. A crash mid-write — including a
+    hard power loss (no UPS here) — leaves either the complete old file or the
+    complete new one, never a torn or zero-length one. See src/atomic_io.py."""
+    atomic_write_text(_store_path(), json.dumps(reminders, indent=2))
 
 
 def add(

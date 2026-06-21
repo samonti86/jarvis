@@ -24,6 +24,8 @@ import sys
 import threading
 from pathlib import Path
 
+from src.atomic_io import atomic_write_text
+
 # All reads/writes funnel through this lock — the tray toggle (pystray worker
 # thread) and startup (main thread) can both touch the file.
 _LOCK = threading.Lock()
@@ -60,10 +62,7 @@ def set_flag(name: str, value: bool) -> None:
         data = _load()
         data[name] = bool(value)
         try:
-            path = _store_path()
-            tmp = path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, path)
+            # Durable + atomic — see src/atomic_io.py.
+            atomic_write_text(_store_path(), json.dumps(data))
         except OSError as exc:
             print(f"[ui_state] save failed for {name!r}: {exc}", file=sys.stderr)

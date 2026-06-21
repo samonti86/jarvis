@@ -42,6 +42,7 @@ import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
+from src.atomic_io import atomic_write_text
 from src.memory import format_relative_time
 
 
@@ -138,10 +139,8 @@ def _load() -> list[dict]:
 
 
 def _save(items: list[dict]) -> None:
-    path = _store_path()
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    # Durable + atomic — see src/atomic_io.py.
+    atomic_write_text(_store_path(), json.dumps(items, indent=2, ensure_ascii=False))
 
 
 def record_deferred(text: str, label: str, now: datetime | None = None) -> None:

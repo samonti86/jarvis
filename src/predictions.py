@@ -41,10 +41,13 @@ import json
 import os
 import re
 import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import anthropic
+
+from src.atomic_io import atomic_write_text
 
 
 # --- Tuning ----------------------------------------------------------------
@@ -119,10 +122,9 @@ def _load() -> dict:
 
 
 def _save(store: dict) -> None:
-    path = _store_path()
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(store, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    # Durable + atomic + concurrency-safe (the background mining cycle and the
+    # briefing surfacing can both save). See src/atomic_io.py.
+    atomic_write_text(_store_path(), json.dumps(store, indent=2, ensure_ascii=False))
 
 
 def _stable_id(claim: str, made_at: str) -> str:
@@ -285,12 +287,17 @@ def mine_predictions(*, miner=None, now: datetime | None = None) -> int:
 
     existing = {p.get("id") for p in store["predictions"]}
     added = 0
-    # Earliest exchange ts is a reasonable made_at when the miner can't tell us;
-    # but we want each prediction stamped near when it was said. The miner
-    # returns no ts, so we approximate made_at with the most recent exchange in
-    # the batch (predictions are usually the latest thing discussed). Good
-    # enough for the day-granularity stable id and the resolve-delay clock.
-    made_at = max((ex.get("ts", "") for ex in exchanges), default=now.isoformat(timespec="seconds")) \
+    # made_at FALLBACK, used only when the miner doesn't return a per-prediction
+    # date (it normally reads the [timestamp] off Jarvis's line — see
+    # _normalize_mined). Use the EARLIEST exchange in the batch, not the latest:
+    # on a 30-day backfill run, stamping an old prediction with "now" would make
+    # it look fresh and delay its first resolve check by _DEFAULT_RESOLVE_DELAY_DAYS
+    # (an old, already-decided call sits unresolvable for a week). Earliest is
+    # the safe direction — the resolver is conservative and returns UNRESOLVED if
+    # it truly isn't decided, so an over-eager check just costs one throttled
+    # search. Still a real date, so the day-granularity stable id stays stable.
+    made_at = min((ex.get("ts", "") for ex in exchanges if ex.get("ts")),
+                  default=now.isoformat(timespec="seconds")) \
         or now.isoformat(timespec="seconds")
     for p in found:
         rec = _normalize_mined(p, made_at)
@@ -467,18 +474,67 @@ def format_followups(recs: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Guards the background mine+resolve cycle: only ONE runs at a time. A second
+# briefing while a cycle is in flight just skips spawning another (the running
+# one will finish and its results surface next briefing).
+_CYCLE_LOCK = threading.Lock()
+
+
+def run_prediction_cycle_async() -> bool:
+    """Run mine+resolve on a daemon thread and return immediately. Returns True
+    if a cycle was started, False if one was already running.
+
+    WHY BACKGROUND: a voice "good morning" runs the briefing INLINE in the
+    agentic tool loop, where the user is waiting. mine_predictions is a Haiku
+    call and resolve_due makes up to 3 web-search-backed calls (40s timeout
+    each) — a worst-case ~2-minute stall on the marquee feature. Moving the
+    cycle off-thread keeps the briefing instant; freshly-resolved predictions
+    surface on the NEXT briefing, which is fine (sports outcomes resolve over
+    days, not seconds). Never raises."""
+    if not _cycle_lock_acquired():
+        return False
+
+    def _work() -> None:
+        try:
+            mine_predictions()
+            resolve_due()
+        except Exception as exc:  # noqa: BLE001 — a background cycle must die quietly
+            print(f"[predictions] background cycle failed: {exc}", file=sys.stderr)
+        finally:
+            _CYCLE_LOCK.release()
+
+    try:
+        threading.Thread(target=_work, name="prediction-cycle", daemon=True).start()
+        return True
+    except Exception as exc:  # noqa: BLE001 — thread spawn failed; don't leak the lock
+        print(f"[predictions] could not start cycle thread: {exc}", file=sys.stderr)
+        _CYCLE_LOCK.release()
+        return False
+
+
+def _cycle_lock_acquired() -> bool:
+    """Try to claim the cycle lock without blocking. Isolated for the spawn-fail
+    path to release cleanly."""
+    return _CYCLE_LOCK.acquire(blocking=False)
+
+
 def briefing_followups(*, run_cycle: bool = True) -> str:
-    """The morning-briefing entry point: optionally run a mine+resolve cycle,
-    then return the follow-up text for any newly-resolved predictions (marking
-    them surfaced). Returns '' when disabled, unconfigured, or nothing's ready.
-    Never raises — a failure costs this section, not the briefing."""
+    """The morning-briefing entry point: surface the follow-up text for any
+    already-resolved-but-unsurfaced predictions (marking them surfaced), and —
+    when run_cycle — kick a mine+resolve cycle in the BACKGROUND so the briefing
+    never blocks on the network. Returns '' when disabled, unconfigured, or
+    nothing's ready. Never raises — a failure costs this section, not the
+    briefing.
+
+    Surface BEFORE spawning so the background cycle's _load() sees the freshly
+    marked-surfaced records and won't re-surface them."""
     if not _enabled() or not _api_key():
         return ""
     try:
+        recs = take_unsurfaced()
         if run_cycle:
-            mine_predictions()
-            resolve_due()
-        return format_followups(take_unsurfaced())
+            run_prediction_cycle_async()
+        return format_followups(recs)
     except Exception as exc:  # noqa: BLE001
         print(f"[predictions] briefing_followups failed: {exc}", file=sys.stderr)
         return ""

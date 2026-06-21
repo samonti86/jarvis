@@ -909,7 +909,16 @@ class SecurityWatcher:
             return None
         if not self._ensure_model():
             return None
-        return self._detect_person(frame)
+        try:
+            return self._detect_person(frame)
+        finally:
+            # M44: _detect_person does `del results`, but the ultralytics
+            # Results.orig_img reference CYCLE is only reclaimed by an explicit
+            # gc.collect() — which _watch_loop runs per tick but this
+            # external-camera path does not. Collect here too so EVERY YOLO
+            # inference path uniformly breaks the cycle (defense-in-depth; this
+            # path is rare, so the extra collect is free).
+            gc.collect()
 
     def update_challenge_evidence(self, jpeg_bytes: bytes) -> None:
         """Attach late-arriving evidence bytes to an active challenge.

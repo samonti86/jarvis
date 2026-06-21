@@ -17,11 +17,81 @@ the venv's. No numpy/anthropic/etc. allowed in the import chain.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 
 DEFAULT_MAX_BYTES = 5_000_000   # 5 MB — months of moderate use
 DEFAULT_KEEP = 3                # log + 3 backups = ~20 MB max footprint
+
+
+def _line_stamp() -> str:
+    """The per-line prefix: a compact, sortable, second-resolution wall clock.
+    Matches the bracketed style of the '--- Jarvis started ... ---' markers and
+    the Plex MCP child's own log lines, so the whole file reads uniformly."""
+    return datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+
+
+def stamp_chunk(data: str, at_line_start: bool, stamp: str) -> tuple[str, bool]:
+    """Pure core of TimestampStream.write: prefix `stamp` at the start of every
+    NON-EMPTY line in `data`. Returns (stamped_text, at_line_start_after).
+
+    Separated from the stream and the clock so the line-splitting logic is
+    deterministically testable. Stateful by necessity — print() emits a line as
+    two calls ("text" then "\\n") and a traceback arrives as one multi-line
+    write, so we carry whether the next char opens a fresh line across calls.
+    A lone newline (blank line) is left UNstamped so the log's blank separators
+    stay clean.
+    """
+    if not data:
+        return "", at_line_start
+    out: list[str] = []
+    for ch in data:
+        if at_line_start and ch != "\n":
+            out.append(stamp)
+            at_line_start = False
+        out.append(ch)
+        if ch == "\n":
+            at_line_start = True
+    return "".join(out), at_line_start
+
+
+class TimestampStream:
+    """Wraps a writable text stream and prefixes every emitted line with a
+    wall-clock timestamp. The Jarvis log is a redirected stdout/stderr of bare
+    print() calls, so historically only session markers carried a time — which
+    made a long-running soak impossible to reason about temporally (two lines
+    being file-adjacent did NOT mean they happened close in time, e.g. across an
+    overnight shutdown gap). One stamp per line closes that.
+
+    fileno() deliberately DELEGATES to the wrapped stream: in production a
+    subprocess inherits the parent's stderr by file descriptor (the Plex MCP
+    child's logs reach jarvis.log this way), and that must keep working. Such
+    output bypasses stamping — fine, it carries its own format, exactly as
+    before this wrapper existed. Only Python-level writes (.write) get stamped.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._at_line_start = True
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        text, self._at_line_start = stamp_chunk(
+            data, self._at_line_start, _line_stamp()
+        )
+        self._stream.write(text)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
 
 
 def _backup_path(log_path: Path, n: int) -> Path:

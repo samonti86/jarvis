@@ -142,9 +142,13 @@ def _normalise_ical_event(vevent) -> CalendarEvent | None:
         # subclass of date, so order matters: check datetime first.
         is_all_day = isinstance(start, date) and not isinstance(start, datetime)
         if is_all_day:
-            # Promote DATE → DATETIME at midnight; treat as local time for
-            # display (an all-day event is "all of that calendar day in the
-            # viewer's wall clock" by convention).
+            # Promote DATE → DATETIME at midnight, LOCAL wall clock (an all-day
+            # event is "all of that calendar day in the viewer's zone"). Leave
+            # these NAIVE: the final .astimezone() below reads a naive datetime
+            # as system-local, giving the intended local midnight. Stamping them
+            # UTC here (as the timed branch does) would shift the calendar day
+            # BACKWARD in any behind-UTC zone — a real bug masked only because
+            # every consumer special-cases is_all_day.
             start = datetime.combine(start, datetime.min.time())
             if dtend_prop is not None:
                 end_raw = dtend_prop.dt
@@ -156,12 +160,14 @@ def _normalise_ical_event(vevent) -> CalendarEvent | None:
                 end = start + timedelta(days=1)
         else:
             end = dtend_prop.dt if dtend_prop is not None else start + timedelta(hours=1)
-        # Ensure tz-aware. icalendar usually returns aware datetimes when
-        # the VEVENT has TZID (Microsoft always sets it), but be defensive.
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
+            # Ensure tz-aware. icalendar returns aware datetimes when the VEVENT
+            # has TZID (Microsoft always sets it); be defensive and treat a naive
+            # TIMED datetime as UTC (the server's canonical zone). All-day events
+            # stay naive-local (handled above) and must NOT reach this.
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
         return CalendarEvent(
             subject=subject,
             start_local=start.astimezone(),

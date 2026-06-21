@@ -138,7 +138,10 @@ def _default_ask(api_key: str, model: str, system: str, user: str) -> str:
     failure — the engine catches it and waits for the next tick."""
     import anthropic  # noqa: PLC0415 — lazy, already a project dep
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # Bound the call like the other best-effort background LLM calls
+    # (summarizer, predictions): a hung endpoint must not stall this daemon
+    # tick for the SDK's default ~10-min retry budget.
+    client = anthropic.Anthropic(api_key=api_key, timeout=30.0, max_retries=1)
     resp = client.messages.create(
         model=model,
         max_tokens=200,

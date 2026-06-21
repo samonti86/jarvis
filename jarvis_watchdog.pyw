@@ -97,15 +97,16 @@ def _redirect_to_logfile() -> Path:
     """Mirror of jarvis.pyw's log redirect so watchdog events land in the
     same jarvis.log alongside main's logs. The watchdog's own lines are
     tagged `[watchdog]` for grep."""
-    from src.logfile import rotate_if_needed
+    from src.logfile import rotate_if_needed, TimestampStream
 
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "jarvis.log"
     rotate_if_needed(log_path)
     f = open(log_path, "a", encoding="utf-8", buffering=1)
-    sys.stdout = f
-    sys.stderr = f
+    stamped = TimestampStream(f)  # per-line timestamps (see src/logfile.py)
+    sys.stdout = stamped
+    sys.stderr = stamped
     print(f"\n--- Jarvis watchdog started "
           f"{datetime.now().isoformat(timespec='seconds')} ---")
     return log_path

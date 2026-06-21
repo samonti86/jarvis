@@ -272,10 +272,17 @@ def _collect_exchanges(days_back: int | None) -> list[dict]:
                 pending_user = rec
             elif role == "assistant" and pending_user is not None:
                 ts = pending_user.get("ts") or rec.get("ts") or ""
-                # Per-exchange window filter (finer than the per-file one).
+                # Per-exchange window filter, by CALENDAR DAY to match the
+                # per-file filter (_iter_session_files uses file_date.date() <
+                # cutoff.date()). Comparing the raw timestamp here instead would
+                # disagree with the file filter — e.g. days_back=1 keeps
+                # yesterday's FILE but would drop its early-morning exchanges
+                # (>24h ago), so "what did I say yesterday?" silently under-
+                # returns. predictions._recent_exchanges re-filters by exact ts
+                # on top, so widening here doesn't loosen mining.
                 if cutoff is not None:
                     try:
-                        if datetime.fromisoformat(ts) < cutoff:
+                        if datetime.fromisoformat(ts).date() < cutoff.date():
                             pending_user = None
                             continue
                     except (ValueError, TypeError):

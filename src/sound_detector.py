@@ -767,10 +767,15 @@ class SoundDetector:
             # Worker is behind. Drop the OLDEST chunk and enqueue the newest
             # — recent audio matters more than ancient backlog. Logged at
             # most once per 30 dropped windows to avoid spam.
+            # Catch BOTH queue.Empty (queue drained between Full and get) AND
+            # queue.Full (refilled before our put): a raise here escapes into
+            # the sounddevice callback and would ABORT the input stream. Single-
+            # producer makes the Full case unreachable today, but guarding it is
+            # cheap insurance against a high-consequence, low-probability abort.
             try:
                 self._chunks.get_nowait()
                 self._chunks.put_nowait(window)
-            except queue.Empty:
+            except (queue.Empty, queue.Full):
                 pass
             self._dropped += 1
             if self._dropped % 30 == 1:

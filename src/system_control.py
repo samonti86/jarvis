@@ -72,6 +72,11 @@ import psutil
 # So cache it once at module import. The mutating verbs (M40 — flush_dns,
 # restart_service) check this and fail loudly rather than discovering the
 # Access Denied from subprocess output.
+#   Load-bearing invariant: in-session elevation (the M41 tray "Restart as
+#   Administrator") works by spawning a FRESH process, which re-imports this
+#   module and re-evaluates the cache — so the running process never needs to
+#   observe its own privilege changing. If in-process elevation is ever added,
+#   switch these gates to call _is_admin() at check time (it's microseconds).
 #
 # M41: single source of truth for `is_admin()` lives in `src.autostart`
 # (alongside the elevated-relaunch helper that the tray uses). Importing

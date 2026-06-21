@@ -195,8 +195,9 @@ def _category(name: str | None) -> str | None:
     key = _WS_RE.sub(" ", name.strip().lower())
     if key in _CATEGORY_ALIASES:
         return _CATEGORY_ALIASES[key]
-    # A single descriptive word we don't alias (e.g. "sports" — that's a
-    # different tool) → None so the caller can say what it DOES cover.
+    # A word we don't have a bucket for (e.g. "weather" — that's a different
+    # tool) → None so the caller can say what it DOES cover. (Note: "sports"
+    # and "gaming" ARE aliased as of M55, so they resolve above, not here.)
     return None
 
 

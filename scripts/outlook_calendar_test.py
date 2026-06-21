@@ -190,6 +190,12 @@ check("_normalise_ical_event: all-day flagged",
       ev is not None and ev.is_all_day is True)
 check("_normalise_ical_event: all-day subject still parses",
       ev is not None and ev.subject == "Memorial Day holiday")
+# Regression: an all-day DTSTART:20260615 must land on 2026-06-15 LOCALLY in any
+# timezone. The old code stamped the naive midnight UTC then converted to local,
+# shifting the date backward (to 06-14) in behind-UTC zones. start_local.date()
+# == the source date is the timezone-independent invariant the fix guarantees.
+check("_normalise_ical_event: all-day date not shifted by TZ conversion",
+      ev is not None and ev.start_local.date().isoformat() == "2026-06-15")
 
 
 # --- Test 8: recurring-ical-events expands RRULE into instances ----------

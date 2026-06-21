@@ -113,7 +113,7 @@ def setup_logging() -> Path:
       You see live output AND the conversation is persisted.
     - pythonw main.py (rare; no launcher): no console to tee to, redirect only.
     """
-    from src.logfile import rotate_if_needed
+    from src.logfile import rotate_if_needed, TimestampStream
 
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -132,12 +132,16 @@ def setup_logging() -> Path:
 
     if sys.stdout is None or sys.stderr is None:
         # pythonw without the launcher — no console to tee to.
-        sys.stdout = log_file
-        sys.stderr = log_file
+        stamped = TimestampStream(log_file)
+        sys.stdout = stamped
+        sys.stderr = stamped
     else:
-        # Console mode — tee both. Live terminal output + persistent file.
-        sys.stdout = _TeeStream(sys.stdout, log_file)
-        sys.stderr = _TeeStream(sys.stderr, log_file)
+        # Console mode — tee both. Live terminal output + persistent file. Only
+        # the FILE side is timestamped (one shared wrapper so stdout/stderr share
+        # the line state); the live terminal stays clean for dev readability.
+        stamped_file = TimestampStream(log_file)
+        sys.stdout = _TeeStream(sys.stdout, stamped_file)
+        sys.stderr = _TeeStream(sys.stderr, stamped_file)
 
     return log_path
 
@@ -466,7 +470,7 @@ class TurnRunner:
         self, *, llm_stream, pc_silent: bool, barge_enabled: bool,
         session: "AudioSession | None", interrupt_event: "threading.Event | None",
         language: str, reply_text: "Callable[[str], None] | None",
-        aec_barge: bool = False,
+        aec_barge_on: bool = False,
     ) -> bool:
         """Run the LLM stream and, when audible, speak it — holding the
         cooperative speech gates for the spoken portion and running the
@@ -508,9 +512,10 @@ class TurnRunner:
                 # Jarvis", just sets interrupt_event — speak_streaming polls it
                 # and performs the sd.stop() cut on its own (stream-owning)
                 # thread, the WASAPI thread-affinity fix. M88 Phase 2: when
-                # `aec_barge` is on we do NOT start this monitor — the duplex AEC
-                # stream inside speak_streaming does the detection (hands-free
-                # talk-over) and sets the same interrupt_event.
+                # `aec_barge_on` is set we do NOT start this monitor — the duplex
+                # AEC stream inside speak_streaming does the detection (hands-free
+                # talk-over) and sets the same interrupt_event. (Named *_on to not
+                # shadow the imported `aec_barge` module — see process_question.)
                 if barge_enabled:
                     monitor_thread = threading.Thread(
                         target=monitor_for_wake_word,
@@ -526,7 +531,7 @@ class TurnRunner:
                     on_first_audio=lambda: self._ui.set_state(State.SPEAKING),
                     on_amplitude=self._ui.set_amplitude,
                     interrupt_event=interrupt_event,
-                    aec_barge_device=(self._mic_device if aec_barge else None),
+                    aec_barge_device=(self._mic_device if aec_barge_on else None),
                     # M88 Phase 2: on a hands-free cut, flip the orb to LISTENING
                     # the instant we detect — not after the stream teardown — so
                     # it doesn't linger on SPEAKING.
@@ -779,7 +784,7 @@ class TurnRunner:
                 llm_stream=llm_stream, pc_silent=pc_silent,
                 barge_enabled=barge_enabled, session=session,
                 interrupt_event=interrupt_event, language=language,
-                reply_text=reply_text, aec_barge=aec_barge_on,
+                reply_text=reply_text, aec_barge_on=aec_barge_on,
             ):
                 return False
 
@@ -1319,6 +1324,21 @@ def listen_loop(
                     )
                 except Exception as exc:
                     print(f"[main] STT failed: {exc}")
+                    # M88: a PERSISTENT STT failure (GPU server down, mic device
+                    # yanked, decode error) must not spin conversation mode
+                    # forever — unlike the wake-word path it has no blocking
+                    # fallback, so an exception that re-arms immediately is a hot
+                    # loop. Count a failure like an empty window so the same idle
+                    # auto-exit drops us back to standby; a transient blip just
+                    # adds one (reset to 0 on the next real utterance).
+                    if conversation_mode.is_set():
+                        idle_empties += 1
+                        if idle_empties >= _CONVERSATION_IDLE_EXITS:
+                            print("[conversation] repeated STT failure — mode OFF, "
+                                  "back to wake word\n", file=sys.stderr)
+                            conversation_mode.clear()
+                            idle_empties = 0
+                            ui.set_state(State.IDLE)
                     followup = False
                     continue
 
@@ -1487,6 +1507,11 @@ def listen_loop(
                 if _interp_start.is_start_intent(transcript.text):
                     ui.add_user_text(transcript.text, transcript.language)
                     interpreter_mode.set()
+                    # Modes are mutually exclusive: entering interpreter from
+                    # conversation mode must drop conversation mode, else "stop
+                    # interpreting" later would silently fall back INTO it
+                    # instead of returning to the wake-word baseline.
+                    conversation_mode.clear()
                     print("[interpreter] mode ON (voice)", file=sys.stderr)
                     runner.speak_line(_interp_start.START_CONFIRM_EN, "en")
                     if "es" in _interp_start.LANG_PAIR:
@@ -1516,6 +1541,7 @@ def listen_loop(
                 elif _convo.is_start_intent(transcript.text):
                     ui.add_user_text(transcript.text, transcript.language)
                     conversation_mode.set()
+                    interpreter_mode.clear()  # mutually exclusive (see above)
                     followup = True
                     idle_empties = 0
                     print("[conversation] mode ON (voice)", file=sys.stderr)
@@ -1542,7 +1568,8 @@ def listen_loop(
                 # turn AND exits the mode — with a brief spoken acknowledgement
                 # (unlike the silent follow-up close, since the user explicitly
                 # ended a back-and-forth).
-                if (followup or conversation_mode.is_set()) and _is_dismissal(transcript.text):
+                is_signoff = _is_dismissal(transcript.text)
+                if (followup or conversation_mode.is_set()) and is_signoff:
                     ui.add_user_text(transcript.text, transcript.language)
                     print("[main] sign-off — closing without an LLM turn\n",
                           file=sys.stderr)
@@ -1579,7 +1606,7 @@ def listen_loop(
                           file=sys.stderr)
                     followup = True
                     barged = True  # M52: next iteration skips session.drain()
-                elif _is_dismissal(transcript.text):
+                elif is_signoff:
                     print("[main] user signed off — no follow-up window\n",
                           file=sys.stderr)
                     followup = False
