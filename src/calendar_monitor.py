@@ -71,6 +71,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 
+from src.atomic_io import atomic_write_text
+
 # --- Tunables (module-local, env-driven; same pattern as homelab_monitor) ---
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -239,9 +241,12 @@ class DedupeStore:
             payload = json.dumps(pruned)
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self._path)
+            # 2026-07-02 QA: migrated to the shared durable write (fsync +
+            # unique temp + Windows replace-retry). This store backs the
+            # 168-hour WEATHER dedupe too — a torn/unsynced file after a power
+            # loss (the no-UPS box) re-announced still-active multi-day NWS
+            # warnings, the exact re-fire class the long retention prevents.
+            atomic_write_text(self._path, payload)
         except OSError as exc:
             print(f"[calendar] dedupe save failed: {exc}", file=sys.stderr)
 
@@ -300,6 +305,13 @@ class CalendarMonitor:
             print("[calendar] not configured (set OUTLOOK_ICAL_URL) — "
                   "not starting", file=sys.stderr)
             return
+        # 2026-07-02 QA: a rapid deactivate→activate (tray double-toggle) can
+        # see the OLD loop thread still mid-exit, skip the spawn below, and
+        # end up "active" with no loop. Join the dying thread first so the
+        # is_alive() check is truthful. (Same fix across all four monitors.)
+        if (self._thread is not None and self._stop.is_set()
+                and self._thread.is_alive()):
+            self._thread.join(timeout=2.0)
         self._active.set()
         self._stop.clear()
         print(f"[calendar] monitor activated — poll {_POLL_SECONDS}s, "

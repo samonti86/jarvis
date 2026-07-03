@@ -542,6 +542,17 @@ def execute_tmdb_tool(params: dict) -> str:
     """Run the tool. Always returns a string for Claude — never raises.
     Same shape as execute_games_tool: validate key + args up front, dispatch
     on mode, every failure path is a readable string."""
+    # 2026-07-02 QA: last-resort net so the never-raises contract doesn't rest
+    # solely on per-helper guards (e.g. an unguarded int() on an API id) —
+    # the same defensive ceiling system_control/pc_shell already have.
+    try:
+        return _execute_tmdb_tool(params)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tmdb] tool failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return "The movie/TV lookup hit an unexpected error, sir."
+
+
+def _execute_tmdb_tool(params: dict) -> str:
     key = _api_key()
     if not key:
         return (

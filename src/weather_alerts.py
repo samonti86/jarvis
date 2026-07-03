@@ -273,8 +273,9 @@ class WeatherAlertMonitor:
         self._severities = _announce_severities()
 
         # Geocoded home point, resolved lazily on the first poll and cached.
+        # (A failed geocode is simply retried on the next poll — no permanent-
+        # failure latch; a dead flag claiming otherwise was removed 2026-07-02.)
         self._latlon: tuple[float, float] | None = None
-        self._geocode_failed = False
 
         self._active = threading.Event()
         self._stop = threading.Event()
@@ -293,6 +294,11 @@ class WeatherAlertMonitor:
             print("[weather] no JARVIS_HOME_LOCATION — alerts monitor not "
                   "starting", file=sys.stderr)
             return
+        # 2026-07-02 QA: join a mid-exit old thread so the is_alive() spawn
+        # check below is truthful (see calendar_monitor.activate).
+        if (self._thread is not None and self._stop.is_set()
+                and self._thread.is_alive()):
+            self._thread.join(timeout=2.0)
         self._active.set()
         self._stop.clear()
         print(f"[weather] alerts monitor activated — poll {_POLL_SECONDS}s, "

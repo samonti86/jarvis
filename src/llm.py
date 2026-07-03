@@ -773,6 +773,30 @@ def _format_today() -> str:
     return now.strftime("%A, %B ") + str(now.day) + now.strftime(", %Y")
 
 
+def _format_now_time() -> str:
+    """Cross-platform '7:05 PM' (no leading zero on hour)."""
+    return datetime.now().strftime("%I:%M %p").lstrip("0")
+
+
+# 2026-07-02 QA — process-wide Anthropic client. A fresh Anthropic() per turn
+# built a new httpx connection pool each time: a fresh TLS handshake on the
+# hot path EVERY turn (compounded per relayed utterance in interpreter mode),
+# with old sockets reclaimed only by GC. The SDK client is thread-safe; one
+# instance serves every caller. Keyed so a changed api_key (tests) rebuilds.
+_client_lock = threading.Lock()
+_shared_client: "anthropic.Anthropic | None" = None
+_shared_client_key: str | None = None
+
+
+def _get_client(api_key: str) -> "anthropic.Anthropic":
+    global _shared_client, _shared_client_key
+    with _client_lock:
+        if _shared_client is None or _shared_client_key != api_key:
+            _shared_client = anthropic.Anthropic(api_key=api_key)
+            _shared_client_key = api_key
+        return _shared_client
+
+
 def build_system_prompt(
     summaries: list[SummaryRecord] | None = None,
     plex_available: bool = False,
@@ -1033,7 +1057,7 @@ def stream_translation(
     swallows it so the interpreter loop keeps going."""
     from src.interpreter import build_translation_prompt  # noqa: PLC0415
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _get_client(api_key)
     with client.messages.stream(
         model=model,
         max_tokens=1024,  # ample for one spoken utterance
@@ -1096,7 +1120,7 @@ def stream_response(
     callback — an accepted, minor cost on an interrupted turn.
     """
     started_at = time.monotonic()
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _get_client(api_key)
     system_text = build_system_prompt(
         summaries,
         plex_available=plex_client is not None,
@@ -1130,6 +1154,12 @@ def stream_response(
             "Vocal delivery this turn — how he SOUNDED, not stated in his words: "
             f"{vocal_cue}. Use it ONLY to calibrate your manner (see Tone awareness)."
         )
+    # 2026-07-02 QA (the "12:00 AM" clock bug): the cached prefix anchors the
+    # DATE only — by design, so the cache invalidates once per day, not per
+    # turn. The current TIME rides this per-turn UNcached block instead:
+    # "what time is it" now answers from ground truth, at a few fresh tokens
+    # per turn and zero cache-miss cost.
+    _per_turn.append(f"Current local time: {_format_now_time()}.")
     if _per_turn:
         system_param.append({"type": "text", "text": "\n\n".join(_per_turn)})
     tools = [

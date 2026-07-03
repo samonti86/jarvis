@@ -366,9 +366,15 @@ def reindex() -> ReindexResult:
                 "can't index knowledge, sir.",
             )
 
-        # Rebuild atomically: build into the live table inside one
-        # transaction so a crash mid-reindex can't leave a half-empty index
-        # that silently returns nothing.
+        # Rebuild atomically (2026-07-02 QA): Python's sqlite3 in its default
+        # legacy transaction mode runs DDL in AUTOCOMMIT — the DROP/CREATE
+        # below used to take effect immediately, so a crash mid-insert (power
+        # loss on the no-UPS box) left a committed EMPTY index that silently
+        # returned nothing for every query. Take manual control and wrap the
+        # WHOLE rebuild (SQLite DDL is transactional) in one BEGIN IMMEDIATE:
+        # until COMMIT, a crash rolls back to the intact OLD index.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("DROP TABLE IF EXISTS chunks")
         # path UNINDEXED: stored so we can name the source file in results,
         # but not tokenized (we never search on the path). porter stemming so

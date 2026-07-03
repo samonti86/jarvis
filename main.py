@@ -39,11 +39,13 @@ import re
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, NamedTuple
 
 from src.audio import AudioSession, resolve_input_device
+from src.gates import CountedEvent
 from src.config import Config, load
 from src.llm import TelemetryRecord, stream_response, stream_translation
 from src.memory import MemoryStore, SummaryRecord, default_base_dir, summarize_session
@@ -217,7 +219,12 @@ _DISMISSAL_PHRASES = frozenset({
     "that is everything", "thats everything", "nothing else", "nothing more",
     "no thank you", "no thanks", "im done", "im good", "im all set",
     "we are done", "were done", "all done", "thank you jarvis",
-    "thanks jarvis", "goodbye", "good night", "goodnight",
+    "thanks jarvis", "goodbye",
+    # 2026-07-02 QA: "good night"/"goodnight" REMOVED — as dismissals they
+    # short-circuited before the LLM on any follow-up/conversation-mode turn,
+    # shadowing the M63 get_good_night wrap (security state + tomorrow's
+    # schedule/weather). "Good night" now reaches Claude and routes to the
+    # wrap; the reply's follow-up window then just elapses to standby.
 })
 
 # M51 follow-on (2026-05-21): a trailing courtesy masks a sign-off. "That is
@@ -297,7 +304,7 @@ class TurnRunner:
         # the always-on voice-capture loop discards self-audio (omni-mic echo
         # fix). Shared with the Announcer (announces set it too); a fresh local
         # Event if unwired (tests / standalone) so it's never None.
-        self._pc_speaking = pc_speaking if pc_speaking is not None else threading.Event()
+        self._pc_speaking = pc_speaking if pc_speaking is not None else CountedEvent()
         # Cooperative SPEECH gate (the 2026-05-19 stutter post-mortem) — SET
         # while this turn plays audio so the armed CPU loops (SoundDetector's
         # PANNs inference, SecurityWatcher's YOLO/grab/gc bursts) DEFER and
@@ -307,7 +314,7 @@ class TurnRunner:
         # announces were gated (see _build_announcer's CONTRACT). Distinct from
         # `pc_speaking` (mic-capture echo) — different failure, same lifetime.
         self._announce_speaking = (
-            announce_speaking if announce_speaking is not None else threading.Event()
+            announce_speaking if announce_speaking is not None else CountedEvent()
         )
 
         self._history: list[dict] = []
@@ -1163,8 +1170,23 @@ def listen_loop(
     text_thread = threading.Thread(target=text_input_loop, daemon=True)
     text_thread.start()
 
-    try:
+    # 2026-07-02 QA: the voice loop's mic session lifetime, extracted so the
+    # supervisor below can re-open it after a failure. Live incident: a
+    # PortAudioError -9985 ("Device unavailable") on this open killed the
+    # thread unhandled and Jarvis ran DEAF all day — every other subsystem
+    # stayed up, and the watchdog only sees process exit, not thread death.
+    # The acoustic stream opened the SAME device 35 minutes later, so a retry
+    # recovers. Mode state (follow-up window, interpreter/conversation Events)
+    # deliberately re-initializes on re-open — standby is the only honest
+    # state after the mic has been away.
+    def _voice_session_loop() -> None:
+        nonlocal mic_failures
         with AudioSession(sample_rate=cfg.sample_rate, device=mic_device) as session:
+            if mic_failures:
+                print("[audio] microphone recovered — voice loop resuming",
+                      file=sys.stderr)
+                ui.add_system_text("🎙 Microphone recovered — listening again.")
+                mic_failures = 0
             # M51: True ⇒ the previous turn just ended; listen for a follow-up
             # WITHOUT requiring "Hey Jarvis" (a longer pre-speech window;
             # silence past it falls back to wake-word mode). Starts False —
@@ -1187,6 +1209,9 @@ def listen_loop(
             # counts consecutive silent windows toward the auto-exit-to-standby.
             conversation_mode = threading.Event()
             idle_empties = 0
+            # 2026-07-02 QA: consecutive interpreter STT failures — the
+            # interpreter analog of conversation mode's idle_empties escape.
+            interp_failures = 0
             while not ui.shutdown.is_set():
                 # M52: skip the drain on the post-barge-in iteration so the
                 # already-spoken follow-up survives into capture; otherwise
@@ -1222,6 +1247,15 @@ def listen_loop(
                 # transcribe Jarvis's own translation.
                 if interpreter_mode.is_set():
                     followup = False  # interpreter supersedes the follow-up window
+                    # 2026-07-02 QA: honour a tray "Reset conversation" while
+                    # interpreting — this branch never consulted reset_event, so
+                    # the click was silently inert until the mode was exited BY
+                    # VOICE (impossible when STT itself is failing). Exit the
+                    # mode and fall through; the wake-word path seals the reset.
+                    if reset_event.is_set():
+                        interpreter_mode.clear()
+                        print("[interpreter] mode OFF (reset)", file=sys.stderr)
+                        continue
                     ui.set_state(State.LISTENING)
                     try:
                         transcript = transcribe_after_wake(
@@ -1237,7 +1271,20 @@ def listen_loop(
                     except Exception as exc:
                         print(f"[main] interpreter STT failed: {exc}",
                               file=sys.stderr)
+                        # 2026-07-02 QA: a PERSISTENT STT failure (mic yanked,
+                        # backend down) must not spin this wake-word-less branch
+                        # as a hot loop with no exit — the only voice escape
+                        # ("stop interpreting") needs a SUCCESSFUL transcription.
+                        # Same escape shape as conversation mode's idle counter.
+                        interp_failures += 1
+                        if interp_failures >= _CONVERSATION_IDLE_EXITS:
+                            interpreter_mode.clear()
+                            interp_failures = 0
+                            print("[interpreter] repeated STT failure — mode OFF, "
+                                  "back to wake word", file=sys.stderr)
+                            ui.set_state(State.IDLE)
                         continue
+                    interp_failures = 0
                     if ui.shutdown.is_set():
                         break
                     if not transcript.text:
@@ -1348,6 +1395,16 @@ def listen_loop(
                     # auto-exit to standby so we're not listening to an empty
                     # room forever. Silent exit (no spoken note — the user has
                     # likely stepped away).
+                    # 2026-07-02 QA: an empty transcript caused by the
+                    # suppress_event abort (a proactive announce started mid-
+                    # window) is NOT user idleness — don't let a chatty reminder
+                    # schedule silently exit conversation mode while the user is
+                    # present. The announce is still playing when we get here
+                    # (the abort fires the instant it starts), so pc_speaking
+                    # reliably tags the suppressed case.
+                    if (conversation_mode.is_set() and pc_speaking is not None
+                            and pc_speaking.is_set()):
+                        continue
                     if conversation_mode.is_set():
                         idle_empties += 1
                         if idle_empties >= _CONVERSATION_IDLE_EXITS:
@@ -1367,9 +1424,6 @@ def listen_loop(
                     else:
                         print("[main] (no speech captured)\n")
                     continue
-
-                # M88: heard something — reset the conversation-mode idle counter.
-                idle_empties = 0
 
                 # M69: identify the speaker on the SAME audio STT just captured.
                 # Active only when at least one voice is enrolled. The per-turn
@@ -1417,9 +1471,27 @@ def listen_loop(
                             if speaker_gate is not None and speaker_gate.is_set():
                                 print("[speaker] voice-lock active → ignoring "
                                       "unrecognized turn", file=sys.stderr)
+                                # 2026-07-02 QA: a gate-dropped turn is NOT the
+                                # user — count it toward the conversation-mode
+                                # idle exit, else background media (TV/YouTube)
+                                # keeps the hands-free window alive forever.
+                                if conversation_mode.is_set():
+                                    idle_empties += 1
+                                    if idle_empties >= _CONVERSATION_IDLE_EXITS:
+                                        print("[conversation] only unrecognized "
+                                              "voices heard — mode OFF, back to "
+                                              "wake word\n", file=sys.stderr)
+                                        conversation_mode.clear()
+                                        idle_empties = 0
                                 ui.set_state(State.IDLE)
                                 followup = False
                                 continue
+
+                # M88: heard a real (non-gate-dropped) utterance — reset the
+                # conversation-mode idle counter. (2026-07-02 QA: moved BELOW
+                # the voice-lock gate — a dropped media turn used to reset the
+                # counter it should have been incrementing.)
+                idle_empties = 0
 
                 # Hand the transcript to the security subsystem first. It
                 # consumes the turn (returns True) for both challenge
@@ -1612,6 +1684,34 @@ def listen_loop(
                     followup = False
                 else:
                     followup = True
+
+    # Mic-session supervisor: the listening loop degrades and retries, never
+    # dies. Any escape from the body (mic-open failure, a mid-session device
+    # error out of wait_for_wake_word, a stalled-stream RuntimeError from
+    # AudioSession.read) lands here; we surface it once per outage — console
+    # line + spoken alert (the speakers usually survive a mic loss) — then
+    # re-open on a capped backoff. The typed/remote paths keep running
+    # throughout (text_input_loop is its own thread).
+    mic_failures = 0
+    try:
+        while not ui.shutdown.is_set():
+            try:
+                _voice_session_loop()
+            except Exception as exc:  # noqa: BLE001 — the voice loop must never die
+                mic_failures += 1
+                delay = min(60.0, 10.0 * mic_failures)
+                if mic_failures == 1:
+                    traceback.print_exc(file=sys.stderr)
+                    ui.add_system_text(
+                        "⚠ Microphone unavailable — voice commands are down; retrying…")
+                    runner.speak_line(
+                        "I seem to have lost the microphone, sir. I'll keep trying.")
+                print(f"[audio] voice loop error ({type(exc).__name__}: {exc}) — "
+                      f"retry {mic_failures} in {delay:.0f}s", file=sys.stderr)
+                ui.shutdown.wait(delay)
+                continue
+            # A clean return means shutdown was requested — exit the supervisor.
+            break
     finally:
         # Quit / shutdown: seal whatever's still in memory so we don't lose it.
         if runner.has_active_conversation():
@@ -1739,7 +1839,11 @@ def _build_announcer(ui: JarvisUI, pc_speaking: threading.Event) -> _Announcer:
     # cooperative speech gate that fixes the armed-only TTS stutter
     # (diagnosed 2026-05-19: any GIL/CPU burst overlapping the Python-fed
     # TTS path underruns the audio buffer). Owned by the Announcer thread.
-    announce_speaking = threading.Event()
+    # 2026-07-02 QA: a CountedEvent, because turn replies ALSO raise this gate
+    # (M68) and an announce can overlap a playing reply — with a plain Event,
+    # whichever speaker finished FIRST dropped the gate while the other was
+    # still talking (armed CPU loops resumed mid-speech). set/clear now nest.
+    announce_speaking = CountedEvent()
 
     def _announcer_loop() -> None:
         """Dedicated proactive-speech thread (see docstring above for why).
@@ -2166,7 +2270,9 @@ def main() -> None:
     # instead of transcribing Jarvis's own reply. Distinct from
     # `announce_speaking` (which gates security/sound CPU bursts): this gates
     # mic capture, and covers turn replies too, not just announces.
-    pc_speaking = threading.Event()
+    # 2026-07-02 QA: CountedEvent so an announce overlapping a turn reply
+    # can't drop the gate early — see src/gates.py.
+    pc_speaking = CountedEvent()
 
     # Proactive-speech subsystem: a dedicated WASAPI-safe Announcer thread.
     # _build_announcer returns the non-blocking announce() entry every

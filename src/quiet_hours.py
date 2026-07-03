@@ -39,6 +39,7 @@ import json
 import os
 import re
 import sys
+import threading
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
@@ -143,6 +144,13 @@ def _save(items: list[dict]) -> None:
     atomic_write_text(_store_path(), json.dumps(items, indent=2, ensure_ascii=False))
 
 
+# 2026-07-02 QA: record_deferred (announce thread) and take_deferred (briefing
+# thread) are both load-mutate-save cycles; unserialized, one interleaving
+# resurrects already-surfaced items and the opposite one silently drops a fresh
+# deferral. atomic_write_text prevents torn FILES, not lost UPDATES.
+_STORE_LOCK = threading.Lock()
+
+
 def record_deferred(text: str, label: str, now: datetime | None = None) -> None:
     """Append a held-back announce to the catch-up store. Never raises — a
     failure here just means the note won't appear in the morning catch-up; it
@@ -150,13 +158,14 @@ def record_deferred(text: str, label: str, now: datetime | None = None) -> None:
     if not text:
         return
     try:
-        items = _load()
-        items.append({
-            "ts": (now or datetime.now()).isoformat(timespec="seconds"),
-            "text": text,
-            "label": label,
-        })
-        _save(items[-_MAX_DEFERRED:])  # keep the newest, bound the file
+        with _STORE_LOCK:
+            items = _load()
+            items.append({
+                "ts": (now or datetime.now()).isoformat(timespec="seconds"),
+                "text": text,
+                "label": label,
+            })
+            _save(items[-_MAX_DEFERRED:])  # keep the newest, bound the file
     except Exception as exc:  # noqa: BLE001
         print(f"[quiet] record_deferred failed: {exc}", file=sys.stderr)
 
@@ -166,19 +175,20 @@ def take_deferred(now: datetime | None = None) -> list[dict]:
     are dropped). Called by the briefing to surface 'while you were away'.
     Never raises — returns [] on any failure."""
     try:
-        items = _load()
-        if not items:
-            return []
-        now = now or datetime.now()
-        cutoff = now - timedelta(hours=_MAX_DEFERRED_AGE_HOURS)
-        fresh: list[dict] = []
-        for it in items:
-            try:
-                if datetime.fromisoformat(it.get("ts", "")) >= cutoff:
-                    fresh.append(it)
-            except (ValueError, TypeError):
-                continue  # undated/garbage → drop
-        _save([])  # clear all (incl. the stale ones we dropped)
+        with _STORE_LOCK:
+            items = _load()
+            if not items:
+                return []
+            now = now or datetime.now()
+            cutoff = now - timedelta(hours=_MAX_DEFERRED_AGE_HOURS)
+            fresh: list[dict] = []
+            for it in items:
+                try:
+                    if datetime.fromisoformat(it.get("ts", "")) >= cutoff:
+                        fresh.append(it)
+                except (ValueError, TypeError):
+                    continue  # undated/garbage → drop
+            _save([])  # clear all (incl. the stale ones we dropped)
         return fresh
     except Exception as exc:  # noqa: BLE001
         print(f"[quiet] take_deferred failed: {exc}", file=sys.stderr)

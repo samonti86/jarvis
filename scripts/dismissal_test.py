@@ -51,7 +51,6 @@ POSITIVES = [
     "we're done",
     "all done",
     "goodbye",
-    "good night",
     "thank you Jarvis",
     # courtesy-stripped tails (the M51 follow-on):
     "that is all, thank you",
@@ -75,6 +74,11 @@ NEGATIVES = [
     "thanks",
     "set a timer for ten minutes",
     "",                                           # empty transcript
+    # 2026-07-02 QA: "good night" must reach the LLM so it can route to the
+    # M63 get_good_night wrap — as a dismissal it short-circuited the wrap
+    # on every follow-up/conversation-mode turn.
+    "good night",
+    "goodnight",
 ]
 for n in NEGATIVES:
     check(f"not a dismissal: {n!r}", _is_dismissal(n) is False)

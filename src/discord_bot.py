@@ -298,11 +298,18 @@ class DiscordBot:
                             auto_archive_duration=60,
                         )
                         self._bot_threads.add(target.id)
-                    except discord.Forbidden:
+                    except discord.HTTPException as exc:
+                        # 2026-07-02 QA: broadened from Forbidden — any other
+                        # create_thread failure (e.g. HTTP 400 "message already
+                        # has a thread" when the user manually started one, or
+                        # the parent message deleted mid-turn) used to fall to
+                        # the outer except and silently DISCARD the whole
+                        # composed reply. Inline fallback keeps the answer.
                         print(
-                            "[discord] no thread permission — replying inline. "
-                            "Grant the bot 'Create Public Threads' + 'Send "
-                            "Messages in Threads' to enable threaded replies.",
+                            f"[discord] create_thread failed ({exc}) — replying "
+                            "inline. If this is a permission error, grant the "
+                            "bot 'Create Public Threads' + 'Send Messages in "
+                            "Threads' to enable threaded replies.",
                             file=sys.stderr,
                         )
                         target = channel

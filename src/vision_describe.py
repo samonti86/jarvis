@@ -51,7 +51,12 @@ def describe_scene(
         return None
     try:
         import anthropic  # noqa: PLC0415 — lazy; never block import on a bg feature
-        client = anthropic.Anthropic(api_key=api_key)
+        # 2026-07-02 QA: explicit timeout — the SDK default (~10 min, plus
+        # retries) could park the M72 armed visual-alert thread for tens of
+        # minutes per acoustic fire during a network outage, accumulating
+        # threads and posting long-stale photos. Same fix the 2026-06-21 pass
+        # applied to the anticipation client.
+        client = anthropic.Anthropic(api_key=api_key, timeout=30.0, max_retries=1)
         b64 = base64.b64encode(jpeg_bytes).decode("ascii")
         msg = client.messages.create(
             model=model,

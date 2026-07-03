@@ -100,7 +100,10 @@ def send_discord_alert(
             files=files,
             timeout=_DISCORD_TIMEOUT_SECONDS,
         )
-    except httpx.HTTPError as exc:
+    except Exception as exc:  # noqa: BLE001 — the never-raises contract: the
+        # security deterrent calls these with NO try-wrapper of its own, and
+        # httpx.InvalidURL (a malformed webhook URL in .env) is NOT an
+        # HTTPError subclass — it escaped the old narrow catch (2026-07-02 QA).
         print(f"[notify] discord POST failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         return False

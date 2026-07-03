@@ -122,6 +122,33 @@ with tempfile.TemporaryDirectory() as tmp:
     check("mining sets the last_mined_at watermark", store["last_mined_at"] is not None)
 
 
+# --- Test 4a (2026-07-02 QA): a FAILED mine must not advance the watermark ---
+# A miner error (API down / unparseable output) was previously
+# indistinguishable from "no predictions found" — the watermark advanced and
+# any prediction made in that window was permanently skipped.
+def _raising_miner(_transcript):
+    raise RuntimeError("api down")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    base = Path(tmp)
+    _write_session(base, datetime.now() - timedelta(days=2),
+                   [(_iso(2), "who wins the finals?", "I'd lean Spurs in six.")])
+    with _env(LOCALAPPDATA=tmp):
+        n = pr.mine_predictions(miner=_raising_miner)
+        check("failed mine adds nothing", n == 0)
+        check("failed mine does NOT advance the watermark",
+              pr._load()["last_mined_at"] is None)
+        check("miner returning None (unparseable) keeps the watermark too",
+              pr.mine_predictions(miner=lambda t: None) == 0
+              and pr._load()["last_mined_at"] is None)
+        # The window is still minable afterwards.
+        check("window re-mined successfully after the failure",
+              pr.mine_predictions(miner=_stub_miner) == 1)
+        check("successful mine advances the watermark",
+              pr._load()["last_mined_at"] is not None)
+
+
 # --- Test 4b: made_at FALLBACK uses the EARLIEST exchange, not the latest ---
 # When the miner returns no per-prediction date, an old backfilled prediction
 # must look OLD (earliest exchange), not fresh — else its first resolve check is

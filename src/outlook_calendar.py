@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -83,12 +84,24 @@ def _fetch_events_ical(start_utc: datetime, end_utc: datetime) -> tuple[list[Cal
     few hours stale. Acceptable for v1; the alternative (polling more
     aggressively) would burn bandwidth for no real benefit since the
     user's calendar doesn't change minute-to-minute."""
-    try:
-        resp = httpx.get(ICAL_URL, follow_redirects=True, timeout=15.0)
-    except httpx.HTTPError as exc:
-        print(f"[outlook] ical fetch failed: "
-              f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        return (None, "I couldn't reach the Outlook iCal feed just now, sir.")
+    # 2026-07-02 QA: one retry after a short backoff (the http_util pattern) —
+    # the live log shows several transient TLS-handshake timeouts per day on
+    # this uplink, and this path had ZERO retries while weather had one: a
+    # single blip failed an on-demand "what's on my calendar?" outright.
+    resp = None
+    for attempt in (1, 2):
+        try:
+            resp = httpx.get(ICAL_URL, follow_redirects=True, timeout=15.0)
+            break
+        except httpx.HTTPError as exc:
+            print(f"[outlook] ical fetch failed: "
+                  f"{type(exc).__name__}: {exc}"
+                  + (" — retrying in 0.5s" if attempt == 1 else ""),
+                  file=sys.stderr)
+            if attempt == 2:
+                return (None,
+                        "I couldn't reach the Outlook iCal feed just now, sir.")
+            time.sleep(0.5)
     if resp.status_code != 200:
         print(f"[outlook] ical HTTP {resp.status_code}: {resp.text[:200]}",
               file=sys.stderr)

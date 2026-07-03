@@ -25,6 +25,7 @@ Embeddings must never break the tools that use them.
 from __future__ import annotations
 
 import sys
+import threading
 
 
 _EMBED_MODEL = "all-MiniLM-L6-v2"
@@ -33,26 +34,32 @@ _EMBED_MODEL = "all-MiniLM-L6-v2"
 # fallback for the rest of the process), else the loaded model object.
 _embedder: object | None = None
 
+# 2026-07-02 QA: the whole point of this module is ONE model instance, but the
+# lazy check-then-load was unsynchronized — a tray "Reindex knowledge" racing a
+# turn-thread recall_conversation on first use loaded the ~80 MB model twice.
+_load_lock = threading.Lock()
+
 
 def get_embedder():
     """The embedding model, lazily loaded and cached process-wide. Returns None
     if sentence-transformers isn't installed or the model can't load — callers
     fall back to keyword-only search."""
     global _embedder
-    if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-            print(f"[embeddings] loading model ({_EMBED_MODEL})…", file=sys.stderr)
-            _embedder = SentenceTransformer(_EMBED_MODEL)
-            print("[embeddings] model ready", file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001 — degrade, never crash
-            print(
-                f"[embeddings] unavailable ({type(exc).__name__}: {exc}) "
-                f"— keyword-only search",
-                file=sys.stderr,
-            )
-            _embedder = False
-    return _embedder or None
+    with _load_lock:
+        if _embedder is None:
+            try:
+                from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+                print(f"[embeddings] loading model ({_EMBED_MODEL})…", file=sys.stderr)
+                _embedder = SentenceTransformer(_EMBED_MODEL)
+                print("[embeddings] model ready", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 — degrade, never crash
+                print(
+                    f"[embeddings] unavailable ({type(exc).__name__}: {exc}) "
+                    f"— keyword-only search",
+                    file=sys.stderr,
+                )
+                _embedder = False
+        return _embedder or None
 
 
 def embed(texts: list[str]):

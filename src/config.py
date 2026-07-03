@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -28,12 +29,21 @@ def _int_env(name: str, default: int) -> int:
 
 def _float_env(name: str, default: float) -> float:
     """float from env `name`, falling back to `default` if unset or non-numeric.
-    Same never-crash rationale as _int_env."""
+    Same never-crash rationale as _int_env.
+
+    2026-07-02 QA: non-finite values are rejected too — float('nan') parses,
+    and a JARVIS_SPEAKER_THRESHOLD=nan makes every `score >= threshold`
+    comparison False: with the voice-lock gate ON that's a silent total
+    lockout, with no [config] warning. Exactly the failure class this helper
+    exists to catch."""
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("non-finite")
+        return value
     except ValueError:
         print(f"[config] {name}={raw!r} is not a number; using {default}",
               file=sys.stderr)

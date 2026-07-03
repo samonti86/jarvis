@@ -58,15 +58,21 @@ class Transcript:
 
 
 _model: WhisperModel | None = None
+# 2026-07-02 QA: the lazy load is reachable from TWO threads — the listen-loop
+# (transcribe_after_wake) and a remote-origin worker (transcribe_blob for
+# phone voice / the GPU auto-fallback). An unsynchronized first use loaded two
+# ~250 MB WhisperModels, one leaked until GC — on a box idling ~1.2 GB free.
+_model_lock = threading.Lock()
 
 
 def _get_model(name: str) -> WhisperModel:
     global _model
-    if _model is None:
-        print(f"[stt] loading whisper model '{name}'...", file=sys.stderr)
-        _model = WhisperModel(name, device="cpu", compute_type="int8")
-        print("[stt] model ready", file=sys.stderr)
-    return _model
+    with _model_lock:
+        if _model is None:
+            print(f"[stt] loading whisper model '{name}'...", file=sys.stderr)
+            _model = WhisperModel(name, device="cpu", compute_type="int8")
+            print("[stt] model ready", file=sys.stderr)
+        return _model
 
 
 def _rms(chunk_i16: np.ndarray) -> float:

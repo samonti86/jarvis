@@ -422,7 +422,25 @@ class JarvisUI:
 
     def _run_tray(self) -> None:
         """Construct + run the tray on this worker thread so any thread-affined
-        Win32 message-pump state stays on the same thread."""
+        Win32 message-pump state stays on the same thread.
+
+        2026-07-02 QA: guarded — a pystray/Win32 failure here (shell not ready
+        at logon-autostart, notification-area glitch) used to kill the thread
+        via the default excepthook, leaving NO tray and therefore no Quit path
+        (the console's X only hides). Fail soft: log it and show the console
+        window so the app stays reachable."""
+        try:
+            self._build_and_run_tray()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tray] tray failed ({type(exc).__name__}: {exc}) — no tray "
+                  f"icon this session; showing the console window instead",
+                  file=sys.stderr)
+            try:
+                self.console.show()
+            except Exception:  # noqa: BLE001 — last-resort; nothing left to do
+                pass
+
+    def _build_and_run_tray(self) -> None:
         self._tray = JarvisTray(
             on_quit=self._handle_quit,
             on_reset=self._handle_reset,

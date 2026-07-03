@@ -195,6 +195,11 @@ class AnticipationEngine:
         if not self._api_key:
             print("[anticipation] no API key — not starting", file=sys.stderr)
             return
+        # 2026-07-02 QA: join a mid-exit old thread so the is_alive() spawn
+        # check below is truthful (see calendar_monitor.activate).
+        if (self._thread is not None and self._stop.is_set()
+                and self._thread.is_alive()):
+            self._thread.join(timeout=2.0)
         self._active.set()
         self._stop.clear()
         print(f"[anticipation] active — synthesizing every {self._poll}s",

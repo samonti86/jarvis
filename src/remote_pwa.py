@@ -451,7 +451,11 @@ PWA_HTML = r"""<!DOCTYPE html>
   function line(cls, text) {
     const d = document.createElement("div");
     d.className = "m " + cls; d.textContent = text;
-    log.appendChild(d); log.scrollTop = log.scrollHeight;
+    log.appendChild(d);
+    // 2026-07-02 QA: cap the transcript DOM — an installed PWA left
+    // connected for days accumulated every message + reconnect line forever.
+    while (log.childNodes.length > 500) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
   }
   function setPill(t, color) {
     pill.textContent = t;

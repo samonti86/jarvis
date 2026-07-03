@@ -247,7 +247,11 @@ class DuplexBargePlayer:
         if self._detector.push_frame(rms):
             print(f"[barge-aec] BARGE-IN — user spoke over Jarvis (cleaned RMS "
                   f"{rms:.0f} > {THRESHOLD:.0f})", file=sys.stderr)
-            self._interrupt.set()
+            # 2026-07-02 QA: the interrupt event is Optional at every call
+            # site above — None.set() inside the PortAudio callback would
+            # abort the duplex stream mid-reply.
+            if self._interrupt is not None:
+                self._interrupt.set()
             if not self._barged:           # flip the UI to LISTENING at once
                 self._barged = True
                 if self._on_barge is not None:

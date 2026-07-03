@@ -100,16 +100,24 @@ def _write_shortcut(
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 2026-07-02 QA: escape embedded single quotes ('' is the PS single-quote
+    # escape) — a legal apostrophe path (C:\Users\O'Brien) previously broke
+    # the script with a parse error (and was technically an injection surface
+    # through the interpolated path).
+    def _ps1(value: object) -> str:
+        return str(value).replace("'", "''")
+
     icon_line = (
-        f"$Shortcut.IconLocation = '{icon_path},0'\n" if icon_path is not None else ""
+        f"$Shortcut.IconLocation = '{_ps1(icon_path)},0'\n"
+        if icon_path is not None else ""
     )
     script = (
         f"$WshShell = New-Object -ComObject WScript.Shell\n"
-        f"$Shortcut = $WshShell.CreateShortcut('{target_path}')\n"
-        f"$Shortcut.TargetPath = '{_VENV_PYTHONW}'\n"
-        f"$Shortcut.Arguments = '\"{_LAUNCHER}\"'\n"
-        f"$Shortcut.WorkingDirectory = '{_PROJECT_ROOT}'\n"
-        f"$Shortcut.Description = '{description}'\n"
+        f"$Shortcut = $WshShell.CreateShortcut('{_ps1(target_path)}')\n"
+        f"$Shortcut.TargetPath = '{_ps1(_VENV_PYTHONW)}'\n"
+        f"$Shortcut.Arguments = '\"{_ps1(_LAUNCHER)}\"'\n"
+        f"$Shortcut.WorkingDirectory = '{_ps1(_PROJECT_ROOT)}'\n"
+        f"$Shortcut.Description = '{_ps1(description)}'\n"
         f"{icon_line}"
         f"$Shortcut.Save()\n"
     )

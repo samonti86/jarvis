@@ -174,8 +174,11 @@ def _extract_json(text: str):
     return None
 
 
-def _default_miner(transcript: str) -> list[dict]:
-    """Extract predictions via Haiku. Returns [] on any failure."""
+def _default_miner(transcript: str) -> "list[dict] | None":
+    """Extract predictions via Haiku. Returns [] when there's nothing to mine
+    (or no API key — a permanent config state, safe to advance past) and None
+    on a FAILURE (API error / unparseable output) so the caller keeps the
+    mining watermark and re-scans the window next cycle (2026-07-02 QA)."""
     key = _api_key()
     if not key:
         return []
@@ -191,10 +194,16 @@ def _default_miner(transcript: str) -> list[dict]:
         )
         text = " ".join(b.text for b in msg.content if hasattr(b, "text"))
         data = _extract_json(text)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            # 2026-07-02 QA: unparseable output is a FAILED mine, not "no
+            # predictions found" — None tells the caller to keep the watermark
+            # so this window is re-scanned next cycle.
+            print("[predictions] miner output unparseable", file=sys.stderr)
+            return None
+        return data
     except Exception as exc:  # noqa: BLE001
         print(f"[predictions] mining call failed: {exc}", file=sys.stderr)
-        return []
+        return None
 
 
 def _normalize_mined(p: dict, made_at: str) -> dict | None:
@@ -271,21 +280,33 @@ def mine_predictions(*, miner=None, now: datetime | None = None) -> int:
     try:
         exchanges = _recent_exchanges(store.get("last_mined_at"), now)
     except Exception as exc:  # noqa: BLE001
-        print(f"[predictions] could not read transcripts: {exc}", file=sys.stderr)
-        exchanges = []
+        # 2026-07-02 QA: a failed SCAN must not advance the watermark — the
+        # unread window would be permanently skipped (subsequent runs are
+        # incremental from the new mark). Bail; next cycle rescans.
+        print(f"[predictions] could not read transcripts: {exc} — "
+              f"watermark not advanced", file=sys.stderr)
+        return 0
     if not exchanges:
-        store["last_mined_at"] = now.isoformat(timespec="seconds")
-        _save(store)
+        with _STORE_LOCK:
+            store = _load()
+            store["last_mined_at"] = now.isoformat(timespec="seconds")
+            _save(store)
         return 0
 
     miner = miner or _default_miner
     try:
-        found = miner(_transcript(exchanges)) or []
+        found = miner(_transcript(exchanges))
     except Exception as exc:  # noqa: BLE001
         print(f"[predictions] miner raised: {exc}", file=sys.stderr)
-        found = []
+        found = None
+    if found is None:
+        # 2026-07-02 QA: a failed MINE (API error / unparseable output) keeps
+        # the watermark too — indistinguishable from "no predictions" before,
+        # which silently lost any prediction made in that window.
+        print("[predictions] mining failed — watermark not advanced",
+              file=sys.stderr)
+        return 0
 
-    existing = {p.get("id") for p in store["predictions"]}
     added = 0
     # made_at FALLBACK, used only when the miner doesn't return a per-prediction
     # date (it normally reads the [timestamp] off Jarvis's line — see
@@ -299,15 +320,21 @@ def mine_predictions(*, miner=None, now: datetime | None = None) -> int:
     made_at = min((ex.get("ts", "") for ex in exchanges if ex.get("ts")),
                   default=now.isoformat(timespec="seconds")) \
         or now.isoformat(timespec="seconds")
-    for p in found:
-        rec = _normalize_mined(p, made_at)
-        if rec and rec["id"] not in existing:
-            store["predictions"].append(rec)
-            existing.add(rec["id"])
-            added += 1
-
-    store["last_mined_at"] = now.isoformat(timespec="seconds")
-    _save(store)
+    # 2026-07-02 QA: merge into a FRESH load under the store lock. The miner
+    # call above takes seconds — a take_unsurfaced() (briefing thread) that
+    # landed in that window would have its surfaced=True marks clobbered if we
+    # saved the stale copy loaded at entry.
+    with _STORE_LOCK:
+        store = _load()
+        existing = {p.get("id") for p in store["predictions"]}
+        for p in found:
+            rec = _normalize_mined(p, made_at)
+            if rec and rec["id"] not in existing:
+                store["predictions"].append(rec)
+                existing.add(rec["id"])
+                added += 1
+        store["last_mined_at"] = now.isoformat(timespec="seconds")
+        _save(store)
     if added:
         print(f"[predictions] mined {added} new prediction(s)", file=sys.stderr)
     return added
@@ -401,29 +428,42 @@ def resolve_due(*, resolver=None, now: datetime | None = None,
     resolver = resolver or _default_resolver
     checks = 0
     resolved = 0
-    dirty = False
+    # 2026-07-02 QA: the resolver makes up to 3 × 40 s web-search calls, so we
+    # can't hold a store snapshot across them and save it at the end — a
+    # take_unsurfaced() landing mid-cycle would have its surfaced=True marks
+    # clobbered by our stale copy. Collect mutations keyed by id, then apply
+    # them to a FRESH load under the store lock.
+    updates: dict[str, dict] = {}
     for rec in store["predictions"]:
         if not _is_due(rec, now):
             continue
         if checks >= max_checks:
             break
         checks += 1
-        rec["last_checked_at"] = now.isoformat(timespec="seconds")
-        dirty = True
+        upd = updates[rec.get("id")] = {
+            "last_checked_at": now.isoformat(timespec="seconds"),
+        }
         try:
             verdict = resolver(rec, now.date().isoformat())
         except Exception as exc:  # noqa: BLE001
             print(f"[predictions] resolver raised: {exc}", file=sys.stderr)
             continue
         if isinstance(verdict, dict) and verdict.get("resolved"):
-            rec["status"] = "resolved"
-            rec["correct"] = verdict.get("correct")
-            rec["actual"] = str(verdict.get("actual", "")).strip()
-            rec["resolved_at"] = now.isoformat(timespec="seconds")
-            rec["surfaced"] = False
+            upd.update(
+                status="resolved",
+                correct=verdict.get("correct"),
+                actual=str(verdict.get("actual", "")).strip(),
+                resolved_at=now.isoformat(timespec="seconds"),
+                surfaced=False,
+            )
             resolved += 1
-    if dirty:
-        _save(store)
+    if updates:
+        with _STORE_LOCK:
+            store = _load()
+            for rec in store["predictions"]:
+                if rec.get("id") in updates:
+                    rec.update(updates[rec.get("id")])
+            _save(store)
     if resolved:
         print(f"[predictions] resolved {resolved} prediction(s)", file=sys.stderr)
     return resolved
@@ -434,19 +474,20 @@ def resolve_due(*, resolver=None, now: datetime | None = None,
 def take_unsurfaced() -> list[dict]:
     """Resolved-but-not-yet-surfaced predictions; marks them surfaced so a
     follow-up is read at most once. Never raises."""
-    store = _load()
-    out = [
-        r for r in store["predictions"]
-        if r.get("status") == "resolved" and not r.get("surfaced")
-    ]
-    if not out:
-        return []
-    out = out[:_MAX_FOLLOWUPS]
-    surfaced_ids = {r["id"] for r in out}
-    for r in store["predictions"]:
-        if r.get("id") in surfaced_ids:
-            r["surfaced"] = True
-    _save(store)
+    with _STORE_LOCK:
+        store = _load()
+        out = [
+            r for r in store["predictions"]
+            if r.get("status") == "resolved" and not r.get("surfaced")
+        ]
+        if not out:
+            return []
+        out = out[:_MAX_FOLLOWUPS]
+        surfaced_ids = {r["id"] for r in out}
+        for r in store["predictions"]:
+            if r.get("id") in surfaced_ids:
+                r["surfaced"] = True
+        _save(store)
     return out
 
 
@@ -478,6 +519,12 @@ def format_followups(recs: list[dict]) -> str:
 # briefing while a cycle is in flight just skips spawning another (the running
 # one will finish and its results surface next briefing).
 _CYCLE_LOCK = threading.Lock()
+
+# 2026-07-02 QA: serializes every load-mutate-save of the store file. The
+# CYCLE lock only stops cycle-vs-cycle; take_unsurfaced (briefing thread) can
+# interleave with an in-flight cycle's save, and atomic_write_text prevents
+# torn FILES, not lost UPDATES. All writers re-load fresh under this lock.
+_STORE_LOCK = threading.Lock()
 
 
 def run_prediction_cycle_async() -> bool:

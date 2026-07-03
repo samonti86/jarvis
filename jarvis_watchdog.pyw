@@ -61,7 +61,6 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _VENV_PYTHONW = _HERE / "venv" / "Scripts" / "pythonw.exe"
-_VENV_PYTHON = _HERE / "venv" / "Scripts" / "python.exe"  # console-attached fallback
 # Spawn jarvis.pyw (not main.py) — it owns the stdout/stderr → log redirect
 # and the `--- Jarvis started ---` session marker. Skipping it under pythonw
 # means main.py runs headless (sys.stdout is None ⇒ prints are silent), and
@@ -94,22 +93,28 @@ def _ensure_correct_interpreter() -> None:
 
 
 def _redirect_to_logfile() -> Path:
-    """Mirror of jarvis.pyw's log redirect so watchdog events land in the
-    same jarvis.log alongside main's logs. The watchdog's own lines are
-    tagged `[watchdog]` for grep."""
+    """Redirect the watchdog's own output to jarvis_watchdog.log.
+
+    2026-07-02 QA: the watchdog used to append to jarvis.log itself — but a
+    long-lived open handle (no FILE_SHARE_DELETE) makes every child respawn's
+    `rotate_if_needed` rename fail silently, so once jarvis.log crossed 5 MB
+    it grew unbounded for the watchdog's whole lifetime. A SEPARATE file (the
+    watchdog writes a handful of lines per spawn/exit event) leaves jarvis.log
+    free to rotate. Returns the CHILD's jarvis.log path — that's what the
+    JARVIS_LOG_PATH pre-set below should carry (jarvis.pyw re-sets it anyway)."""
     from src.logfile import rotate_if_needed, TimestampStream
 
     log_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Jarvis"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "jarvis.log"
-    rotate_if_needed(log_path)
-    f = open(log_path, "a", encoding="utf-8", buffering=1)
+    own_log = log_dir / "jarvis_watchdog.log"
+    rotate_if_needed(own_log)
+    f = open(own_log, "a", encoding="utf-8", buffering=1)
     stamped = TimestampStream(f)  # per-line timestamps (see src/logfile.py)
     sys.stdout = stamped
     sys.stderr = stamped
     print(f"\n--- Jarvis watchdog started "
           f"{datetime.now().isoformat(timespec='seconds')} ---")
-    return log_path
+    return log_dir / "jarvis.log"
 
 
 def _spawn_child() -> subprocess.Popen:
@@ -120,8 +125,13 @@ def _spawn_child() -> subprocess.Popen:
     the watchdog's. NOT detached — we WANT to wait on it."""
     env = os.environ.copy()
     env["JARVIS_WATCHDOG"] = "1"
+    # 2026-07-02 QA: fall back to the running interpreter when the venv is
+    # absent — _ensure_correct_interpreter deliberately proceeds under system
+    # Python in that case, but this spawn used to exec the nonexistent venv
+    # pythonw and die with FileNotFoundError ("giving up") on the first spawn.
+    interp = _VENV_PYTHONW if _VENV_PYTHONW.exists() else Path(sys.executable)
     return subprocess.Popen(
-        [str(_VENV_PYTHONW), str(_CHILD_LAUNCHER)],
+        [str(interp), str(_CHILD_LAUNCHER)],
         cwd=str(_HERE),
         env=env,
     )

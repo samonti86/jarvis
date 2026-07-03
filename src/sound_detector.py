@@ -463,9 +463,10 @@ def _download(url: str, dest: Path, *, expected_min_bytes: int) -> str | None:
         except OSError:
             pass
         return f"download failed: {type(exc).__name__}: {exc}"
-    if tmp.stat().st_size < expected_min_bytes:
+    size = tmp.stat().st_size
+    if size < expected_min_bytes:
         tmp.unlink()
-        return (f"download too small ({tmp.stat().st_size} < "
+        return (f"download too small ({size} < "
                 f"{expected_min_bytes}) — incomplete?")
     os.replace(tmp, dest)
     return None
@@ -480,6 +481,11 @@ class _ResolvedRule:
     rule: ClassRule
     indices: tuple[int, ...]
     tracker: _ClassTracker
+
+
+# 2026-07-02 QA: minimum seconds between stream-status log lines (see
+# SoundDetector._on_audio) — the count since the last line rides along.
+_STATUS_LOG_INTERVAL_SEC = 60.0
 
 
 class SoundDetector:
@@ -537,6 +543,16 @@ class SoundDetector:
         self._buf: list[np.ndarray] = []
         self._buf_len = 0
         self._dropped = 0
+        # 2026-07-02 QA: rate-limited stream-status (overflow) logging — see
+        # _on_audio. Counter + last-emit timestamp, callback-thread only.
+        self._status_count = 0
+        self._status_last_log = float("-inf")
+        # 2026-07-02 QA: serialize activate()/deactivate() — the idempotency
+        # check and _active.set() are separated by seconds of model-load/
+        # stream-open work, so two near-simultaneous activations (presence
+        # auto-arm + a tray toggle) could BOTH open an InputStream and orphan
+        # one forever.
+        self._lifecycle_lock = threading.Lock()
 
         # Resolved at first activate (model load is heavy). Held across
         # activate/deactivate cycles so the second arm is instant.
@@ -566,8 +582,19 @@ class SoundDetector:
     # ---------------------------------------------------------------------
 
     def activate(self) -> None:
+        with self._lifecycle_lock:
+            self._activate_locked()
+
+    def _activate_locked(self) -> None:
         if self._active.is_set():
             return
+        # 2026-07-02 QA: a rapid deactivate→activate could observe the OLD
+        # inference thread still mid-exit (it polls _stop every 0.5 s), skip
+        # the spawn below, and end up active with NO inference loop. Join the
+        # dying thread first so the is_alive() check below is truthful.
+        if (self._thread is not None and self._stop.is_set()
+                and self._thread.is_alive()):
+            self._thread.join(timeout=2.0)
         if not self._ensure_model():
             return  # already auto-announced its own failure
         for r in self._resolved:
@@ -593,10 +620,21 @@ class SoundDetector:
                 blocksize=BLOCK_SAMPLES,
                 device=self._device,
                 callback=self._on_audio,
+                # 2026-07-02 QA: nothing downstream is latency-sensitive (the
+                # consumer assembles 2 s windows), but the sounddevice default
+                # requests the device's LOW-latency ring — a few tens of ms —
+                # which the armed-mode PANNs+YOLO bursts overflowed every ~3-4 s
+                # for the entire armed window (dropped samples = gap-corrupted
+                # detection windows). 'high' gives PortAudio a deep host buffer
+                # that absorbs those bursts; detection semantics are unchanged.
+                latency="high",
             )
             self._stream.start()
         except Exception as exc:
             print(f"[acoustic] mic open failed: {exc}", file=sys.stderr)
+            # A constructed-but-unstarted stream must not leak (start() can
+            # raise after the constructor succeeded).
+            self._close_stream()
             self._safe_announce(
                 "I couldn't open the microphone for acoustic awareness, sir."
             )
@@ -617,13 +655,14 @@ class SoundDetector:
             self._thread.start()
 
     def deactivate(self) -> None:
-        if not self._active.is_set():
-            return
-        self._active.clear()
-        self._stop.set()
-        self._close_stream()
-        print("[acoustic] standing down", file=sys.stderr)
-        self._safe_announce("Acoustic awareness off, sir.")
+        with self._lifecycle_lock:
+            if not self._active.is_set():
+                return
+            self._active.clear()
+            self._stop.set()
+            self._close_stream()
+            print("[acoustic] standing down", file=sys.stderr)
+            self._safe_announce("Acoustic awareness off, sir.")
 
     def shutdown(self) -> None:
         """App-quit: silent wind-down. Daemon thread dies with the process
@@ -746,7 +785,18 @@ class SoundDetector:
 
     def _on_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:  # noqa: ARG002
         if status:
-            print(f"[acoustic] stream status: {status}", file=sys.stderr)
+            # 2026-07-02 QA: rate-limited. While armed this fired every ~3-4 s
+            # for the whole armed window (~1-2k log lines/day), and each print
+            # is a timestamped FILE write inside the 80 ms-budget callback —
+            # lengthening the very callback whose lateness caused the overflow.
+            self._status_count += 1
+            now = time.monotonic()
+            if now - self._status_last_log >= _STATUS_LOG_INTERVAL_SEC:
+                print(f"[acoustic] stream status: {status} "
+                      f"(x{self._status_count} since last report)",
+                      file=sys.stderr)
+                self._status_count = 0
+                self._status_last_log = now
         chunk = indata[:, 0].copy()
         self._buf.append(chunk)
         self._buf_len += chunk.shape[0]

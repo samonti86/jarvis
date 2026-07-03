@@ -217,6 +217,13 @@ def _validate_target(value: Any, field: str = "target") -> tuple[str | None, str
             f"{field} contains characters I won't pass through "
             f"(only letters, digits, dots, hyphens, colons, percent allowed)."
         )
+    # 2026-07-02 QA: no host/IP starts with '-', but the native-exe verbs
+    # (ping/tracert/nslookup) pass the target as a bare argv element — a
+    # leading dash would be parsed as an OPTION by the tool, not a host
+    # (argv option-injection, e.g. target="-4"). Close the documented
+    # "regex is the complete injection boundary" claim.
+    if v.startswith("-"):
+        return None, f"{field} may not start with a hyphen."
     return v, None
 
 

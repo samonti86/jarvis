@@ -156,6 +156,8 @@ class RemoteConsoleServer:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._clients: set[ServerConnection] = set()
+        # Strong refs to fire-and-forget send tasks — see _track (2026-07-02 QA).
+        self._pending_tasks: set = set()
         self._thread: threading.Thread | None = None
         # Last-known surface so a phone connecting mid-session immediately
         # sees the correct state instead of a blank console.
@@ -242,6 +244,13 @@ class RemoteConsoleServer:
                 self._port,
                 process_request=self._process_request,
                 ssl=self._ssl_context,  # None ⇒ plain HTTP/WS; set ⇒ HTTPS/WSS
+                # 2026-07-02 QA: the PWA sends a phone voice note as ONE JSON
+                # frame (base64 ≈ 1.33× the blob), and the mic cap is 60 s —
+                # a long Safari audio/mp4 clip can top the websockets default
+                # max_size of 1 MiB, which kills the connection (code 1009)
+                # and silently loses the utterance. 8 MiB clears the worst
+                # case with margin; everything else on this socket is tiny.
+                max_size=8 * 1024 * 1024,
             ):
                 scheme = "https" if self._ssl_context else "http"
                 mode = (
@@ -372,7 +381,14 @@ class RemoteConsoleServer:
         if not self._token or not supplied:
             return False
         # Constant-time compare — don't leak token length/prefix via timing.
-        return hmac.compare_digest(supplied, self._token)
+        # 2026-07-02 QA: compare_digest raises TypeError on non-ASCII strings;
+        # a pasted token with a Unicode dash would raise out of the request
+        # handler instead of returning 401. Compare as bytes.
+        try:
+            return hmac.compare_digest(
+                supplied.encode("utf-8"), self._token.encode("utf-8"))
+        except Exception:  # noqa: BLE001 — any comparison failure = not authed
+            return False
 
     @staticmethod
     def _http(
@@ -455,7 +471,15 @@ class RemoteConsoleServer:
             return False
         supplied = str(msg.get("token", ""))
         # Constant-time compare — don't leak token length/prefix via timing.
-        return hmac.compare_digest(supplied, self._token)
+        # 2026-07-02 QA: bytes, not str — compare_digest raises TypeError on
+        # non-ASCII input, which killed the handler task with no auth_fail
+        # frame (the client just saw onclose and retried forever with the bad
+        # token). A malformed token must fail auth, not the connection.
+        try:
+            return hmac.compare_digest(
+                supplied.encode("utf-8"), self._token.encode("utf-8"))
+        except Exception:  # noqa: BLE001 — any comparison failure = not authed
+            return False
 
     async def _dispatch(self, conn: ServerConnection, message: object) -> None:
         try:
@@ -562,7 +586,15 @@ class RemoteConsoleServer:
         for conn in list(self._clients):
             # Fire-and-forget; a slow/dead client must not block others or
             # the loop. websockets buffers + drops on its own close.
-            asyncio.create_task(self._send_one(conn, data))
+            self._track(asyncio.create_task(self._send_one(conn, data)))
+
+    def _track(self, task: "asyncio.Task") -> None:
+        """2026-07-02 QA: keep a strong reference to fire-and-forget tasks —
+        the event loop holds only weak refs, so an untracked send task can be
+        garbage-collected mid-flight (a silently-dropped frame/audio clip).
+        The done-callback discard keeps the set from growing."""
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
 
     async def _send_one(self, conn: ServerConnection, data: str) -> None:
         try:
@@ -587,7 +619,7 @@ class RemoteConsoleServer:
         })
         try:
             loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self._send_one(conn, payload))
+                lambda: self._track(asyncio.create_task(self._send_one(conn, payload)))
             )
         except RuntimeError:
             pass  # loop closed during shutdown — nothing to do

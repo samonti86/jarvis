@@ -17,6 +17,7 @@ the venv's. No numpy/anthropic/etc. allowed in the import chain.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -74,14 +75,22 @@ class TimestampStream:
     def __init__(self, stream) -> None:
         self._stream = stream
         self._at_line_start = True
+        # 2026-07-02 QA: many threads print() through the ONE shared instance,
+        # and print() emits a line as two write() calls ("text", then "\n").
+        # Unlocked, a racing thread could observe at_line_start=False mid-pair
+        # and emit its whole line UNstamped — defeating the per-line timestamp
+        # the wrapper exists to guarantee (the log is the forensic artifact
+        # for soak debriefs). Lock the state update + underlying write.
+        self._lock = threading.Lock()
 
     def write(self, data: str) -> int:
         if not data:
             return 0
-        text, self._at_line_start = stamp_chunk(
-            data, self._at_line_start, _line_stamp()
-        )
-        self._stream.write(text)
+        with self._lock:
+            text, self._at_line_start = stamp_chunk(
+                data, self._at_line_start, _line_stamp()
+            )
+            self._stream.write(text)
         return len(data)
 
     def flush(self) -> None:

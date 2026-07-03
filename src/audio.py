@@ -16,6 +16,13 @@ import sounddevice as sd
 CHUNK_SAMPLES = 1280  # 80 ms @ 16 kHz; matches openWakeWord's window
 SAMPLE_RATE = 16_000
 
+# A healthy InputStream delivers a chunk every ~80 ms; a long gap means the
+# device died under us (USB re-enumeration, KVM switch) WITHOUT raising — the
+# callback just stops firing. read() surfaces that as an error instead of
+# blocking forever, so the voice-loop supervisor can re-open the session and
+# shutdown/quit never hangs on a dead mic.
+READ_STALL_SEC = 10.0
+
 
 def resolve_input_device(spec: str) -> Optional[int]:
     """Resolve a JARVIS_MIC_DEVICE spec to a sounddevice input-device index.
@@ -33,7 +40,16 @@ def resolve_input_device(spec: str) -> Optional[int]:
     if not spec:
         return None
     if spec.lstrip("-").isdigit():
-        idx = int(spec)
+        # 2026-07-02 QA: guarded — lstrip("-") strips ALL leading dashes, so a
+        # typo like "--1" passed the check but crashed int(). A bad .env value
+        # must degrade to the default mic, never fail startup (the same
+        # never-crash-on-config rule as _int_env/_float_env).
+        try:
+            idx = int(spec)
+        except ValueError:
+            print(f"[audio] bad mic index {spec!r}; using default mic",
+                  file=sys.stderr)
+            return None
         print(f"[audio] mic pinned to device index {idx}", file=sys.stderr)
         return idx
     try:
@@ -92,8 +108,13 @@ class AudioSession:
             print(f"[audio] status: {status}", file=sys.stderr)
         self._queue.put(indata[:, 0].copy())
 
-    def read(self) -> np.ndarray:
-        return self._queue.get()
+    def read(self, timeout: float = READ_STALL_SEC) -> np.ndarray:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(
+                f"microphone stream stalled — no audio for {timeout:.0f}s"
+            ) from None
 
     def drain(self) -> None:
         """Discard any buffered chunks. Call before re-entering wake-word loop."""

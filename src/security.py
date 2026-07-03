@@ -1069,6 +1069,20 @@ class SecurityWatcher:
         if self._smtp_username and self._smtp_to:
             self._send_email_alert_async(jpeg_bytes, saved_path)
 
+        # 2026-07-02 QA: a successful try_authenticate can land in the gap
+        # between the LOCKED transition above (the lock is released for the
+        # slow evidence/push work) and this point — it clears _locked and
+        # fires on_locked_changed(False). Re-check under the lock so we don't
+        # pin a stale 🔒 indicator and speak a false "authorities notified"
+        # right after "Welcome back, sir". (The evidence save + Discord/email
+        # pushes above still fired — correct: someone WAS unauthenticated for
+        # the whole challenge window; only the UI flip + deterrent are moot.)
+        with self._challenge_lock:
+            if not self._locked:
+                print("[security] authenticated during deterrent prep — "
+                      "suppressing LOCKED indicator + deterrent announce",
+                      file=sys.stderr)
+                return
         # Flip the LOCKED indicator BEFORE the announce so the UI updates
         # immediately, not after the ~5s deterrent playback finishes.
         self._safe_call(self._on_locked_changed, True, label="on_locked_changed(True)")
@@ -1304,7 +1318,18 @@ class SecurityWatcher:
         if not self.is_armed():
             return None
         try:
-            return self._grab_frame()
+            with self._cap_lock:
+                # 2026-07-02 QA: serve ONLY from an already-open persistent
+                # capture — never open one here. A disarm can land between the
+                # is_armed() check above and this point; if this path opened a
+                # fresh capture after the watcher's finally released its own,
+                # nothing would ever release ours (camera held for the whole
+                # disarmed period — the M44 leak class). _cap is None ⇒ the
+                # watcher isn't holding the camera ⇒ the caller can safely
+                # open its own handle, so returning None is correct.
+                if self._cap is None:
+                    return None
+                return self._grab_frame()
         except Exception as exc:  # noqa: BLE001 — a snapshot must never break
             print(f"[security] snapshot frame grab failed: {exc}", file=sys.stderr)
             return None
@@ -1462,14 +1487,29 @@ class SecurityWatcher:
 
     def _auto_disarm(self) -> None:
         """Internal: clear armed state + notify UI without an extra spoken
-        message (caller already announced the reason for the failure)."""
+        message (caller already announced the reason for the failure).
+
+        2026-07-02 QA: also clears any open CHALLENGE/LOCKED state, exactly
+        like deactivate() — the watcher thread exits after this, so
+        _check_challenge_timeout never runs again; leaving _challenge_active
+        set would divert EVERY subsequent utterance into try_authenticate
+        (including "stand down") with no path out, and a stale _locked would
+        pin the 🔒 indicator forever."""
         self._armed.clear()
         self._stop.set()
+        with self._challenge_lock:
+            self._challenge_active = False
+            self._challenge_evidence_bytes = b""
+            was_locked = self._locked
+            self._locked = False
         if self._on_armed_changed is not None:
             try:
                 self._on_armed_changed(False)
             except Exception:
                 pass
+        if was_locked:
+            self._safe_call(self._on_locked_changed, False,
+                            label="on_locked_changed(False)")
 
 
 # --- Voice-intent regexes --------------------------------------------------

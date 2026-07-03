@@ -138,7 +138,14 @@ def monitor_for_wake_word(
     model = _get_barge_model()
     print("[barge-in] monitoring for 'Hey Jarvis' during playback", file=sys.stderr)
     while not stop_event.is_set():
-        chunk = session.read()
+        try:
+            chunk = session.read()
+        except Exception as exc:  # noqa: BLE001 — a dead mic mid-reply just
+            # ends the monitor (no barge-in possible); the reply keeps playing
+            # and the voice loop's supervisor handles the mic on its next read.
+            print(f"[barge-in] mic read failed ({exc}) — monitor exiting",
+                  file=sys.stderr)
+            return
         if stop_event.is_set():
             return
         scores = model.predict(chunk)
