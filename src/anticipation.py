@@ -145,6 +145,9 @@ def _default_ask(api_key: str, model: str, system: str, user: str) -> str:
     resp = client.messages.create(
         model=model,
         max_tokens=200,
+        # Sonnet 5 defaults thinking ON; disable it so the 200-token budget goes
+        # entirely to the one-line insight (adaptive thinking could eat it).
+        thinking={"type": "disabled"},
         system=system,
         messages=[{"role": "user", "content": user}],
     )
@@ -164,7 +167,7 @@ class AnticipationEngine:
         snapshot_fn: Callable[[], dict],
         *,
         api_key: str = "",
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-sonnet-5",
         poll_seconds: int = _POLL_SECONDS,
         recent_keep: int = 12,
         ask_fn: "Callable[[str, str], str] | None" = None,

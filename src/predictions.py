@@ -78,7 +78,7 @@ def _resolve_model() -> str:
     # Judgment (did it resolve, was it right?) → the main model by default.
     return os.getenv(
         "JARVIS_PREDICTION_RESOLVE_MODEL",
-        os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"),
+        os.getenv("CLAUDE_MODEL", "claude-sonnet-5"),
     )
 
 
@@ -371,6 +371,9 @@ def _default_resolver(rec: dict, today: str) -> dict | None:
         msg = client.messages.create(
             model=_resolve_model(),
             max_tokens=500,
+            # Sonnet 5 defaults thinking ON; disable it so the 500-token budget
+            # goes to the JSON verdict (and to keep resolver behavior unchanged).
+            thinking={"type": "disabled"},
             system=_RESOLVER_SYSTEM,
             tools=[_WEB_SEARCH_TOOL],
             messages=[{"role": "user", "content": prompt}],

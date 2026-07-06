@@ -519,7 +519,7 @@ class JarvisConsole:
 
     def set_model_name(self, model: str) -> None:
         """Display name for the model in the status bar. Strips the 'claude-'
-        prefix for readability — 'sonnet-4-6' beats 'claude-sonnet-4-6'."""
+        prefix for readability — 'sonnet-5' beats 'claude-sonnet-5'."""
         if self._destroyed:
             return
         clean = model.removeprefix("claude-") if model else "?"

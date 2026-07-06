@@ -61,6 +61,10 @@ def describe_scene(
         msg = client.messages.create(
             model=model,
             max_tokens=_MAX_TOKENS,
+            # One-line scene description, latency-sensitive (armed alert path).
+            # Sonnet 5 defaults thinking ON; disable it so the small 160-token
+            # budget isn't consumed by reasoning and truncate the description.
+            thinking={"type": "disabled"},
             messages=[{
                 "role": "user",
                 "content": [

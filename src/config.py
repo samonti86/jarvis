@@ -115,7 +115,7 @@ def load() -> Config:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     return Config(
         anthropic_api_key=api_key,
-        claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"),
+        claude_model=os.getenv("CLAUDE_MODEL", "claude-sonnet-5"),
         summary_model=os.getenv("SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
         whisper_model=os.getenv("WHISPER_MODEL", "small"),
         wake_word_threshold=_float_env("WAKE_WORD_THRESHOLD", 0.5),

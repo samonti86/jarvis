@@ -733,12 +733,13 @@ _LOOP_CAP_FALLBACK = (
     "Here's where I got to; ask me to continue and I'll pick it up."
 )
 
-# Token budgets. Default mode is voice-shaped — short replies, no thinking.
-# Engineer mode unlocks extended thinking + a generous output budget so the
+# Token budgets. Default mode is voice-shaped — short replies, thinking OFF
+# (Sonnet 5 runs ADAPTIVE thinking by default when `thinking` is omitted, which
+# would add latency and eat into max_tokens — we disable it explicitly below).
+# Engineer mode unlocks ADAPTIVE thinking + a generous output budget so the
 # model can both reason and write the longer structured answer it produced.
 _DEFAULT_MAX_TOKENS = 1024
-_ENGINEER_THINKING_BUDGET = 5000
-_ENGINEER_MAX_TOKENS = 8192   # must exceed thinking_budget; ~3k left for the actual reply
+_ENGINEER_MAX_TOKENS = 8192   # room for adaptive reasoning + a structured reply
 
 
 @dataclass
@@ -1044,7 +1045,7 @@ def _execute_client_tool(
 
 def stream_translation(
     *, api_key: str, text: str, target_lang: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
 ) -> Iterator[str]:
     """M87 — interpreter mode: stream a faithful translation of `text` into
     `target_lang`. Deliberately MINIMAL and isolated from stream_response's
@@ -1061,6 +1062,9 @@ def stream_translation(
     with client.messages.stream(
         model=model,
         max_tokens=1024,  # ample for one spoken utterance
+        # Faithful relay, not reasoning — and Sonnet 5 defaults thinking ON when
+        # omitted. Disable it: interpreter latency stays low, no thinking tokens.
+        thinking={"type": "disabled"},
         system=build_translation_prompt(target_lang),
         messages=[{"role": "user", "content": text}],
     ) as stream:
@@ -1071,7 +1075,7 @@ def stream_translation(
 def stream_response(
     api_key: str,
     messages: list[dict],
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
     summaries: list[SummaryRecord] | None = None,
     plex_client: PlexMCPClient | None = None,
     plex_laptop_client: PlexLaptopClient | None = None,
@@ -1215,23 +1219,20 @@ def stream_response(
     iterations = 0
 
     # Build per-turn stream kwargs once; reuse across agentic-loop iterations.
-    # max_tokens MUST exceed thinking budget when thinking is on; 8192 leaves
-    # room for both the reasoning + a generous structured reply. Anthropic
-    # also requires temperature=1 with extended thinking (we don't set it,
-    # so default of 1 holds). Thinking blocks are preserved in the assistant
-    # turn we append below — required when thinking + tool_use are combined.
+    # Thinking is explicit on Sonnet 5: engineer mode gets ADAPTIVE thinking
+    # (the model self-budgets reasoning depth — the old enabled+budget_tokens
+    # shape is rejected with a 400), and voice mode gets thinking DISABLED
+    # (Sonnet 5 would otherwise run adaptive by default and add latency +
+    # consume max_tokens). Adaptive thinking blocks are preserved in the
+    # assistant turn we append below — required when thinking + tool_use combine.
     stream_kwargs: dict = {
         "model": model,
         "max_tokens": _ENGINEER_MAX_TOKENS if engineer_mode else _DEFAULT_MAX_TOKENS,
         "system": system_param,
         "messages": working,
         "tools": tools,
+        "thinking": {"type": "adaptive"} if engineer_mode else {"type": "disabled"},
     }
-    if engineer_mode:
-        stream_kwargs["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": _ENGINEER_THINKING_BUDGET,
-        }
 
     while iterations < _MAX_LOOP_ITERATIONS:
         iterations += 1

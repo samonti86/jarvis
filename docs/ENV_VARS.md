@@ -24,7 +24,7 @@ disables that optional feature (the project's fail-soft contract).
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ANTHROPIC_API_KEY` | **(required)** | Claude API key. Jarvis exits if missing. |
-| `CLAUDE_MODEL` | `claude-sonnet-4-6` | Main conversation model. |
+| `CLAUDE_MODEL` | `claude-sonnet-5` | Main conversation model. |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Cheap model for session summaries. |
 | `WHISPER_MODEL` | `small` | Local faster-whisper model size. |
 | `WAKE_WORD_THRESHOLD` | `0.5` | openWakeWord confidence to trigger. |
