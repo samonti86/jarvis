@@ -8,7 +8,8 @@ language you spoke". Interpreter mode flips the turn pipeline: instead of
 configured pair and speaks it in that language's voice — so two people who
 don't share a language can talk THROUGH Jarvis.
 
-Real motivation: the user wants to talk to his non-English-speaking family member.
+Motivating case: a household where not everyone speaks the same language, and
+a conversation has to bridge that gap without either party learning the other's.
 
 This module is the pure, model-free, I/O-free core — the language-pair logic,
 the activation/exit intent matchers, the translation system prompt, and the
