@@ -97,15 +97,25 @@ enough for always-on real-time capture.
 ## Quick start
 
 ```powershell
+git clone https://github.com/samonti86/jarvis.git && cd jarvis
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env    # add your ANTHROPIC_API_KEY
+
+Copy-Item .env.example .env    # then set ANTHROPIC_API_KEY
+python scripts\doctor.py       # verifies deps, config, audio devices
 python main.py                 # or: pythonw jarvis.pyw  (silent, no console)
 ```
 
-Then say **"Hey Jarvis."** Everything beyond the core loop is optional and off by
-default — see [.env.example](.env.example), which documents every setting.
+Then say **"Hey Jarvis."**
+
+`doctor.py` is read-only and tells you exactly what is missing — it is the fastest
+answer to "why won't it start?". An Anthropic API key is the **only** hard
+requirement; every other integration is optional, off by default, and degrades to
+"not configured" rather than failing.
+
+- **[docs/SETUP.md](docs/SETUP.md)** — full walkthrough, including how to obtain each API key
+- **[docs/ENV_VARS.md](docs/ENV_VARS.md)** — every setting, its default, and where it's read
 
 Run the gate with `python scripts/run_all_tests.py`.
 
