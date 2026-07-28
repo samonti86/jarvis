@@ -18,6 +18,13 @@ mic ──► openWakeWord ──► faster-whisper ──► Claude ──► e
                                             tool loop)
 ```
 
+![The Jarvis console and its ambient desktop overlay](docs/images/ui.png)
+
+*The console window and the optional ambient overlay — a translucent,
+click-through HUD that floats over whatever you're working on. Both draw the
+same arc reactor, whose rotation frames are pre-rendered and cached so the
+animation costs an array index rather than a core.*
+
 Roughly 29k lines of Python across 70 modules. The full engineering log — the design
 trade-offs, the post-mortems, and the conclusions that turned out to be wrong — is in
 [docs/MILESTONES.md](docs/MILESTONES.md); its

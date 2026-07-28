@@ -12,7 +12,7 @@ response back through the speakers via TTS. Inspired by Tony Stark's J.A.R.V.I.S
 courteous, dryly witty, concise.
 
 The interesting part is not the voice loop — it is everything hung off it: an
-agentic tool layer (~40 tools), proactive background monitors, a vision/security
+agentic tool layer (36 tools), proactive background monitors, a vision/security
 subsystem, a phone client, and a set of engineering conventions strict enough to
 keep an always-on process honest.
 
@@ -355,11 +355,12 @@ suites and green.
 - The core loop: wake word → local STT (EN/ES auto-detect) → streaming,
   prompt-cached, agentic Claude call → streaming TTS, with a tray icon, a
   console window with live transcript and waveform, and an optional ambient
-  overlay.
+  overlay. Both the console orb and the overlay render the shared pre-rendered
+  arc reactor (`src/reactor.py`).
 - **Conversational**: a follow-up window after each reply (no wake word needed);
   a persistent hands-free conversation mode; barge-in (interrupt mid-reply by
   saying the wake word).
-- **~40 tools** across web, data, personal knowledge, memory recall, reminders,
+- **36 tools** across web, data, personal knowledge, memory recall, reminders,
   diagnostics, and gated system actions. See "The tool layer" above.
 - **Memory**: in-process turn history + a JSONL session store, summarized at
   session boundaries and recalled into the system prompt; a separate curated
@@ -370,6 +371,13 @@ suites and green.
 - **Proactive**: homelab monitoring, calendar pre-event announces, severe-weather
   alerts, scheduled briefings, an anticipation layer, and a quiet-hours policy
   that lets important announcements pierce while routine ones defer.
+- **Long-horizon work (M91/M92)**: research tasks that outlive the turn, run on
+  Anthropic's Managed Agents and polled to completion, delivered when ready
+  (and held back through quiet hours). Schedulable — "every Monday, look into
+  X" reuses the existing reminder scheduler. **Off unless
+  `JARVIS_BACKGROUND_AGENTS=1`** — see the privacy exception above.
+- **Self-diagnosis (M93)**: `self_review` clusters this machine's own logs
+  across sessions and restarts into ranked recurring problems, read-only.
 - **Clients**: local voice, console, a token-gated phone PWA (type / push-to-talk
   / reply audio / state), and a Discord bridge — the last two on a restricted
   tool surface.
@@ -398,7 +406,11 @@ Neutral backlog; nothing here is committed. The standing discipline is
 - Multi-camera / RTSP support (OpenCV already supports it; needs a camera
   registry and a `camera` parameter).
 - Additional MCP servers through the existing bridge (home automation, 3D
-  printing) — same async↔sync wrapper and voice allowlist.
+  printing) — same async↔sync wrapper and voice allowlist. **Home Assistant is
+  the concrete next one and is deliberately NOT built**: there is no HA
+  instance on this network to validate against, and an integration written
+  against documentation alone would ship untested against the one thing that
+  matters (the real entity registry). Build it when HA is actually installed.
 - Growing the knowledge corpus. The hybrid retrieval is correct but the corpus is
   currently too small to demonstrate an aggregate win; size, not the algorithm,
   is the limiter.
