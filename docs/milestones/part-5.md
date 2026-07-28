@@ -1167,3 +1167,52 @@ drift-triggered `agents.update`), `scripts/outcome_probe.py` (NEW instrument),
 `tests/background_tasks_test.py` (+8, now 57).
 
 **Gate:** 52/52 green.
+
+## M96 — structured outputs on the background jobs — 2026-07-28
+
+**What shipped.** The prediction miner and resolver now constrain their replies
+with `output_config.format` + a JSON schema, instead of asking for JSON in prose
+and digging it back out with a regex.
+
+**Checked before changing it: this had never failed.** Zero occurrences of
+`miner output unparseable` across both log files. The old extractor searched for
+a bracketed span with a **greedy** pattern — spanning the first `[` to the last
+`]` anywhere in the reply — but no production reply had ever tripped it.
+
+So why change it? Because unlike M95's Outcomes (8× cost for a marginal gain),
+this is a *parameter*, not a mechanism: no extra latency, no extra tokens,
+arguably fewer (the prompt no longer has to beg for clean JSON). Cheap insurance
+against a latent failure class is worth buying; expensive insurance against a
+marginal one is not. Both decisions came from measuring first; they differ only
+in what the measurement said.
+
+`_extract_json` is **kept as a fallback** rather than deleted — if a future
+model or SDK ignores the constraint, a degraded parse beats a lost mining cycle.
+
+**Schema notes.** Nullable fields use `anyOf`, not a JSON-Schema *type array*,
+which is outside the supported subset. The miner's array is wrapped in an object
+because the constraint is specified against an object root.
+
+**Verified live that structured output composes with a SERVER-SIDE tool**: the
+resolver keeps `web_search` and still returns a clean verdict — the response
+carries `server_tool_use`, `web_search_tool_result` and `text` blocks, with the
+text being exactly the JSON document.
+
+**A test caught what a live test could not.** The first edit half-applied: the
+resolver got its `output_config`, the miner silently did not. The live miner run
+still returned perfect JSON — *via the regex fallback* — so it looked like proof
+and was nothing of the sort. The unit assertion "miner sends
+output_config.format" failed and exposed it. A live test proves the feature
+works; only an assertion on the call proves it is the feature you think is
+running.
+
+**Two self-inflicted test bugs, both worth recording.** `_api_key()` returned an
+empty string in a bare test process, so the miner returned early and never built
+a client — the assertions failed for a reason unrelated to the code. And the fix
+was not `os.environ.setdefault`, which is a silent no-op when the variable
+already exists **as an empty string**; it needed direct assignment.
+
+**Files:** `src/predictions.py` (schemas, `_parse_structured`, both call sites),
+`tests/structured_output_test.py` (NEW, 17 assertions).
+
+**Gate:** 53/53 green.

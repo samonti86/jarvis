@@ -159,6 +159,67 @@ For each real prediction, output an object with:
 Respond with ONLY a JSON array of these objects. If there are no qualifying predictions, respond with exactly []."""
 
 
+# JSON SCHEMAS (M96). These make the model's reply structurally guaranteed
+# rather than hopefully-parseable. `_extract_json` below is kept as a fallback,
+# not deleted: if a future model or SDK ignores output_config, the old
+# best-effort path still works instead of failing the whole mine.
+#
+# Nullable fields use anyOf rather than {"type": ["string", "null"]} — the
+# structured-outputs schema subset supports anyOf, and a type ARRAY is not on
+# the supported list.
+_MINER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "predictions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "made_at": {"type": "string"},
+                    "resolve_after": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                },
+                "required": ["claim", "subject", "made_at", "resolve_after"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["predictions"],
+    "additionalProperties": False,
+}
+
+_RESOLVER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resolved": {"type": "boolean"},
+        "correct": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+        "actual": {"type": "string"},
+    },
+    "required": ["resolved", "correct", "actual"],
+    "additionalProperties": False,
+}
+
+
+def _parse_structured(text: str, key: str | None = None):
+    """Parse a structured-output reply, falling back to the old extractor.
+
+    With output_config.format the whole reply IS the JSON document, so a plain
+    json.loads is correct and the greedy regex is unnecessary. The fallback
+    stays for the case where the constraint was not applied for any reason —
+    losing a mining cycle to a parse failure is worse than a redundant branch.
+    """
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = _extract_json(text)
+    if key and isinstance(data, dict) and key in data:
+        return data[key]
+    return data
+
+
 def _extract_json(text: str):
     """Pull the first JSON array/object out of an LLM reply. None on failure."""
     if not text:
@@ -188,12 +249,14 @@ def _default_miner(transcript: str) -> "list[dict] | None":
             model=_mining_model(),
             max_tokens=600,
             system=_MINER_SYSTEM,
+            output_config={"format": {"type": "json_schema",
+                                      "schema": _MINER_SCHEMA}},
             messages=[{"role": "user", "content":
                        f"TRANSCRIPT:\n{transcript}\nEND TRANSCRIPT\n\n"
-                       "Output the JSON array now."}],
+                       "Output the predictions now."}],
         )
         text = " ".join(b.text for b in msg.content if hasattr(b, "text"))
-        data = _extract_json(text)
+        data = _parse_structured(text, key="predictions")
         if not isinstance(data, list):
             # 2026-07-02 QA: unparseable output is a FAILED mine, not "no
             # predictions found" — None tells the caller to keep the watermark
@@ -375,11 +438,13 @@ def _default_resolver(rec: dict, today: str) -> dict | None:
             # goes to the JSON verdict (and to keep resolver behavior unchanged).
             thinking={"type": "disabled"},
             system=_RESOLVER_SYSTEM,
+            output_config={"format": {"type": "json_schema",
+                                      "schema": _RESOLVER_SCHEMA}},
             tools=[_WEB_SEARCH_TOOL],
             messages=[{"role": "user", "content": prompt}],
         )
         text = " ".join(b.text for b in msg.content if hasattr(b, "text"))
-        data = _extract_json(text)
+        data = _parse_structured(text)
         return data if isinstance(data, dict) else None
     except Exception as exc:  # noqa: BLE001
         print(f"[predictions] resolver call failed: {exc}", file=sys.stderr)
