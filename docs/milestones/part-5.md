@@ -795,3 +795,100 @@ would have deterred anyone from ever revisiting it.
 the workaround coexist, the workaround's justification needs a re-test date, not
 just a rationale — otherwise the codebase carries a permanent detour around a
 pothole that was filled months ago.
+
+## M91 — long-horizon background agents: "research it overnight, brief me at breakfast" — 2026-07-28
+
+**What shipped.** `start_background_task` hands an open-ended job to an
+Anthropic Managed Agents session that works for minutes to an hour and reports
+back on its own. Results are spoken when they land, or — if they land at 03:00
+— held and folded into the morning briefing. Plus `list_background_tasks` and
+`cancel_background_task`. Off by default behind `JARVIS_BACKGROUND_AGENTS=1`.
+
+Live round trip verified end to end: dispatch → 17s → a cited, speakable
+research answer.
+
+**Why this is an architecture change, not a tool.** Every previous capability
+fits the turn: wake → answer → speak, capped at 8 tool iterations, first word
+inside a second. This is the first thing Jarvis does that *outlives the
+conversation that started it*. Film-J.A.R.V.I.S. is not a fast question
+answerer; he is a process that works while Tony sleeps and reports back. That
+required a second execution mode, not a 41st tool.
+
+**Why Managed Agents rather than a local thread — restart survival.** Jarvis
+runs under `jarvis_watchdog.pyw` (respawn on crash) and `update_jarvis` restarts
+the process deliberately. A thread holding an overnight task dies as a matter of
+*routine*, not misfortune. A managed session lives server-side; `task_store.py`
+holds its id and the manager re-attaches on the next start. A local loop would
+also have parked an hour of CPU next to the real-time audio threads — exactly
+the contention the M67/M68 cooperative speech gate exists to prevent.
+
+**Least privilege, inverted from the obvious instinct.** A background agent runs
+*unobserved*, for a long time, with nobody able to interrupt it. The pull is to
+give it more power because it is doing real work; it gets strictly **less** than
+a voice turn. Its whole surface is Anthropic's hosted toolset inside a
+per-session container — no Jarvis tools at all, no host filesystem, no shell, no
+camera, no self-update, no route back to this machine. Only the text of its
+report crosses back. That is a stronger boundary than the per-origin deny list
+used for phone and Discord, which filters a *shared* tool set: here the surface
+is separate by construction, so there is nothing to leak through. All three
+tools are also in `_RESTRICTED_DENY` — dispatching is unbounded API spend, and a
+remote origin must not be able to start it.
+
+**Delivery: two state flags, not one.** `status` is what the agent is doing;
+`delivered` is whether the user has been told. Separating them is what makes the
+overnight case work. A task finishing at 03:00 is `done` immediately but is
+deliberately not announced — `deliver_ready()` checks `quiet_hours.is_quiet()`
+and simply leaves it, and `get_briefing` drains it in the morning, marking each
+delivered as it hands it over. Collapsing the two flags would mean a restart
+between "finished" and "spoken" silently loses the report, which is the one
+outcome an overnight task cannot have.
+
+Deciding this in the manager rather than adding a label to
+`_DEFERRABLE_LABELS` also avoided a double-delivery: the quiet-hours catch-up
+store *and* the new briefing section would both have replayed it.
+
+**THE LIVE PROBE CAUGHT TWO BUGS THAT 41 GREEN TESTS DID NOT.**
+
+The hermetic suite passed completely — including a fake transport that happily
+accepted whatever it was handed. The real API did not:
+
+1. `Sessions.create() got an unexpected keyword argument 'initial_events'` —
+   that field postdates the installed SDK (0.97.0). Kickoff had to become a
+   separate `events.send` call.
+2. Worse, and only visible *because* of fixing (1): without `initial_events` a
+   session is created **idle** and only starts when the first message lands. The
+   poll loop read `idle`, found no messages yet, and would have marked the task
+   **done with an empty report** — a silent success that delivers nothing.
+   `poll()` now treats "idle with no result yet" as still-running.
+
+That second failure is the interesting one: it did not exist until the fix for
+the first, and no fake would ever have exhibited it. A mock proves the code
+agrees with your idea of the API; only the API proves the code agrees with the
+API.
+
+Treating "idle, nothing yet" as running then created a third hole — a genuinely
+wedged session would poll forever and hold a concurrency slot permanently — so
+the manager gained an 8-hour age cap. Age is the only signal that distinguishes
+"not started yet" from "never will".
+
+**Cost discipline.** Concurrency capped at 2; each task is real, open-ended
+spend. `shutdown()` stops polling but deliberately leaves sessions running —
+they live server-side and are re-attached — because cancelling on shutdown would
+make `update_jarvis` silently destroy an overnight task.
+
+**Privacy — the deliberate exception.** Jarvis's standing promise is that only
+transcribed text leaves the machine. This breaks it: the agent fetches pages and
+writes working files in an Anthropic-hosted sandbox. Rather than quietly weaken
+the claim, the principle in CLAUDE.md now names the exception, says it is
+off unless explicitly enabled, and instructs that any future off-box feature
+gets its own flag and its own line. A promise is only worth making if it stays
+literally true for anyone who has not opted in.
+
+**Files:** `src/task_store.py` (NEW), `src/background_agent.py` (NEW),
+`src/background_tasks.py` (NEW), `src/llm.py` (3 tools registered + denied +
+system-prompt entries 27-29), `src/briefing.py` (`_background_tasks_section`),
+`main.py` (construct, start, status registration, shutdown),
+`tests/background_tasks_test.py` (NEW, 41 assertions),
+`scripts/background_agent_probe.py` (NEW live instrument), docs.
+
+**Gate:** 50/50 green.

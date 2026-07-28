@@ -97,6 +97,27 @@ Whisper — and intentionally not an env var.)*
 | `JARVIS_PREDICTION_MINE_MODEL` | `SUMMARY_MODEL` | predictions.py | Model for extraction (cheap). |
 | `JARVIS_PREDICTION_RESOLVE_MODEL` | `CLAUDE_MODEL` | predictions.py | Model for the resolution judgment. |
 
+## Long-horizon background agents (M91)
+
+**This is the one setting that changes Jarvis's privacy posture.** Everything
+else keeps audio and question text local (or LAN-local). A background agent
+runs on Anthropic's infrastructure: it fetches pages and writes working files
+inside an Anthropic-hosted sandbox. Off unless you turn it on, deliberately.
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_BACKGROUND_AGENTS` | `""` (**off**) | background_agent.py | Enable `start_background_task` and the poll/delivery loop. Blank/`0`/`false`/`no`/`off` ⇒ disabled. |
+
+Notes:
+- The agent's tool surface is **only** Anthropic's hosted toolset (bash, files,
+  web search/fetch) inside a per-session container. It gets **no** Jarvis tools
+  — no shell, no host filesystem, no camera, no self-update — and no route back
+  to this machine. The only thing that crosses back is its report.
+- All three task tools are in `_RESTRICTED_DENY`, so a phone or Discord turn
+  cannot start one (dispatching is unbounded API spend, run unobserved).
+- Concurrency is capped at 2. Sessions live server-side, so they survive a
+  Jarvis restart and are re-attached on startup.
+
 ## Severe-weather alerts (M77 — US only, no API key)
 
 | Variable | Default | Read in | Purpose |

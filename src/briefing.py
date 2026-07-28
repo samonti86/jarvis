@@ -185,6 +185,28 @@ def _quiet_catchup_section() -> str:
         return ""
 
 
+def _background_tasks_section() -> str:
+    """M91 — long-horizon research that finished while the user was asleep.
+
+    A task completing at 03:00 is deliberately NOT announced; it is left
+    undelivered and drained here instead. `pending_reports()` marks each one
+    delivered as it hands it over, so a report is spoken exactly once whether
+    it arrives by announce or by briefing. Lazy import + fail-soft; returns ""
+    when the feature is off or nothing finished."""
+    try:
+        from src import background_tasks  # noqa: PLC0415 — lazy
+        reports = background_tasks.pending_reports()
+        if not reports:
+            return ""
+        if len(reports) == 1:
+            return reports[0]
+        body = "\n".join(f"- {r}" for r in reports)
+        return f"While you were asleep I finished {len(reports)} tasks:\n{body}"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[briefing] background-tasks section failed: {exc}", file=sys.stderr)
+        return ""
+
+
 def _predictions_section() -> str:
     """M78.2 — "you called it" follow-ups: any sports prediction Jarvis made
     that has since been decided. Mines recent transcripts, resolves due ones
@@ -234,6 +256,7 @@ def execute_briefing_tool(params: dict) -> str:  # noqa: ARG001 — param-less t
         _weather_section(),
         _security_section(),
         _quiet_catchup_section(),  # M79 — "while you were away" deferred announces
+        _background_tasks_section(),  # M91 — research that finished overnight
         _calendar_section(),    # M62 — silent skip when Outlook isn't configured
         _reminders_section(),
         _predictions_section(), # M78.2 — silent skip when nothing's resolved
