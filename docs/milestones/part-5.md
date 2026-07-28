@@ -1025,3 +1025,80 @@ system-prompt entry 24a drawing the line against `status_report`),
 `tests/self_review_test.py` (NEW, 23 assertions).
 
 **Gate:** 51/51 green.
+## M94 — the fix M93 found: transient TLS retries that actually ride out the blip — 2026-07-28
+
+**The loop closed.** M93 shipped a diagnostic; the first thing it said was that
+the calendar feed had been failing for weeks. This is that fix — and the
+investigation is more of the story than the diff.
+
+**What the diagnostic reported.**
+
+> 47 times in 16 sessions: `[outlook] ical fetch failed: ConnectTimeout: _ssl.c:993`
+
+**First correction: it is not a calendar bug.** The same error class appeared in
+`[weather]` (21), `[stt]` (9) and `[news]` (1). Point-fixing outlook would have
+treated a symptom — the exact mistake the M67/M68 stutter-gate post-mortem
+records ("stop point-fixing").
+
+**Hypotheses tested and discarded, in order.**
+
+1. *Network not ready at boot.* Falsified: **zero** failures in the first 60s
+   of a session; 87% land more than an hour in.
+2. *That 87% proves anything.* Also discarded — it is confounded. If sessions
+   run for hours, most polls happen >1h in regardless, so the distribution
+   reflects exposure, not cause.
+3. *Silent degradation of the briefing.* Wrong, and worth recording as a
+   correction: `_calendar_section` **already** surfaces the error deliberately
+   ("silent failure here would mean a missed meeting"). That was designed
+   right; no bug to fix there.
+
+**The question that was not confounded** — burst or uniform? Measured: **44
+distinct outage bursts over 35 days**, 22 of them a single event, the largest 10
+events across 1.6 minutes. Transient network flakiness, not a config error.
+
+**The actual defect.** 52 outlook failures, but only 18 announced a retry —
+meaning 34 exhausted it. A retry had already been added for this on 2026-07-02
+and *was not enough*, because it was calibrated for the wrong failure shape:
+
+> ```
+> 10:26:45  ical fetch failed ... — retrying in 0.5s
+> 10:27:01  ical fetch failed ...          <- gave up
+> ```
+
+Sixteen seconds apart. The handshake burns the **full 15s timeout** before the
+backoff even begins, so a flat 0.5s puts attempt 2 about 15.5s in — still inside
+the same blip. The retry never had a chance.
+
+**The fix is strictly better on both axes, not merely more patient.** A
+handshake that has not completed in 8s is not going to (a healthy one is well
+under a second), so the per-attempt timeout drops and buys a third attempt with
+an exponential gap:
+
+| | attempts | worst case |
+|---|---|---|
+| before | 2 | 15 + 0.5 + 15 = **30.5s** |
+| after | 3 | 8 + 1 + 8 + 2 + 8 = **27.0s** |
+
+More chances to catch a good moment, in less time spent failing. That matters
+because this path also serves the on-demand "what's on my calendar?" turn, where
+a user is waiting in silence.
+
+**What was deliberately NOT changed.** `http_util` gained an `attempts`
+parameter — defaulting to **2, exactly today's behaviour**. Every caller of that
+helper (weather, news, sports, tmdb, games) is an *interactive voice tool*.
+Making them more patient would trade this project's first constraint, latency,
+for a background problem's benefit. Only a caller where nobody is waiting should
+raise it. The backoff there is now exponential rather than flat, which is the
+part that was actually wrong.
+
+**Lesson.** A retry policy is not "did we retry" but "did we retry *later than
+the thing that broke us*". The 2026-07-02 fix answered the first question and
+failed the second, and nothing in the system could tell — because a fault that
+appears once per run is invisible per-run. It took a cross-session view to make
+a months-old, already-"fixed" defect legible.
+
+**Files:** `src/http_util.py` (`attempts` param, exponential backoff),
+`src/outlook_calendar.py` (3 attempts, 8s timeout, exponential backoff),
+`tests/retry_policy_test.py` (NEW, 12 assertions).
+
+**Gate:** 52/52 green.
