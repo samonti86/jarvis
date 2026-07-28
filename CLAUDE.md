@@ -71,8 +71,22 @@ keep an always-on process honest.
 
 ## Key Files & Directories
 The core listen → process → respond spine:
-- `main.py` — top-level loop; wake word → STT → LLM → TTS. Owns `TurnRunner`
-  (conversation history, per-turn orchestration) and wires every subsystem.
+- `main.py` — the composition root, and *only* that: one `main()` that loads
+  config, builds subsystems, starts threads, and waits. It was 2,805 lines
+  until the 2026-07-28 extraction split it four ways (below).
+- `src/listen_loop.py` — the voice path and the conversation-level state
+  machine above a single turn: wake-word arming, barge-in, the follow-up
+  window, conversation mode, interpreter mode, the speaker gate, dismissals.
+- `src/turn_runner.py` — one turn, end to end: history, streaming, the tool
+  loop, sentence-chunked TTS, finalisation. **Its collaborators
+  (`stream_response`, `speak`, `speak_streaming`, `MemoryStore`,
+  `_seal_session`) must stay resolvable as module-level globals** — that is
+  the seam `turn_runner_test.py` patches, and `turn_runner_patch_test.py`
+  exists to fail if a refactor ever breaks it.
+- `src/bootstrap.py` — subsystem assembly: the two optional Plex connections,
+  the announcement fan-out, the remote console, the status registry, ordered
+  shutdown. Everything that *builds* a thing and returns a handle.
+- `src/logging_setup.py` — stdout/stderr wiring for the three launch modes.
 - `jarvis.pyw` — silent launcher (pythonw, no console); logs to
   `%LOCALAPPDATA%\Jarvis\jarvis.log`.
 - `jarvis_watchdog.pyw` — supervisor; respawns `main.py` on crash.

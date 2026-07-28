@@ -124,14 +124,18 @@ Run the gate with `python scripts/run_all_tests.py`.
 ## Layout
 
 ```text
-main.py                 event loop: wake -> STT -> LLM -> TTS; owns conversation state
+main.py                 composition root: load config, build subsystems, start threads
+src/listen_loop.py      voice path — wake word, barge-in, follow-up/conversation modes
+src/turn_runner.py      one turn end-to-end: history, streaming, tool loop, TTS
+src/bootstrap.py        subsystem assembly (Plex, announcer, remote console, shutdown)
 src/llm.py              Anthropic client, streaming, tool loop, per-origin tool boundary
 src/wake_word.py        openWakeWord
 src/speech_to_text.py   faster-whisper (local, or offloaded to a GPU host)
 src/text_to_speech.py   edge-tts + fallback, sentence-chunked streaming
 src/security.py         vision security mode (person detection, challenge/response)
-src/*.py                the tool and subsystem modules (66 in total)
+src/*.py                the tool and subsystem modules (70 in total)
 scripts/*_test.py       the regression suites
+docs/SETUP.md           deployment walkthrough
 docs/MILESTONES.md      the engineering log
 ```
 
