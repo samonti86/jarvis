@@ -26,6 +26,8 @@ disables that optional feature (the project's fail-soft contract).
 | `ANTHROPIC_API_KEY` | **(required)** | Claude API key. Jarvis exits if missing. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Main conversation model. |
 | `SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Cheap model for session summaries. |
+| `JARVIS_VOICE_EFFORT` | `medium` | Reasoning/acting depth for a spoken turn (`low`…`max`). Sonnet 5 defaults to `high` when unset, which over-thinks "what's the weather". Read in `llm.py`; an invalid value logs and falls back rather than 400-ing every turn. |
+| `JARVIS_ENGINEER_EFFORT` | `high` | Same knob for engineer mode, where depth is the point. |
 | `WHISPER_MODEL` | `small` | Local faster-whisper model size. |
 | `WAKE_WORD_THRESHOLD` | `0.5` | openWakeWord confidence to trigger. |
 | `MEMORY_RECALL_COUNT` | `10` | Recent session summaries injected into the system prompt. |
