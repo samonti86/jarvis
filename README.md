@@ -58,8 +58,8 @@ transcription server, the calendar feed — can fail without taking down the lis
 loop. Degrade and log; never crash the thing the user is talking to.
 
 **A regression gate, because a bug a test would have caught earns a test.**
-`scripts/run_all_tests.py` runs 45 gates — syntax, module wiring, a JS structural
-check, and 42 test suites totalling ~1,000 assertions — and must be green before
+`scripts/run_all_tests.py` runs 49 gates — syntax, module wiring, a JS structural
+check, and 46 test suites totalling ~1,100 assertions — and must be green before
 anything ships. CI runs the *same* command on every push; the five gates that need
 a native ML toolchain or Windows SAPI are skipped **by name**, never silently
 folded into the pass count.
@@ -136,10 +136,11 @@ src/speech_to_text.py   faster-whisper (local, or offloaded to a GPU host)
 src/text_to_speech.py   edge-tts + fallback, sentence-chunked streaming
 src/security.py         vision security mode (person detection, challenge/response)
 src/*.py                the tool and subsystem modules (70 in total)
-scripts/*_test.py       the regression suites
+tests/*_test.py         the regression suites — everything here runs in the gate
+scripts/                operational entry points + hand-run probes; never collected
 docs/SETUP.md           deployment walkthrough
 docs/MILESTONES.md      engineering log — index + "start here"
-docs/milestones/        the log itself, 105 entries across 5 parts
+docs/milestones/        the log itself, 107 entries across 5 parts
 ```
 
 ## License

@@ -100,10 +100,11 @@ The core listen → process → respond spine:
 - `src/remote_console.py` / `src/remote_pwa.py` / `src/discord_bot.py` — the
   remote clients.
 - `scripts/run_all_tests.py` — the unified regression gate (see Commands).
+- `tests/*_test.py` — the regression suites; everything here runs in the gate.
 - `docs/MILESTONES.md` — the engineering log's **index** (intro, a curated
   "Start here", and generated contents); the entries themselves live in
   `docs/milestones/part-N.md`. The index is generated — after adding an entry
-  run `python scripts/milestones_toc_test.py --write`, or the gate fails.
+  run `python tests/milestones_toc_test.py --write`, or the gate fails.
   `docs/CODE_AUDIT.md` — the
   consolidation-pass audits. `docs/ENV_VARS.md` — config inventory.
 
@@ -135,9 +136,19 @@ venv\Scripts\python.exe scripts\run_all_tests.py
 
 The gate folds in: `py_compile` over `main.py` + launchers + every `src/*.py`;
 an `import main` module-wiring smoke test; a structural JS check on the PWA
-(`scripts/js_parse_gate.py`); and every `scripts/*_test.py` suite (45 suites at
-last count). It must exit 0. If the venv is unavailable, the minimum fallback is
+(`scripts/js_parse_gate.py`); and every `tests/*_test.py` suite (46 at last
+count). It must exit 0. If the venv is unavailable, the minimum fallback is
 `python -m py_compile main.py jarvis.pyw src/*.py`.
+
+**The directory is the boundary.** Anything in `tests/` is collected by the gate
+automatically — adding a suite there is the whole registration step. Nothing in
+`scripts/` is ever collected, whatever it is named: that is where the
+operational entry points (`run_all_tests.py`, `doctor.py`, `js_parse_gate.py`)
+and the hand-run instruments live. Several of those instruments cost live API
+calls (`effort_probe.py`, `web_search_version_probe.py`) or need hardware and
+run for hours (`leak_repro.py`, the `*_soak.py` pair) — they must never be
+picked up by CI, and a directory guarantees that where a naming convention only
+asks politely.
 
 ## Architecture
 

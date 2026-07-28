@@ -2,7 +2,7 @@ r"""Unified test runner / close-out regression gate for Jarvis.
 
 WHY THIS EXISTS:
 Until now the close-out gate was `py_compile` (syntax only) and the dozen
-`scripts/*_test.py` suites were each run by hand. That's no regression net —
+`*_test.py` suites were each run by hand. That's no regression net —
 a reorg that silently breaks the announce path or a tool schema compiles
 fine and passes "py_compile" while being thoroughly broken. This script is
 the single command that says "is the codebase still green?", so any later
@@ -12,14 +12,15 @@ WHAT IT RUNS (in order, fail-fast OFF — every gate runs so you see the full
 picture, exit code reflects whether ANY failed):
   1. py_compile syntax gate over main.py + the launchers + every src/*.py
   2. js_parse_gate.py — structural JS check on the inlined PWA script
-  3. every scripts/*_test.py unit/regression suite, each in its own subprocess
+  3. every tests/*_test.py unit/regression suite, each in its own subprocess
 
-WHAT IT DELIBERATELY EXCLUDES:
-  - leak_repro.py, barge_stutter_soak.py  -> long-running soaks (minutes/hours)
-These are instruments you reach for by hand, not gates. They're listed in
-_EXCLUDED so a future reader knows the omission is deliberate, not an oversight.
-(Note: _EXCLUDED only matters for files that DO end in `*_test.py`; other
-standalone scripts simply aren't globbed.)
+WHAT IT DELIBERATELY EXCLUDES — and how:
+Everything in scripts/. Suites used to sit there beside hand-run probes and
+soaks, and the only thing keeping a probe out of the gate was remembering not
+to name it `*_test.py`. That is a convention, and a convention is one careless
+rename away from CI running `effort_probe.py` (live API calls) or `leak_repro.py`
+(hours). Since 2026-07-28 the DIRECTORY is the boundary: tests/ is collected,
+scripts/ never is, whatever a file is called.
 
 Each suite is run with THIS interpreter (sys.executable), so when you invoke
 it as `venv\Scripts\python.exe scripts\run_all_tests.py` the children inherit
@@ -52,9 +53,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+TESTS = ROOT / "tests"
 
-# Standalone scripts that are NOT regression gates (see module docstring).
-_EXCLUDED = {"leak_repro.py", "barge_stutter_soak.py"}
+# THE DIRECTORY IS THE BOUNDARY (2026-07-28).
+# Suites used to live in scripts/ alongside hand-run probes and soaks, and the
+# only thing keeping a probe out of the gate was remembering not to name it
+# `*_test.py`. That is a convention, and conventions are one careless rename
+# away from a probe that costs live API calls running in CI.
+#
+# Now: everything in tests/ is a gate and runs automatically; nothing in
+# scripts/ is ever collected, whatever it is called. `effort_probe.py` and
+# `web_search_version_probe.py` spend real money and need network — they are
+# instruments, and they live in scripts/ where the runner cannot reach them.
+_EXCLUDED: set[str] = set()
 
 # Third-party modules that cannot be assumed present on a stock CI runner:
 # native builds (dlib), multi-GB ML wheels (torch), hardware bindings
@@ -153,7 +164,7 @@ def main() -> int:
 
     # --- Gate 3: every *_test.py suite ------------------------------------
     suites = sorted(
-        p for p in SCRIPTS.glob("*_test.py") if p.name not in _EXCLUDED
+        p for p in TESTS.glob("*_test.py") if p.name not in _EXCLUDED
     )
     for suite in suites:
         ok, out = _run(suite.name, [py, str(suite)])
