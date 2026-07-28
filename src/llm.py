@@ -64,6 +64,11 @@ from src.news import NEWS_TOOL, execute_news_tool
 from src.briefing import BRIEFING_TOOL, execute_briefing_tool
 from src.good_night import GOOD_NIGHT_TOOL, execute_good_night_tool
 from src.self_update import UPDATE_JARVIS_TOOL, execute_update_jarvis
+from src.background_tasks import (
+    CANCEL_BACKGROUND_TASK_TOOL, LIST_BACKGROUND_TASKS_TOOL,
+    START_BACKGROUND_TASK_TOOL, execute_cancel_background_task,
+    execute_list_background_tasks, execute_start_background_task,
+)
 from src.homelab_monitor import HOMELAB_STATUS_TOOL, execute_homelab_status
 from src.self_status import STATUS_REPORT_TOOL, execute_status_report
 from src.reminders import (
@@ -516,6 +521,29 @@ Self-maintenance (one tool):
     say so once and don't loop. On a successful pull, voice the
     confirmation immediately — Jarvis restarts ~5 s later. Do NOT recite
     individual commits / changed files; one sentence summary only.
+
+Long-horizon work (three tools):
+27. start_background_task — hand an open-ended research or analysis job to a
+    background agent that works for many minutes to an hour and reports back
+    later. Use it ONLY when the user is clearly not waiting on the answer:
+    "research X overnight", "look into Y and tell me later/in the morning",
+    "do a proper comparison of A and B and brief me". Signals are an explicit
+    later ("tonight", "in the morning", "while I'm out") or a scope obviously
+    too large for one reply.
+    Do NOT use it as a substitute for answering now. A normal question — even
+    a broad one — gets web_search and an answer in this turn. If in doubt,
+    answer now; a user waiting in silence for an hour is a much worse failure
+    than a slightly shallow immediate reply.
+    Write the `task` for someone with no other context: what to find out and
+    what a good answer looks like. Confirm briefly and say you'll report back;
+    do not narrate the mechanism.
+28. list_background_tasks — what is running and what recently finished. Use
+    for "what are you working on?" or to get an id before cancelling.
+29. cancel_background_task — stop one. Use on "drop it", "stop looking into
+    that", "never mind".
+    Results arrive on their own, spoken when they land or folded into the next
+    morning briefing if they finish overnight — so never tell the user to ask
+    again later, and never poll on their behalf.
 
 Tool-use rules:
 - For TIME-SENSITIVE categories, ALWAYS prefer the appropriate tool over memory or
@@ -990,6 +1018,9 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "homelab_status":               _ClientTool(execute_homelab_status, "homelab"),
     "status_report":                _ClientTool(execute_status_report, "self_status"),
     "what_did_you_hear":            _ClientTool(execute_what_did_you_hear, "acoustic_recall"),
+    "start_background_task":        _ClientTool(execute_start_background_task, "bgtask_start"),
+    "list_background_tasks":        _ClientTool(execute_list_background_tasks, "bgtask_list"),
+    "cancel_background_task":       _ClientTool(execute_cancel_background_task, "bgtask_cancel"),
     "pc_diagnostics":               _ClientTool(execute_pc_diagnostics_tool, "diagnostics"),
     "pc_shell":                     _ClientTool(execute_pc_shell, "shell"),
     "system_control":               _ClientTool(execute_system_control_tool, "sysctl"),
@@ -1023,6 +1054,11 @@ _RESTRICTED_DENY: frozenset[str] = frozenset({
     # anything — a phone-driven self-update IS arbitrary code execution
     # by another name).
     "update_jarvis",
+    # BLOCK — dispatching a long-horizon agent is unbounded API spend and
+    # runs unobserved. A phone- or Discord-origin turn must not be able to
+    # start one; listing/cancelling go with it so the surface is coherent
+    # (you cannot cancel what you could not start).
+    "start_background_task", "list_background_tasks", "cancel_background_task",
     # EXCLUDE — read-only but sensitive from a remote
     "read_local_file", "screen_snapshot", "camera_snapshot",
 })
@@ -1246,6 +1282,8 @@ def stream_response(
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, GOOD_NIGHT_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
         WHAT_DID_YOU_HEAR_TOOL,
+        START_BACKGROUND_TASK_TOOL, LIST_BACKGROUND_TASKS_TOOL,
+        CANCEL_BACKGROUND_TASK_TOOL,
         UPDATE_JARVIS_TOOL,
         PC_DIAGNOSTICS_TOOL, PC_SHELL_TOOL, SYSTEM_CONTROL_TOOL,
         READ_LOCAL_FILE_TOOL, RUN_PC_DIAGNOSTICS_COLLECTOR_TOOL,

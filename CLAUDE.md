@@ -208,6 +208,14 @@ Claude drives an agentic loop (max 8 iterations) over:
   primary if that matters.
 - Any subsystem that ships data off-box (push notifications, remote clients) is
   opt-in and off by default.
+- **One exception, and it is deliberate: background agents (M91).** A
+  long-horizon task runs on Anthropic's infrastructure, not this machine — it
+  fetches pages and writes working files inside an Anthropic-hosted sandbox.
+  That is genuinely more than "only the transcribed text leaves", so it is
+  **off unless `JARVIS_BACKGROUND_AGENTS=1`**. Do not quietly widen this: if a
+  future feature sends more off-box, it gets its own flag and its own line
+  here. The promise above is only worth making if it is kept literally for
+  anyone who hasn't opted in.
 
 ### Latency targets
 - Wake word: <100 ms.

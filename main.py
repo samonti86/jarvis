@@ -543,6 +543,21 @@ def main() -> None:
 
     # M60 — self-status registry: each subsystem reports a one-line status via
     # the `status_report` tool. Registered with the live subsystem handles.
+    # M91 — long-horizon background tasks. Constructed always so status_report
+    # can say "off"; the poll thread only starts when JARVIS_BACKGROUND_AGENTS
+    # is set. start() also RE-ATTACHES to any session still running from before
+    # a restart — the watchdog respawning us or update_jarvis restarting us is
+    # routine, and those sessions kept working server-side meanwhile.
+    # Completions ride the same _announce path as every other proactive
+    # subsystem; one that lands during quiet hours is held back and surfaces in
+    # the morning briefing instead. Local import matches the pattern above.
+    from src.background_tasks import BackgroundTaskManager  # noqa: PLC0415
+    from src import self_status  # noqa: PLC0415
+
+    background_tasks_mgr = BackgroundTaskManager(cfg.anthropic_api_key, _announce)
+    background_tasks_mgr.start()
+    self_status.register("background tasks", background_tasks_mgr.status_summary)
+
     register_status(
         cfg, security_watcher, sound_detector, homelab_monitor,
         plex_client, plex_laptop_client, remote_server, calendar_monitor,
@@ -593,6 +608,9 @@ def main() -> None:
         plex_client=plex_client,
         plex_laptop_client=plex_laptop_client,
     )
+    # Stops polling only. Running sessions are left alone on purpose:
+    # they live server-side and the next start() re-attaches.
+    background_tasks_mgr.shutdown()
 
     # Restart-Jarvis tray click sets ui.relaunch_mode. We defer the actual
     # respawn until here so the mic + Plex MCP + SSH have all released

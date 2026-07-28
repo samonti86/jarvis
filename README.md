@@ -9,7 +9,8 @@ spoken answer — with a 36-tool agentic layer behind it that can search the web
 code in a sandbox, read a calendar, watch a homelab, and see through a webcam.
 
 Wake-word detection and speech-to-text run **locally**. Only the transcribed text ever
-leaves the machine.
+leaves the machine — with one opt-in exception, [background agents](docs/ENV_VARS.md#long-horizon-background-agents-m91),
+which are off by default.
 
 ```text
 mic ──► openWakeWord ──► faster-whisper ──► Claude ──► edge-tts ──► speakers
@@ -74,6 +75,7 @@ folded into the pass count.
 | **Knowledge** | Web search and fetch, a private RAG corpus (SQLite FTS5 + local embeddings, fused with Reciprocal Rank Fusion), full-text recall over past conversations |
 | **Awareness** | Webcam vision, screen capture, ambient sound classification (PANNs), speaker identification from voice embeddings |
 | **Proactive** | Severe-weather alerts, calendar pre-event reminders, homelab up/down monitoring, cross-domain synthesis, a morning briefing and an evening wrap |
+| **Long-horizon** | Dispatch research that runs for an hour in a hosted sandbox and reports back — spoken when it lands, or folded into the morning briefing if it finishes overnight (opt-in) |
 | **System** | Read-only diagnostics shell (18-verb allowlist), confirmation-gated service control, sandboxed code execution, self-update, a crash watchdog |
 | **Clients** | Desktop console, system tray, an iOS PWA with push-to-talk over WSS, a Discord bot bridge |
 | **Data** | Weather, sports, news, film/TV, games, WolframAlpha, Plex (over MCP) |
