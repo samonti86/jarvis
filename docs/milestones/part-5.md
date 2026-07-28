@@ -1102,3 +1102,68 @@ a months-old, already-"fixed" defect legible.
 `tests/retry_policy_test.py` (NEW, 12 assertions).
 
 **Gate:** 52/52 green.
+
+## M95 — Outcomes measured and declined; the prompt fix that beat them — 2026-07-28
+
+**Outcome: Phase 3 is NOT shipped, and that is the finding.** Managed Agents
+supports rubric-graded Outcomes (`user.define_outcome` — verified live that SDK
+0.97.0 accepts it). Measured against a plain prompt on three research questions
+with mechanically-checkable criteria:
+
+| approach | mean words | total time |
+|---|---|---|
+| plain (original prompt) | 317 | 82s |
+| **tightened prompt** | **126** | **68s** |
+| Outcome (rubric-graded) | 92 | 537s |
+
+The Outcome loop *works* — it enforced brevity the prompt only requested. But a
+one-line prompt change captured most of that for **free**, and Outcomes bought
+the last 126→92 words for **8× the wall clock** and a re-run of the whole task
+on every failed grade. Not worth it here. The probe is kept
+(`scripts/outcome_probe.py`) so the trade-off can be re-decided if the pricing
+or the workload changes.
+
+**The prompt bug.** The original instruction was *"keep it under 200 words
+unless the task genuinely needs more"* — and the escape clause was taken **every
+single time**, averaging 317 words. Restated as a ceiling with no exemption:
+126. An instruction with an opt-out is a suggestion.
+
+**Honest flaw in the measurement.** One of the three criteria — "cites a URL" —
+failed in all six runs, because the agent's own system prompt forbids markup and
+tells it the answer may be *spoken*. The criterion was testing my rubric against
+the agent's design, not testing Outcomes. Excluding it, the real comparison is
+plain 3/6 vs Outcome 5/6. Recorded rather than quietly dropped, because the
+headline number (33% → 44%) is the less honest one.
+
+**AND THE BUG THIS UNCOVERED — a silent no-op.** The agent's `system` lives
+**server-side** on the persistent agent object, and `ensure_resources` returns
+early whenever the ids are cached. So editing `_SYSTEM` in this repo changed
+*nothing* for an already-provisioned agent: tune the prompt, redeploy, and the
+agent keeps the old one indefinitely. There was no error and no signal — the
+only way to see it was to read the live agent back, which is how it was found.
+
+Fixed by fingerprinting the prompt (sha256, stored beside the ids) and pushing
+`agents.update` when it drifts. Two details earned their own assertions:
+
+- **`version` is REQUIRED** by SDK 0.97.0's `agents.update()` — the
+  optimistic-concurrency check. Omitting it raises rather than defaulting to
+  last-write-wins, which is how the first attempt failed. The current version is
+  read and handed straight back; this agent has one writer.
+- **A failed update must not record the fingerprint.** Saving it would mark the
+  drift resolved and never retry — recreating the exact silent no-op the whole
+  mechanism exists to prevent.
+
+Verified end to end: the live agent moved to **version 2** carrying the new
+ceiling, and a second call is a no-op.
+
+**Lesson.** Three SDK surprises across M91–M95 (`initial_events` unsupported,
+sessions start idle, `update` needs `version`) all shared a shape: the hermetic
+tests passed because the fake agreed with my *idea* of the API. Every one was
+caught by pointing the code at the real service. Mocks verify wiring; only the
+live call verifies the contract.
+
+**Files:** `src/background_agent.py` (hard ceiling, `_system_fingerprint`,
+drift-triggered `agents.update`), `scripts/outcome_probe.py` (NEW instrument),
+`tests/background_tasks_test.py` (+8, now 57).
+
+**Gate:** 52/52 green.

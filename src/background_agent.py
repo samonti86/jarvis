@@ -56,6 +56,14 @@ _ENV_NAME = "jarvis-research"
 # web_fetch, web_search — all executing inside the session container.
 _TOOLSET = {"type": "agent_toolset_20260401"}
 
+# THE 90-WORD CEILING IS MEASURED, NOT GUESSED (M95).
+# The original wording — "keep it under 200 words unless the task genuinely
+# needs more" — averaged 317 words across a live 3-question probe, because the
+# escape clause was taken every single time. Restating it as a hard ceiling
+# with no exemption cut the mean to 126 words at no latency cost.
+#
+# The rationale lives here rather than in the prompt on purpose: the prompt is
+# billed on every call and should instruct, not narrate its own history.
 _SYSTEM = """You are Jarvis's research agent, working a long-running task on \
 his behalf while the user is away.
 
@@ -70,7 +78,9 @@ Write it for someone who has been asleep:
 - Open with the answer or the single most useful finding, in one sentence.
 - Then the supporting detail, in short paragraphs. No headers, no bullet \
 markup, no tables — this may be spoken.
-- Keep it under 200 words unless the task genuinely needs more.
+- HARD LIMIT: 90 words. This is a ceiling, not a target. A longer answer is a \
+failed answer however good the content — cut detail until it fits; the user \
+can always ask for more.
 - If you failed, say so in the first sentence and explain what blocked you. \
 Do not pad a failure into something that sounds like a result."""
 
@@ -108,6 +118,13 @@ def _save_ids(ids: dict) -> None:
     atomic_write_text(_ids_path(), json.dumps(ids, indent=2))
 
 
+def _system_fingerprint() -> str:
+    """Short hash of the system prompt, stored beside the ids so a drifted
+    prompt is detectable without keeping a full copy on disk."""
+    import hashlib  # noqa: PLC0415
+    return hashlib.sha256(_SYSTEM.encode("utf-8")).hexdigest()[:16]
+
+
 def _get_client(api_key: str):
     """Lazy import so this module stays import-light and a missing/old SDK
     degrades instead of breaking startup."""
@@ -127,6 +144,40 @@ def ensure_resources(api_key: str) -> tuple[str | None, str | None]:
     with _LOCK:
         ids = _load_ids()
         if ids.get("agent_id") and ids.get("environment_id"):
+            # THE PROMPT LIVES SERVER-SIDE. The agent object holds `system`, so
+            # editing _SYSTEM in this file changes nothing for an agent that was
+            # already provisioned — the ids are cached and this function used to
+            # return right here. That is a silent no-op: you tune the prompt,
+            # redeploy, and the agent keeps using the old one forever.
+            # Fingerprint the prompt and push an update when it drifts. Updating
+            # creates a new agent VERSION; sessions already running keep theirs.
+            want = _system_fingerprint()
+            if ids.get("system_sha") != want:
+                try:
+                    client = _get_client(api_key)
+                    # `version` is REQUIRED by this SDK (0.97.0) — it is the
+                    # optimistic-concurrency check, and omitting it raises
+                    # rather than defaulting to last-write-wins. Read the
+                    # current version and hand it straight back; this agent has
+                    # exactly one writer, so there is no race to lose.
+                    current = client.beta.agents.retrieve(ids["agent_id"])
+                    updated = client.beta.agents.update(
+                        ids["agent_id"],
+                        system=_SYSTEM,
+                        version=getattr(current, "version", 1),
+                    )
+                    # Only record the fingerprint once the server has actually
+                    # taken it. Saving it on a failed update would mark the
+                    # drift resolved and never retry — the silent no-op this
+                    # whole block exists to prevent.
+                    ids["system_sha"] = want
+                    _save_ids(ids)
+                    print(f"[bgagent] system prompt changed - agent updated to "
+                          f"version {getattr(updated, 'version', '?')}",
+                          file=sys.stderr)
+                except Exception as exc:  # noqa: BLE001 — never block a dispatch
+                    print(f"[bgagent] could not update system prompt: {exc}",
+                          file=sys.stderr)
             return ids["agent_id"], ids["environment_id"]
 
         try:
@@ -145,6 +196,7 @@ def ensure_resources(api_key: str) -> tuple[str | None, str | None]:
                     tools=[_TOOLSET],
                 )
                 ids["agent_id"] = agent.id
+            ids["system_sha"] = _system_fingerprint()
             _save_ids(ids)
             print(f"[bgagent] resources ready agent={ids['agent_id']} "
                   f"env={ids['environment_id']}", file=sys.stderr)
