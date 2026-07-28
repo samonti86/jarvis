@@ -1025,7 +1025,6 @@ system-prompt entry 24a drawing the line against `status_report`),
 `tests/self_review_test.py` (NEW, 23 assertions).
 
 **Gate:** 51/51 green.
-
 ## M94 — the fix M93 found: transient TLS retries that actually ride out the blip — 2026-07-28
 
 **The loop closed.** M93 shipped a diagnostic; the first thing it said was that
