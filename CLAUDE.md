@@ -100,7 +100,11 @@ The core listen → process → respond spine:
 - `src/remote_console.py` / `src/remote_pwa.py` / `src/discord_bot.py` — the
   remote clients.
 - `scripts/run_all_tests.py` — the unified regression gate (see Commands).
-- `docs/MILESTONES.md` — the engineering log. `docs/CODE_AUDIT.md` — the
+- `docs/MILESTONES.md` — the engineering log's **index** (intro, a curated
+  "Start here", and generated contents); the entries themselves live in
+  `docs/milestones/part-N.md`. The index is generated — after adding an entry
+  run `python scripts/milestones_toc_test.py --write`, or the gate fails.
+  `docs/CODE_AUDIT.md` — the
   consolidation-pass audits. `docs/ENV_VARS.md` — config inventory.
 
 The remaining ~50 `src/` modules are individual tools and monitors (weather,
