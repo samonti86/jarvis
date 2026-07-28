@@ -554,7 +554,7 @@ def main() -> None:
     from src.background_tasks import BackgroundTaskManager  # noqa: PLC0415
     from src import self_status  # noqa: PLC0415
 
-    background_tasks_mgr = BackgroundTaskManager(cfg.anthropic_api_key, _announce)
+    background_tasks_mgr = BackgroundTaskManager(cfg.anthropic_api_key, _announce, ui=ui)
     background_tasks_mgr.start()
     self_status.register("background tasks", background_tasks_mgr.status_summary)
 

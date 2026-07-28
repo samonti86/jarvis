@@ -51,6 +51,7 @@ _ACCENT_HOT = "#7df3ff"   # near-white-hot cyan — glow cores, peaks
 _RING = "#244a5e"         # dim HUD ring / ticks
 _TEXT = "#7fe9f5"         # cyan readout text
 _ARMED = "#ff5a5a"        # security-armed red
+_RESEARCH = "#7fd4ff"     # background-research cyan
 
 
 def is_enabled() -> bool:
@@ -100,6 +101,8 @@ class JarvisHUD:
         self._state: State = State.IDLE
         self._amp = 0.0
         self._armed = False
+        self._tasks_active = 0
+        self._tasks_pending = 0
         self._anim_start = time.time()
         self._wave_bars: list[int] = []
         try:
@@ -124,6 +127,20 @@ class JarvisHUD:
 
     def set_armed(self, on: bool) -> None:
         self._armed = bool(on)
+
+    def set_research(self, active: int, pending: int) -> None:
+        """Background research state (M97).
+
+        This is the one thing Jarvis does that is otherwise INVISIBLE: an M91
+        task runs off-box for minutes to hours with no window, no sound, and
+        no tray change. Ambient status is exactly what a HUD is for, so a
+        running task gets a line and a finished-but-unspoken one gets a
+        different line."""
+        try:
+            self._tasks_active = max(0, int(active))
+            self._tasks_pending = max(0, int(pending))
+        except (TypeError, ValueError):
+            self._tasks_active = self._tasks_pending = 0
 
     def is_active(self) -> bool:
         return not self._disabled
@@ -238,6 +255,8 @@ class JarvisHUD:
         # Clock + security badge readouts.
         self._clock = cv.create_text(cx, 236, text="--:--", fill=_TEXT,
                                      font=("Consolas", 22, "bold"))
+        self._research = cv.create_text(cx, 284, text="", fill=_RESEARCH,
+                                        font=("Consolas", 8))
         self._badge = cv.create_text(cx, 266, text="", fill=_RING,
                                      font=("Consolas", 11, "bold"))
 
@@ -302,6 +321,22 @@ class JarvisHUD:
                 cv.itemconfig(self._badge, text="● ARMED", fill=_ARMED)
             else:
                 cv.itemconfig(self._badge, text="○ SECURE", fill=_RING)
+
+            # Research line. Empty when there is nothing to say — an always-on
+            # row of "0 tasks" is clutter, and the HUD sits over the user's work.
+            if self._tasks_active:
+                dots = "." * (1 + int(t * 2) % 3)      # gentle "working" motion
+                n = self._tasks_active
+                label = f"researching{dots}" if n == 1 else f"researching x{n}{dots}"
+                cv.itemconfig(self._research, text=label, fill=_RESEARCH)
+            elif self._tasks_pending:
+                n = self._tasks_pending
+                cv.itemconfig(
+                    self._research,
+                    text="1 report ready" if n == 1 else f"{n} reports ready",
+                    fill=_RESEARCH)
+            else:
+                cv.itemconfig(self._research, text="")
         except tk.TclError:
             return False
         return True

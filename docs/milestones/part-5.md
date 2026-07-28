@@ -1216,3 +1216,46 @@ already exists **as an empty string**; it needed direct assignment.
 `tests/structured_output_test.py` (NEW, 17 assertions).
 
 **Gate:** 53/53 green.
+
+## M97 — the HUD learns to show background research — 2026-07-28
+
+**What shipped.** The ambient overlay (M84) gains a research line under the
+security badge: `researching...` with a gentle animated ellipsis while a task is
+working, `1 report ready` when something has finished but not yet been spoken,
+and **nothing at all** when there is neither.
+
+**Why this and not a general "richer HUD".** Background research is the one
+thing Jarvis does that has *no visible surface anywhere*. A voice turn lights
+the orb, an announce speaks, an armed watcher flips a badge — but an M91 task
+runs off-box for minutes to hours with no window, no sound and no tray change.
+That is precisely the gap an ambient overlay exists to fill, so it earned the
+space; a decorative addition would not have.
+
+**The empty state is a feature.** A permanent `0 tasks` row would be clutter on
+a translucent overlay that sits over the user's actual work. The line renders
+only when it has something to say.
+
+**Fan-out follows the existing chain** — `JarvisUI.set_research_indicator` →
+`JarvisConsole.set_research` → `JarvisHUD.set_research` — the same path
+`set_armed` already takes, so there is one pattern for "ambient state" rather
+than two.
+
+One deliberate difference: this indicator is driven by the
+**BackgroundTaskManager poll thread**, not by a UI event. So the facade wraps
+the call in a try/except that the other indicators do not need. A poll loop that
+died on a Tk teardown would silently stop delivering finished research — the one
+failure this feature cannot have. Asserted directly: *"a dead UI cannot kill the
+poll loop."*
+
+**Verified structurally, not visually.** As with M84 itself, the overlay was
+built without being able to see it: the tests assert the state transitions
+(1 active → 0 active/1 pending → cleared after delivery) and that the research
+colour is distinct from the armed red. The rendering itself needs a human
+glance.
+
+**Files:** `src/hud.py` (research line + colour + setter), `src/console.py`
+(thread-safe bridge), `src/ui.py` (facade), `src/background_tasks.py`
+(`_push_ui` each cycle), `main.py` (pass the UI through),
+`tests/background_tasks_test.py` (+7, now 63).
+
+**Gate:** 53/53 green.

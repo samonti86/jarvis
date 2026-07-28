@@ -248,6 +248,19 @@ class JarvisUI:
     # set_armed_indicator.
     # ------------------------------------------------------------------
 
+    def set_research_indicator(self, active: int, pending: int) -> None:
+        """Thread-safe pass-through to the ambient overlay's research line
+        (M97). Called from the BackgroundTaskManager poll thread every cycle.
+
+        Wrapped because unlike the other indicators this one is driven by a
+        background thread that must survive anything the UI does — a poll loop
+        that dies on a Tk teardown would silently stop delivering finished
+        research, which is the one failure this feature cannot have."""
+        try:
+            self.console.set_research(active, pending)
+        except Exception:  # noqa: BLE001 — a UI sink must never break the poller
+            pass
+
     def set_armed_indicator(self, on: bool) -> None:
         """Thread-safe pass-through to the console's armed indicator.
         Called from SecurityWatcher's on_armed_changed callback."""
