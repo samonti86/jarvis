@@ -1,5 +1,9 @@
 # Jarvis
 
+[![gate](https://github.com/samonti86/jarvis/actions/workflows/ci.yml/badge.svg)](https://github.com/samonti86/jarvis/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+
 An always-on voice assistant for Windows. Say "Hey Jarvis," ask a question, get a
 spoken answer — with a 36-tool agentic layer behind it that can search the web, run
 code in a sandbox, read a calendar, watch a homelab, and see through a webcam.
@@ -7,7 +11,7 @@ code in a sandbox, read a calendar, watch a homelab, and see through a webcam.
 Wake-word detection and speech-to-text run **locally**. Only the transcribed text ever
 leaves the machine.
 
-```
+```text
 mic ──► openWakeWord ──► faster-whisper ──► Claude ──► edge-tts ──► speakers
         (local)          (local)           (agentic    (streamed)
                                             tool loop)
@@ -53,7 +57,10 @@ loop. Degrade and log; never crash the thing the user is talking to.
 
 **A regression gate, because a bug a test would have caught earns a test.**
 `scripts/run_all_tests.py` runs 45 gates — syntax, module wiring, a JS structural
-check, and 42 test suites — and must be green before anything ships.
+check, and 42 test suites totalling ~1,000 assertions — and must be green before
+anything ships. CI runs the *same* command on every push; the five gates that need
+a native ML toolchain or Windows SAPI are skipped **by name**, never silently
+folded into the pass count.
 
 ---
 

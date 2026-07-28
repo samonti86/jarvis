@@ -27,11 +27,24 @@ the venv and every dependency resolves.
 
     venv\Scripts\python.exe scripts\run_all_tests.py        # exit 0 = all green
     venv\Scripts\python.exe scripts\run_all_tests.py -v     # stream all output
+
+CI MODE (--allow-missing-deps):
+Jarvis's full dependency set is not installable on a stock CI runner — torch,
+ctranslate2, onnxruntime, opencv and the audio/GUI bindings need native builds,
+hardware, or ~2 GB of wheels. Rather than maintain a hand-curated "suites CI can
+run" allowlist (which silently rots the moment a suite is added), `--allow-missing-
+deps` reclassifies exactly one failure mode as SKIP: the suite died on an
+ImportError for a module in _OPTIONAL_DEPS. Every other failure is still a FAIL.
+
+That keeps ONE gate command for both local and CI — a new suite is picked up by
+CI automatically if its deps are light, and skipped (loudly, by name) if not.
+Skips are always printed, never silently folded into the pass count.
 """
 
 from __future__ import annotations
 
 import glob
+import re
 import subprocess
 import sys
 import time
@@ -43,11 +56,43 @@ SCRIPTS = ROOT / "scripts"
 # Standalone scripts that are NOT regression gates (see module docstring).
 _EXCLUDED = {"leak_repro.py", "barge_stutter_soak.py"}
 
+# Third-party modules that cannot be assumed present on a stock CI runner:
+# native builds (dlib), multi-GB ML wheels (torch), hardware bindings
+# (sounddevice → PortAudio), or a GUI/display (tkinter, pystray).
+# A suite that dies importing one of these is SKIPPED under --allow-missing-deps,
+# never silently passed. Everything else is a genuine failure.
+_OPTIONAL_DEPS = {
+    "torch", "torchaudio", "torchvision", "ultralytics", "cv2", "dlib",
+    "face_recognition", "sounddevice", "panns_inference", "resemblyzer",
+    "openwakeword", "faster_whisper", "ctranslate2", "sentence_transformers",
+    "transformers", "onnxruntime", "pyttsx3", "pystray", "customtkinter",
+    "tkinter", "scipy", "librosa", "numba", "miniaudio", "pyaec", "pycaw",
+    "webrtcvad", "soundfile", "howlongtobeatpy", "plexapi", "mcp", "discord",
+}
+
+# `ModuleNotFoundError: No module named 'x'` / `ImportError: ... 'x'`
+_MISSING_MOD_RE = re.compile(r"No module named ['\"]([A-Za-z0-9_.]+)['\"]")
+
 # Per-suite hard timeout. Heavy suites import torch / sentence-transformers,
 # whose first import is slow but nowhere near this; a suite hitting this is hung.
 _TIMEOUT_S = 600
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
+ALLOW_MISSING = "--allow-missing-deps" in sys.argv
+
+
+def _missing_optional_dep(output: str) -> str | None:
+    """Return the optional module a suite died importing, if that's why it failed.
+
+    Only the TOP-LEVEL package is checked against _OPTIONAL_DEPS, so
+    `torch.nn.functional` matches `torch`. Returns None when the failure was
+    anything other than a missing *optional* dependency — a missing REQUIRED
+    dep (httpx, numpy) is a broken environment and must still fail loudly.
+    """
+    for mod in _MISSING_MOD_RE.findall(output):
+        if mod.split(".")[0] in _OPTIONAL_DEPS:
+            return mod
+    return None
 
 
 def _run(label: str, argv: list[str]) -> tuple[bool, str]:
@@ -116,27 +161,50 @@ def main() -> int:
 
     # --- Report -----------------------------------------------------------
     print("=" * 70)
-    print("Jarvis regression gate")
+    print("Jarvis regression gate" + ("  [CI: optional deps may be absent]" if ALLOW_MISSING else ""))
     print("=" * 70)
     failed_any = False
+    skipped: list[tuple[str, str]] = []
     for label, ok, out in results:
-        status = "PASS" if ok else "FAIL"
+        missing = None if ok else (_missing_optional_dep(out) if ALLOW_MISSING else None)
+        if missing:
+            status = "SKIP"
+            skipped.append((label, missing))
+        else:
+            status = "PASS" if ok else "FAIL"
         tail = _summary_tail(out)
         suffix = f"   ({tail})" if tail else ""
+        if status == "SKIP":
+            suffix = f"   (optional dep not installed: {missing})"
         print(f"  [{status}]  {label}{suffix}")
-        if not ok:
+        if status == "FAIL":
             failed_any = True
-        # Show output when verbose, or always for a failure (so the cause
-        # is right there, not hidden behind a re-run).
-        if VERBOSE or not ok:
+        # Show output when verbose, or always for a real failure (so the cause
+        # is right there, not hidden behind a re-run). A SKIP is expected in CI
+        # and its traceback is noise.
+        if VERBOSE or status == "FAIL":
             for line in out.strip().splitlines():
                 print(f"          | {line}")
 
     elapsed = time.monotonic() - t0
     n = len(results)
-    n_fail = sum(1 for _, ok, _ in results if not ok)
+    n_fail = sum(
+        1
+        for label, ok, out in results
+        if not ok and not (ALLOW_MISSING and _missing_optional_dep(out))
+    )
+    n_skip = len(skipped)
     print("-" * 70)
-    print(f"  {n - n_fail}/{n} gates passed   ({elapsed:.1f}s)")
+    print(f"  {n - n_fail - n_skip}/{n} gates passed"
+          + (f", {n_skip} skipped" if n_skip else "")
+          + (f", {n_fail} FAILED" if n_fail else "")
+          + f"   ({elapsed:.1f}s)")
+    if skipped:
+        # Never let a skip masquerade as coverage — name every one.
+        print("-" * 70)
+        print("  Skipped (optional dependency absent - run the full gate locally):")
+        for label, mod in skipped:
+            print(f"    - {label}  (needs {mod})")
     print("=" * 70)
     return 1 if failed_any else 0
 
