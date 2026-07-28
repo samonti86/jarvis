@@ -1,0 +1,51 @@
+# CI dependency set — the subset of requirements.txt that installs on a stock
+# GitHub Actions windows-latest runner with no native toolchain and no hardware.
+#
+# WHY A SECOND FILE:
+# The full requirements.txt pulls torch (~200 MB), ctranslate2, onnxruntime and
+# ultralytics — multi-GB of wheels plus native builds, for a gate that would
+# still be unable to open a microphone or a camera. This set is everything that
+# is a plain pip wheel, which empirically runs 40 of the 45 gates in ~55 s.
+#
+# The 5 gates this set CANNOT run (they need faster-whisper/ctranslate2 or the
+# Windows SAPI bindings) are SKIPPED BY NAME, never silently passed — see
+# `--allow-missing-deps` in scripts/run_all_tests.py. Run the full gate locally
+# before shipping:  venv\Scripts\python.exe scripts\run_all_tests.py
+#
+# Keep this file in sync with requirements.txt when a light dep is added.
+
+# Core LLM + HTTP
+anthropic>=0.40.0
+httpx>=0.27
+
+# Config, data tools, feeds
+python-dotenv>=1.0.0
+feedparser>=6.0
+recurring-ical-events>=3.0
+numpy>=1.24
+
+# Remote clients / transport (pure-Python)
+websockets>=13.0
+paramiko>=3.4
+mcp>=1.0.0
+
+# TTS + audio decode. edge-tts and miniaudio are pure wheels; sounddevice
+# bundles PortAudio in its Windows wheel, so it IMPORTS fine in CI — it only
+# fails when actually opening a device, which no gate does.
+edge-tts>=6.1.0
+miniaudio>=1.59
+sounddevice>=0.4.6
+
+# UI. tkinter ships with CPython on Windows; pystray/Pillow/customtkinter are
+# plain wheels. Needed for the tray + console state gates.
+pystray>=0.19.5
+Pillow>=10.0
+customtkinter>=5.2.0
+
+# Local telemetry (system_control / status_report gates)
+psutil>=5.9
+
+# Webcam frame handling. Headless build = no Qt/GUI. Required by the
+# remote_camera provider-frame gate, which exercises the image path without
+# touching hardware.
+opencv-python-headless>=4.8

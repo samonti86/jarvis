@@ -70,6 +70,57 @@ Whisper — and intentionally not an env var.)*
 | `JARVIS_ACOUSTIC_DISABLE` | `""` (none) | sound_detector.py | Comma-list of classes to suppress. |
 | `JARVIS_ACOUSTIC_WATER_RMS_FLOOR` | `0.025` | sound_detector.py | RMS floor for `running_water` (pet-fountain guard). |
 | `JARVIS_ACOUSTIC_THREADS` | `1` | sound_detector.py | Torch thread cap for PANNs (stutter-gate, M67). |
+| `JARVIS_ACOUSTIC_DEBUG` | `""` (off) | sound_detector.py | Log real classifier scores + RMS, for calibrating the floors below. |
+| `JARVIS_ACOUSTIC_RMS_FLOOR` | `0.02` | sound_detector.py | Global loudness floor an event must clear before any acoustic rule fires. |
+| `JARVIS_ACOUSTIC_VOICE_THRESHOLD` | `0.60` | sound_detector.py | Confidence for the armed `voice_while_armed` rule (M81). The **weak** lever — wall-bleed *is* speech and scores high. |
+| `JARVIS_ACOUSTIC_VOICE_RMS_FLOOR` | `0.06` | sound_detector.py | Loudness floor — the real through-the-wall discriminator (M87). Observed neighbour bleed: 0.020–0.044. |
+
+## Voice, tone & speaker identity (M69 / M80 / M85)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_USER_NAME` | `you` | config.py | Name your primary voice enrolls under; appears in `[speaker]` logs. |
+| `JARVIS_SPEAKER_THRESHOLD` | `0.60` | config.py | Min cosine similarity to call a voice recognized. Fail-open by design — see the note below. |
+| `JARVIS_SPEAKER_GATE` | `""` (off) | config.py | Voice lock: drop confidently-unrecognized **voice** turns. Typed input is never gated. |
+| `JARVIS_TONE` | `1` (on) | config.py | Tonal awareness — reads volume/pace/pauses from the STT clip into a descriptive cue. `0` disables. |
+
+## Proactive intelligence (M78.2 / M79 / M83)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_ANTICIPATION` | `""` (off) | config.py | Cross-domain synthesis pass. Opt-in — it makes a recurring LLM call. |
+| `JARVIS_ANTICIPATION_POLL_SECONDS` | `1800` | anticipation.py | Cadence of that pass. |
+| `JARVIS_QUIET_HOURS` | `""` (off) | config.py | DND window, e.g. `22:00-08:00`. Only ROUTINE announces defer; important ones pierce. Wraps midnight. |
+| `JARVIS_PREDICTION_FOLLOWUPS` | `1` (on) | predictions.py | Mine past sports predictions and surface resolved ones in the briefing. |
+| `JARVIS_PREDICTION_MINE_MODEL` | `SUMMARY_MODEL` | predictions.py | Model for extraction (cheap). |
+| `JARVIS_PREDICTION_RESOLVE_MODEL` | `CLAUDE_MODEL` | predictions.py | Model for the resolution judgment. |
+
+## Severe-weather alerts (M77 — US only, no API key)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_WEATHER_ALERTS` | on when `JARVIS_HOME_LOCATION` set | config.py | `0/false/off` disables proactive NWS alerts. |
+| `JARVIS_WEATHER_ALERT_SEVERITY` | `severe` | weather_alerts.py | Lowest severity to announce: `extreme` / `severe` / `moderate` (noisier). |
+| `JARVIS_WEATHER_POLL_SECONDS` | `600` (min 60) | weather_alerts.py | Poll cadence against api.weather.gov. |
+
+## Presence / geofence auto-arm (M70)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_PRESENCE_ARM_DELAY` | `60.0` | config.py | Seconds to defer auto-arm after a "leave" ping; cancelled by an "arrive". Damps geofence boundary-flap. |
+| `JARVIS_PRESENCE_GREETING` | `Welcome home, sir.` | config.py | Spoken on an arrive that disarms an armed house. |
+
+## Interpreter mode (M87)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_INTERPRETER_LANGS` | `""` (→ `en,es`) | config.py | Language pair as `primary,secondary`. Each side is spoken in that language's `VOICE_BY_LANG` voice. |
+
+## Ambient HUD (M84)
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_HUD` | `""` (off) | config.py | Translucent click-through overlay: arc-reactor orb, waveform, clock, security badge. Windows-only, fail-soft. |
 
 ## Homelab monitor (M56)
 
@@ -118,6 +169,37 @@ Whisper — and intentionally not an env var.)*
 | `SMTP_USERNAME` | `""` | config.py | SMTP login. Blank disables email. |
 | `SMTP_PASSWORD` | `""` | config.py | App password (Gmail: 16-char). |
 | `SMTP_TO` | `""` | config.py | Recipient(s), comma-separated. |
+| `JARVIS_REMINDER_DISCORD` | `1` (on when webhook set) | reminders.py | Also push a reminder's text to the webhook when it fires. `0` disables. |
+
+## Discord bot bridge (2026-06-02)
+
+A private channel as a two-way conversational client. Distinct from the one-way
+webhook above — this needs a Gateway bot. Runs on the **restricted** tool surface
+(no shell, filesystem, code execution, or self-update), enforced server-side.
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `DISCORD_BOT_TOKEN` | `""` (bridge off) | discord_bot.py | Bot token. The only secret of the three. Needs the Message Content intent. |
+| `DISCORD_CHANNEL_ID` | `""` | discord_bot.py | The single channel the bot listens to. |
+| `DISCORD_ALLOWED_USER_IDS` | `""` (nobody) | discord_bot.py | Comma-separated user IDs permitted to talk to Jarvis. Fail-closed allowlist. |
+
+## Hands-free barge-in (SHELVED — default off)
+
+Interrupting mid-reply *without* the wake word. Built and shelved: once Jarvis's
+own echo is cancelled, an energy gate fires on any residual sound, because it
+detects the *presence* of sound, not the *intent* to interrupt. Kept behind a
+default-off flag for a headset/quiet-room scenario. Wake-word barge-in
+(`JARVIS_BARGE_IN`) is the robust path and is on by default.
+
+| Variable | Default | Read in | Purpose |
+|----------|---------|---------|---------|
+| `JARVIS_HANDS_FREE_BARGE` | `""` (off) | main.py | Master switch for the shelved energy-gate path. |
+| `JARVIS_BARGE_DEBUG` | `""` (off) | main.py | Log live AEC/energy numbers for calibration. |
+| `JARVIS_BARGE_THRESHOLD` | `1187.0` | aec_barge.py | Cleaned-RMS gate (int16) the residual must clear to count as an interruption. |
+| `JARVIS_BARGE_DELAY_MS` | see source | main.py | Delay before the gate arms after playback starts. |
+| `JARVIS_BARGE_FILTER_LEN` | see source | main.py | SpeexDSP echo-canceller filter length. |
+| `JARVIS_BARGE_SUSTAIN` | see source | main.py | Consecutive frames above threshold required to fire. |
+| `JARVIS_BARGE_WIN_FRAMES` | see source | main.py | Sliding-window size for the energy decision. |
 
 ## Remote console (M48)
 
@@ -135,6 +217,7 @@ Whisper — and intentionally not an env var.)*
 |----------|---------|---------|---------|
 | `RAWG_API_KEY` | `""` | games.py | RAWG (games). Blank disables `get_game_info`. |
 | `TMDB_API_KEY` | `""` | tmdb.py | TMDB (movies/TV/person). Blank disables those tools. |
+| `TMDB_WATCH_REGION` | `""` (→ `US`) | tmdb.py | ISO-3166-1 country for "where can I watch X?" (`mode=providers`, M73). |
 | `WOLFRAM_APP_ID` | `""` | wolfram.py | WolframAlpha. Blank disables `wolfram_query`. |
 
 ## Misc
