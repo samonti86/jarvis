@@ -45,7 +45,13 @@ QUERIES: list[tuple[str, str | None]] = [
     ("How long does it take to beat Elden Ring?",         "get_game_length"),
     ("Who directed the movie Dune?",                      "get_movie_tv_info"),
     ("Where can I watch Oppenheimer?",                    "get_movie_tv_info"),
-    ("Remind me at 6pm to call the dentist.",             "set_reminder"),
+    # NB: deliberately NOT "remind me to..." — set_reminder WRITES to the
+    # real reminders.json. An early version of this probe used it and, over
+    # 3 levels x 3 repeats x 2 runs, created 18 live "call the dentist"
+    # reminders in production that all fired the same evening. A probe must
+    # exercise routing WITHOUT mutating real state; list_reminders is the
+    # read-only member of the same family.
+    ("What reminders do I have set?",                     "list_reminders"),
     # NOTE: the schema name is `pc_diagnostics`, NOT `get_pc_diagnostics` — the
     # get_ prefix is not universal in this tool set. Getting an expected name
     # wrong silently scores a MISS on a tool that fired correctly, which would
