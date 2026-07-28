@@ -17,9 +17,11 @@ mic ──► openWakeWord ──► faster-whisper ──► Claude ──► e
                                             tool loop)
 ```
 
-Roughly 29k lines of Python across 66 modules. The full engineering log — the design
+Roughly 29k lines of Python across 70 modules. The full engineering log — the design
 trade-offs, the post-mortems, and the conclusions that turned out to be wrong — is in
-[docs/MILESTONES.md](docs/MILESTONES.md).
+[docs/MILESTONES.md](docs/MILESTONES.md); its
+[**Start here**](docs/MILESTONES.md#start-here) section picks the six entries worth
+reading if you only read six.
 
 ---
 
@@ -136,7 +138,8 @@ src/security.py         vision security mode (person detection, challenge/respon
 src/*.py                the tool and subsystem modules (70 in total)
 scripts/*_test.py       the regression suites
 docs/SETUP.md           deployment walkthrough
-docs/MILESTONES.md      the engineering log
+docs/MILESTONES.md      engineering log — index + "start here"
+docs/milestones/        the log itself, 105 entries across 5 parts
 ```
 
 ## License
