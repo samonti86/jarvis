@@ -34,6 +34,7 @@ import time
 import tkinter as tk
 from typing import Callable
 
+from src import reactor
 from src.tray import State
 
 # The transparent-colour key. A near-black almost no real element uses; any
@@ -92,9 +93,10 @@ class JarvisHUD:
     console's). All public setters are cheap attribute stores read by the
     animation tick, so they're safe to call from any thread."""
 
-    W = 240
-    H = 300
+    W = 260
+    H = 348
     MARGIN = 28
+    ORB = 190          # rendered reactor size, px
 
     def __init__(self, root: tk.Misc, *, corner: str = "se") -> None:
         self._disabled = False
@@ -105,6 +107,8 @@ class JarvisHUD:
         self._tasks_pending = 0
         self._anim_start = time.time()
         self._wave_bars: list[int] = []
+        self._photos: dict[tuple, object] = {}   # (color, i) -> PhotoImage (GC anchor)
+        self._img_mode = False
         try:
             self._build(root, corner)
         except Exception as exc:  # noqa: BLE001 — eye-candy must never break Jarvis
@@ -203,62 +207,120 @@ class JarvisHUD:
                   file=sys.stderr)
 
     def _build_items(self) -> None:
-        """Create canvas items once; the tick mutates fills/coords/text."""
+        """Create canvas items once; the tick mutates fills/coords/text.
+
+        TWO renderers live here. The pre-rendered PIL reactor (M98) is the real
+        look; the vector items below are the FALLBACK that draws until the
+        first rotation cycle finishes warming on its background thread, and
+        forever if Pillow is unavailable. They are hidden, not destroyed, the
+        moment images become available — so a HUD that loses its images (it
+        cannot, but) degrades rather than goes blank.
+        """
         cv = self._cv
         cx = self.W // 2
-        ocy = 96                       # orb centre y (upper portion)
+        ocy = 6 + self.ORB // 2        # orb centre y — image pasted at y=6
         r_out = 64
         r_mid = int(r_out * 0.80)
         self._ocx, self._ocy, self._r_out, self._r_mid = cx, ocy, r_out, r_mid
 
-        # Bezel ring + 12 tick marks.
-        cv.create_oval(cx - r_out, ocy - r_out, cx + r_out, ocy + r_out,
-                       outline=_RING, width=2)
+        # The pre-rendered reactor. Created first so everything else sits above
+        # it; empty until the warm completes.
+        self._orb_img = cv.create_image(cx, ocy)
+        reactor.warm_all(self.ORB, _STATE_COLOR.values())
+
+        # --- vector fallback (hidden once images arrive) ---
+        self._vec: list[int] = []
+        self._vec.append(cv.create_oval(cx - r_out, ocy - r_out, cx + r_out, ocy + r_out,
+                                        outline=_RING, width=2))
         for i in range(12):
             a = math.radians(i * 30)
             r1, r2 = r_out - 3, r_out - 10
-            cv.create_line(cx + r1 * math.cos(a), ocy + r1 * math.sin(a),
-                           cx + r2 * math.cos(a), ocy + r2 * math.sin(a),
-                           fill=_RING, width=2)
+            self._vec.append(
+                cv.create_line(cx + r1 * math.cos(a), ocy + r1 * math.sin(a),
+                               cx + r2 * math.cos(a), ocy + r2 * math.sin(a),
+                               fill=_RING, width=2))
         # Radial glow halo — 4 discs, large → small (filled per-frame).
         self._glow: list[int] = []
         for rr in (int(r_out * 0.62), int(r_out * 0.46),
                    int(r_out * 0.32), int(r_out * 0.21)):
             self._glow.append(cv.create_oval(cx - rr, ocy - rr, cx + rr, ocy + rr,
                                              fill=_KEY, outline=""))
-        cv.create_oval(cx - r_mid, ocy - r_mid, cx + r_mid, ocy + r_mid,
-                       outline=_RING, width=1)
-        self._core_r = max(8, int(r_out * 0.16))
-        r = self._core_r
-        self._core = cv.create_oval(cx - r, ocy - r, cx + r, ocy + r,
-                                    fill="#22d3ee", outline="")
+        self._vec.extend(self._glow)
+        self._vec.append(cv.create_oval(cx - r_mid, ocy - r_mid, cx + r_mid, ocy + r_mid,
+                                        outline=_RING, width=1))
         self._arc_out = cv.create_arc(cx - r_out, ocy - r_out, cx + r_out, ocy + r_out,
                                       start=0, extent=90, style="arc",
                                       outline="#22d3ee", width=3)
         self._arc_mid = cv.create_arc(cx - r_mid, ocy - r_mid, cx + r_mid, ocy + r_mid,
                                       start=180, extent=60, style="arc",
                                       outline="#22d3ee", width=2)
+        self._vec.extend((self._arc_out, self._arc_mid))
 
-        # Live waveform — a row of bars under the orb.
-        self._wave_n = 21
-        self._wave_y = 196
-        self._wave_w = self.W - 40
-        bw = self._wave_w / self._wave_n
-        x0 = 20
+        # --- live overlays (drawn in BOTH modes) ---
+        # The pre-rendered frames cannot vary with amplitude, so the two things
+        # that react to the voice stay cheap canvas primitives on top: a
+        # throbbing core and an amplitude ring.
+        self._core_r = max(8, int(self.ORB * 0.055))
+        r = self._core_r
+        self._core = cv.create_oval(cx - r, ocy - r, cx + r, ocy + r,
+                                    fill="#22d3ee", outline="")
+        self._amp_ring = cv.create_oval(cx, ocy, cx, ocy, outline="", width=2)
+
+        # Waveform — 19 thin bars, tapered at the ends by a sine envelope so it
+        # reads as a waveform rather than a barcode (the first draft did not).
+        self._wave_n = 19
+        self._wave_y = 230
+        self._wave_step = 6
+        x0 = cx - (self._wave_n - 1) * self._wave_step // 2
         for i in range(self._wave_n):
-            x = x0 + i * bw + bw / 2
+            x = x0 + i * self._wave_step
             self._wave_bars.append(
                 cv.create_line(x, self._wave_y, x, self._wave_y, fill=_RING,
-                               width=max(1, int(bw * 0.5)), capstyle="round")
+                               width=1, capstyle="round")
             )
+        self._wave_env = [math.sin(math.pi * (i + 0.5) / self._wave_n) ** 0.8
+                          for i in range(self._wave_n)]
 
-        # Clock + security badge readouts.
-        self._clock = cv.create_text(cx, 236, text="--:--", fill=_TEXT,
-                                     font=("Consolas", 22, "bold"))
-        self._research = cv.create_text(cx, 284, text="", fill=_RESEARCH,
-                                        font=("Consolas", 8))
-        self._badge = cv.create_text(cx, 266, text="", fill=_RING,
-                                     font=("Consolas", 11, "bold"))
+        # --- readouts ---
+        # Vertical budget is tight: the orb ends at y=196 and the waveform can
+        # swing +/-16 px about y=230, so the label sits in the gap between them
+        # and the clock clears the waveform's bottom.
+        self._label = cv.create_text(cx, 206, text="", fill=_RING,
+                                     font=("Consolas", 8))
+        self._clock = cv.create_text(cx, 268, text="--:--", fill=_TEXT,
+                                     font=("Consolas", 26, "bold"))
+        cv.create_line(74, 292, self.W - 74, 292, fill="#142c38")
+        self._badge = cv.create_text(cx, 308, text="", fill=_RING,
+                                     font=("Consolas", 10, "bold"))
+        self._research = cv.create_text(cx, 328, text="", fill=_RESEARCH,
+                                        font=("Consolas", 9))
+
+    def _orb_frame(self, color: str, t: float) -> bool:
+        """Blit the current rotation frame. False if not warmed yet."""
+        cycle = reactor.frames(self.ORB, color)
+        if cycle is None:
+            return False
+        # Rotation speed per state — the frame index, not the render, is what
+        # changes, so a "faster" state costs exactly the same as a slow one.
+        rate = {State.IDLE: 1.2, State.LISTENING: 3.0,
+                State.THINKING: 6.0, State.SPEAKING: 4.0}.get(self._state, 2.0)
+        i = int(t * rate) % len(cycle)
+        key = (color, i)
+        photo = self._photos.get(key)
+        if photo is None:
+            from PIL import ImageTk  # noqa: PLC0415 — lazy; needs a live Tk
+
+            # Converted once per frame per colour and kept forever: a
+            # PhotoImage that loses its last Python reference is garbage
+            # collected and the canvas silently draws nothing.
+            photo = ImageTk.PhotoImage(cycle[i])
+            self._photos[key] = photo
+        self._cv.itemconfig(self._orb_img, image=photo)
+        if not self._img_mode:
+            self._img_mode = True
+            for item in self._vec:
+                self._cv.itemconfigure(item, state="hidden")
+        return True
 
     # ---- animation ----
 
@@ -268,7 +330,12 @@ class JarvisHUD:
         if not self._draw():
             return
         try:
-            self._win.after(33, self._tick)   # ~30 fps
+            # 20 fps, not 30. Measured: the redraw costs 13% of a core at 30 fps
+            # and 8% at 20, and nothing on screen needs the extra frames — the
+            # reactor's own arcs only advance 1.2-6 times a second. The saving
+            # lands hardest while SPEAKING, which is precisely when the
+            # real-time audio threads can least afford the competition (M67/M68).
+            self._win.after(50, self._tick)
         except tk.TclError:
             self._disabled = True
 
@@ -292,30 +359,48 @@ class JarvisHUD:
 
         try:
             cv = self._cv
-            cv.itemconfig(self._arc_out, start=ang,
-                          outline=_blend(_dim(base, 0.35), base, pulse))
-            cv.itemconfig(self._arc_mid, start=(-ang * 1.4) % 360,
-                          outline=_dim(base, 0.5 + 0.3 * pulse))
-            for gid, f in zip(self._glow, (0.18, 0.34, 0.58, 0.92)):
-                cv.itemconfig(gid, fill=_dim(base, f * pulse))
+            cx, cy = self._ocx, self._ocy
+
+            if not self._orb_frame(base, t):
+                # Vector fallback — still warming, or no Pillow.
+                cv.itemconfig(self._arc_out, start=ang,
+                              outline=_blend(_dim(base, 0.35), base, pulse))
+                cv.itemconfig(self._arc_mid, start=(-ang * 1.4) % 360,
+                              outline=_dim(base, 0.5 + 0.3 * pulse))
+                for gid, f in zip(self._glow, (0.18, 0.34, 0.58, 0.92)):
+                    cv.itemconfig(gid, fill=_dim(base, f * pulse))
+
             cv.itemconfig(self._core,
                           fill=_blend(base, _ACCENT_HOT, 0.25 + 0.55 * pulse))
             cr = self._core_r * (0.78 + 0.5 * pulse)
-            cx, cy = self._ocx, self._ocy
             cv.coords(self._core, cx - cr, cy - cr, cx + cr, cy + cr)
 
-            # Waveform — reactive while speaking, a faint resting ripple otherwise.
+            # Amplitude ring — expands with the live TTS level. Hidden when
+            # silent (an empty outline is how a canvas item goes invisible).
+            if self._amp > 0.02:
+                rr = self.ORB * (0.25 + 0.03 * self._amp)
+                cv.coords(self._amp_ring, cx - rr, cy - rr, cx + rr, cy + rr)
+                cv.itemconfig(self._amp_ring,
+                              outline=_blend(base, _ACCENT_HOT, self._amp))
+            else:
+                cv.itemconfig(self._amp_ring, outline="")
+
+            # Waveform — reactive while speaking, a faint resting ripple
+            # otherwise. `_wave_env` tapers the ends so it reads as a waveform.
             speaking = state == State.SPEAKING
+            wave_fill = _dim(base, 0.5 + 0.5 * pulse) if speaking else _RING
             for i, bar in enumerate(self._wave_bars):
                 phase = math.sin(t * 9 + i * 0.7)
                 if speaking:
-                    mag = self._amp * (0.45 + 0.55 * abs(phase)) * 40
+                    mag = self._amp * (0.35 + 0.65 * abs(phase)) * 16 * self._wave_env[i]
                 else:
-                    mag = (0.5 + 0.5 * phase) * 3   # idle shimmer
-                bx = self._cv.coords(bar)[0]
+                    mag = (0.5 + 0.5 * phase) * 1.6 * self._wave_env[i]
+                bx = cv.coords(bar)[0]
                 cv.coords(bar, bx, self._wave_y - mag, bx, self._wave_y + mag)
-                cv.itemconfig(bar, fill=_dim(base, 0.5 + 0.5 * pulse) if speaking else _RING)
+                cv.itemconfig(bar, fill=wave_fill)
 
+            cv.itemconfig(self._label, text=state.name,
+                          fill=_blend(_RING, base, 0.85))
             cv.itemconfig(self._clock, text=time.strftime("%H:%M"))
             if self._armed:
                 cv.itemconfig(self._badge, text="● ARMED", fill=_ARMED)

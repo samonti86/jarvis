@@ -1259,3 +1259,94 @@ glance.
 `tests/background_tasks_test.py` (+7, now 63).
 
 **Gate:** 53/53 green.
+
+## M98 — the arc reactor becomes hardware — 2026-07-28
+
+**What shipped.** Both visible surfaces — the console orb and the ambient HUD
+(M84/M97) — now render a real arc reactor: a soft radial glow, three counter-
+rotating arc rings, a graduated tick ring, and a gradient core, all antialiased.
+The HUD gained a state label and an amplitude ring; the console's waveform went
+from 28 chunky bars to 44 thin ones under a sine envelope, so it reads as a
+waveform rather than a barcode.
+
+**Why the canvas had to go.** Tk's `create_oval` / `create_arc` are *aliased*.
+Every ring shipped with stair-stepped edges, and the "glow" was four opaque
+dimmed discs faking a gradient. That is most of why the old orb read as flat
+clip-art. Pillow — already a dependency via `pystray` — supersamples and
+downsamples, and can stack two dozen translucent discs into an actual falloff.
+The canvas cannot express that at all.
+
+**The measurement that decided the architecture.** Rendering one reactor costs
+9–25 ms. The HUD redrew at 30 fps. Drawing live would therefore have burned
+**55–74% of a core, continuously, forever** — precisely the always-on background
+load that starved the real-time audio threads in M67/M68 and produced the
+armed-mode TTS stutter. That number was taken *before* any of this was wired in,
+and it is what made the design pre-rendered rather than live.
+
+So a full rotation cycle is rendered ONCE per (size, colour) on a **daemon
+thread**, and the widget swaps a `PhotoImage` per tick. Warm: 312 ms, 1.7 MB per
+state. Steady state: **0.3 µs per frame** — an array index.
+
+**It came out cheaper than what it replaced.** A/B, two runs each:
+
+| | 30 fps | |
+|---|---|---|
+| vector (previous shipping HUD) | 13.5% / 12.9% of a core | |
+| pre-rendered reactor | 10.1% / 9.0% | −28% |
+| pre-rendered @ 20 fps | 8.6% / 7.8% | −38% |
+
+One image blit is cheaper than four glow-disc fills plus two arc reconfigures.
+The tick also dropped 30 fps → 20: the reactor's own arcs only advance 1.2–6
+times a second, so nothing on screen needed the extra frames, and the saving
+lands hardest while SPEAKING — exactly when the audio threads can least afford
+competition.
+
+**Built with eyes open, for once.** M84 and M97 were both built blind and
+shipped for a human to eyeball later. This time the overlay was screenshotted in
+its real Tk window (`ImageGrab` over the live HUD) and *looked at* between
+iterations. That caught three things no unit test would have:
+
+1. **The first capture landed over a white browser window**, and the glow showed
+   as an opaque near-black disc. `-transparentcolor` is *binary* — Windows
+   punches out pixels of exactly the key colour and leaves everything else fully
+   opaque, so a soft alpha glow is not expressible. Invisible on this machine's
+   black desktop; ugly on anyone else's. Fixed by clipping every pixel that
+   would composite to within `_KEY_CUT` of the key to alpha 0 — a hard edge
+   placed exactly where the glow stopped being perceptible.
+2. **60 ticks at 190 px read as noise**, not as a scale. Reduced to 36.
+3. **The state label collided with the waveform** at full amplitude.
+
+The lesson is narrower than "test your UI": *the backdrop is part of the test.*
+A chroma-key overlay screenshotted against the author's own desktop can only
+ever confirm the case that already works.
+
+**Two findings the new suite caught, both invisible by eye.**
+
+*Half the frames were duplicates.* A ring of n arcs is symmetric every 360/n
+degrees, so it maps onto itself partway through the cycle unless the rotation is
+chosen against it. Writing q for symmetry-periods-per-cycle, frame i repeats
+frame 0 as soon as `i*q ≡ 0 mod _FRAMES` — so all 12 frames are distinct only
+when `gcd(q, 12) == 1`. The first draft used q = 2, 6, 18 and produced **six**
+distinct frames, two of them rendered twelve times: half the warm cost and half
+the memory bought nothing, and the animation ran at double the intended speed. A
+screenshot cannot show this; only comparing frame bytes can. Now q = 1, −5, 7.
+
+*A failing render retried forever.* `frames()` calls `warm()` on every cache
+miss, and the animation misses 20 times a second — so one broken render (no
+Pillow, an OOM) meant **20 doomed threads per second, indefinitely**. Failure is
+now recorded once and never retried; the widget falls back to vector drawing.
+This is the same shape as the fail-soft rule the project already had, with the
+retry-storm case that rule did not cover.
+
+**The fallback is the whole safety story.** Neither surface *depends* on the
+reactor. Both keep their original vector items, hidden — not destroyed — the
+moment images become available, and draw them until then. A cold start shows the
+old look for a third of a second; a machine without Pillow shows it forever.
+Decoration must never be able to take down an always-on assistant.
+
+**Files:** `src/reactor.py` (NEW — renderer, async cache, chroma clip),
+`src/hud.py` (image path + fallback, amplitude ring, state label, layout,
+20 fps), `src/console.py` (same image path, tapered waveform, orb 176→208 px),
+`tests/reactor_test.py` (NEW, 26 assertions).
+
+**Gate:** 54/54 green.
