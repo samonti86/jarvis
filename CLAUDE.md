@@ -137,13 +137,33 @@ pythonw jarvis_watchdog.pyw
 
 # THE CLOSE-OUT SANITY GATE — must be green before any commit
 venv\Scripts\python.exe scripts\run_all_tests.py
+
+# Replicate durable runtime state offsite (see "State that is not in git")
+pwsh -File scripts\backup_state.ps1 -Push
 ```
 
 The gate folds in: `py_compile` over `main.py` + launchers + every `src/*.py`;
 an `import main` module-wiring smoke test; a structural JS check on the PWA
-(`scripts/js_parse_gate.py`); and every `tests/*_test.py` suite (46 at last
+(`scripts/js_parse_gate.py`); and every `tests/*_test.py` suite (51 at last
 count). It must exit 0. If the venv is unavailable, the minimum fallback is
 `python -m py_compile main.py jarvis.pyw src/*.py`.
+
+### State that is not in git
+`%LOCALAPPDATA%\Jarvis\` holds everything the process *learns*, and none of it
+is in this repo. Most of it genuinely rebuilds — logs rotate, `diagnostics/`
+regenerates, `knowledge.db` is only an FTS5 cache of the `jarvis-knowledge`
+repo. Two things do not: **`sessions/` + `summaries.jsonl`** (verbatim
+conversation history — the corpus `recall_conversation` searches, and
+unreconstructable by any means) and **`speakers/`** (voice enrollments,
+rebuildable only by having each person re-enroll aloud).
+
+`scripts/backup_state.ps1` replicates ~675 KB of that 18.6 MB tree to the
+private `jarvis-state` repo. **It selects by ALLOWLIST, and that is
+load-bearing** — the same directory holds a TLS private key, a Ring API token,
+and `security/` camera evidence (photographs of whoever walked past). A
+denylist starts replicating those the day someone drops in a file its patterns
+did not anticipate; an allowlist fails closed. When you add a new durable
+store, it is NOT backed up until you add it to `$include` in that script.
 
 **The directory is the boundary.** Anything in `tests/` is collected by the gate
 automatically — adding a suite there is the whole registration step. Nothing in
