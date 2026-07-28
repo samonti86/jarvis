@@ -957,3 +957,71 @@ responsible for.
 `tests/scheduled_briefing_test.py`.
 
 **Gate:** 50/50 green.
+
+## M93 — self-review: "how have you been, Jarvis?" — 2026-07-28
+
+**What shipped.** `self_review` reads Jarvis's own logs **across days and
+restarts**, groups failures by what actually went wrong, and reports the ones
+that recur. Read-only by design.
+
+Against the real log on the day it was written:
+
+> In the last 30 days I've run 57 times and logged 80 concerning lines across
+> 14 distinct issues. 1 of those runs ended in an unhandled exception.
+> 47 times in 16 sessions: `[outlook] ical fetch failed: ConnectTimeout …`
+
+That top line is a genuine standing defect — the calendar feed has been timing
+out for weeks — and nothing in the system could see it before.
+
+**The gap M60 left.** `status_report` counts concerning lines *since the current
+session marker*. That is the right window for "are you healthy right now" and
+the wrong one for "is something quietly wrong with you". A fault that appears
+once per run is invisible per-run and obvious across fifty.
+
+**Signatures, not lines.** Every line carries a timestamp, so raw counting
+reports each as unique and the recurring fault drowns. Measured before writing
+anything: **31,427 lines → 73 concerning → 19 distinct signatures**, one
+accounting for 47 of them. Normalising away timestamps, durations, ids, paths
+and retry suffixes is the whole feature.
+
+**Recurrence is counted in SESSIONS, not occurrences.** "47 times" could be one
+bad afternoon; "in 16 of 57 runs" is a standing defect. Both are reported and
+the ranking sorts by sessions first, because that is the number that decides
+whether to care.
+
+**Two bugs the live data caught that a synthetic fixture never would have.**
+
+1. *Traceback scaffolding outranked the errors.* The first run ranked
+   `Traceback (most recent call last):` and `The above exception was the direct
+   cause of…` as the top two "issues". Those are the frame around a failure,
+   never the failure. They are now skipped and the traceback is attributed to
+   its terminating exception line instead — so the report says
+   `PortAudioError: Device unavailable`, which is actionable, rather than
+   `Traceback`, which is not.
+2. *Session counting was nonsense.* `--- Jarvis started` is written directly by
+   `setup_logging`, so unlike every other line it carries **no `[timestamp]`
+   prefix**. The day-window filter therefore inherited whatever state the
+   previous line left, and a rotated log's months-old sessions counted as
+   recent: **441 sessions in 30 days** against a true 57. The banner's own ISO
+   stamp is now parsed.
+
+Both were only visible because the module was pointed at 31,000 lines of real
+history before it was pointed at a test.
+
+**Read-only, deliberately.** The obvious next step — have it open a pull request
+against its own repo — is exactly what this project keeps declining to build.
+Diagnosing yourself is useful; editing yourself unattended is not the same
+thing, and the fix stays a human decision. It is also therefore safe from a
+remote origin, so unlike the M91 task tools it is **not** in `_RESTRICTED_DENY`.
+
+**Test-fixture lesson.** The suite failed on its first run with two errors that
+looked like scanner bugs and were stale fixtures: the rotated-log case wrote
+`jarvis.log.1`, and the write helper only overwrote `jarvis.log`, so the
+rotation leaked into every later case. A fixture helper that cleans *some* of
+the state is worse than one that cleans none, because the leak is invisible.
+
+**Files:** `src/self_review.py` (NEW), `src/llm.py` (tool registered +
+system-prompt entry 24a drawing the line against `status_report`),
+`tests/self_review_test.py` (NEW, 23 assertions).
+
+**Gate:** 51/51 green.

@@ -70,6 +70,7 @@ from src.background_tasks import (
     execute_list_background_tasks, execute_start_background_task,
 )
 from src.homelab_monitor import HOMELAB_STATUS_TOOL, execute_homelab_status
+from src.self_review import SELF_REVIEW_TOOL, execute_self_review
 from src.self_status import STATUS_REPORT_TOOL, execute_status_report
 from src.reminders import (
     CANCEL_REMINDER_TOOL, LIST_REMINDERS_TOOL, SET_REMINDER_TOOL,
@@ -494,6 +495,20 @@ Self-status (one tool):
     systems nominal, sir"); only enumerate the problem subsystems unless the
     user explicitly asked for a full report. Like the briefing and
     homelab_status, this is a fresh-state question — re-run every time.
+24a. self_review — Jarvis's health ACROSS DAYS AND RESTARTS: recurring faults
+    grouped by what actually went wrong, how many separate sessions each
+    affected, and whether any run ended in a crash. Use for "how have you
+    been?", "any problems lately?", "have you been having trouble?", "what
+    keeps going wrong with you?", "how's your week been?".
+    The distinction from status_report matters: status_report is "are you
+    healthy RIGHT NOW" (this session); self_review is "is something quietly
+    wrong with you" (trend across restarts). A fault that appears once per run
+    is invisible to the first and obvious to the second. If the user asks
+    about a period ("this week", "the last month"), pass `days`.
+    Read it back as a verdict, not a list: lead with whether anything is
+    actually wrong, then at most the top couple of issues in plain language.
+    It is read-only — it reports faults, it does not fix them, so do not imply
+    you have repaired anything.
 24b. what_did_you_hear — what AMBIENT sounds Jarvis has recently heard via
     acoustic awareness (M58): use for "what did you just hear?", "did you
     hear something?", "what was that noise?", "heard anything?". Returns any
@@ -1027,6 +1042,7 @@ _CLIENT_TOOLS: dict[str, _ClientTool] = {
     "update_jarvis":                _ClientTool(execute_update_jarvis, "self_update"),
     "homelab_status":               _ClientTool(execute_homelab_status, "homelab"),
     "status_report":                _ClientTool(execute_status_report, "self_status"),
+    "self_review":                  _ClientTool(execute_self_review, "self_review"),
     "what_did_you_hear":            _ClientTool(execute_what_did_you_hear, "acoustic_recall"),
     "start_background_task":        _ClientTool(execute_start_background_task, "bgtask_start"),
     "list_background_tasks":        _ClientTool(execute_list_background_tasks, "bgtask_list"),
@@ -1291,6 +1307,7 @@ def stream_response(
         GET_CALENDAR_TOOL,
         SET_REMINDER_TOOL, LIST_REMINDERS_TOOL, CANCEL_REMINDER_TOOL,
         BRIEFING_TOOL, GOOD_NIGHT_TOOL, HOMELAB_STATUS_TOOL, STATUS_REPORT_TOOL,
+        SELF_REVIEW_TOOL,
         WHAT_DID_YOU_HEAR_TOOL,
         START_BACKGROUND_TASK_TOOL, LIST_BACKGROUND_TASKS_TOOL,
         CANCEL_BACKGROUND_TASK_TOOL,
