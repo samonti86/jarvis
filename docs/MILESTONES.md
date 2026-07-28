@@ -152,7 +152,7 @@ Written to be read by engineers. Dense on purpose.
 </details>
 
 <details>
-<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (36 entries)</strong></summary>
+<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (37 entries)</strong></summary>
 
 - [Debugging session follow-up — TTS retry on transient edge-tts flake](milestones/part-5.md#debugging-session-follow-up--tts-retry-on-transient-edge-tts-flake)
 - [Reminders → Discord push on fire](milestones/part-5.md#reminders--discord-push-on-fire)
@@ -190,6 +190,7 @@ Written to be read by engineers. Dense on purpose.
 - [M95 — Outcomes measured and declined; the prompt fix that beat them — 2026-07-28](milestones/part-5.md#m95--outcomes-measured-and-declined-the-prompt-fix-that-beat-them--2026-07-28)
 - [M96 — structured outputs on the background jobs — 2026-07-28](milestones/part-5.md#m96--structured-outputs-on-the-background-jobs--2026-07-28)
 - [M97 — the HUD learns to show background research — 2026-07-28](milestones/part-5.md#m97--the-hud-learns-to-show-background-research--2026-07-28)
+- [M98 — the arc reactor becomes hardware — 2026-07-28](milestones/part-5.md#m98--the-arc-reactor-becomes-hardware--2026-07-28)
 
 </details>
 

@@ -41,6 +41,7 @@ from typing import Callable
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+from src import reactor
 from src.attachments import load_attachment
 from src.tray import State
 
@@ -61,7 +62,7 @@ class JarvisConsole:
     JARVIS_FG = "#5ee0f0"
     DIM_FG = "#5b6b7f"
 
-    ORB_SIZE = 176  # arc-reactor canvas (square; the orb is centred in it)
+    ORB_SIZE = 208  # arc-reactor canvas (square; the orb is centred in it)
 
     # Per-state orb colour — console-local (NOT State.value, which drives the
     # tray icon). THINKING borrows Iron Man's gold; the rest are reactor cyan.
@@ -204,11 +205,13 @@ class JarvisConsole:
         # Sizes tuned in M17 review — bars feel substantial without dominating
         # the window. To resize: bar_width × num_bars + bar_gap × (num_bars-1)
         # should be ≤ canvas_width with comfortable horizontal padding.
-        self._wave_num_bars = 28
-        self._wave_bar_width = 7
-        self._wave_bar_gap = 6
-        self._wave_min_height = 3
-        self._wave_max_height = 64
+        # M98: many thin bars, not a few chunky ones. Beside the new reactor the
+        # old 28x7px field read as a barcode; 44 bars at 3px read as a waveform.
+        self._wave_num_bars = 44
+        self._wave_bar_width = 3
+        self._wave_bar_gap = 7
+        self._wave_min_height = 2
+        self._wave_max_height = 58
         self._wave_canvas_width = 480
         self._wave_canvas_height = 78
         # Resting bar colour (dim cyan); _wave_tick brightens each bar toward
@@ -223,6 +226,14 @@ class JarvisConsole:
         golden = math.pi * (3 - math.sqrt(5))
         self._wave_phases = [
             (i * golden) % (2 * math.pi) for i in range(self._wave_num_bars)
+        ]
+
+        # Envelope: a half-sine that tapers the field toward both ends, so it
+        # reads as one waveform rather than a row of independent bars. Without
+        # it every bar is equally tall at the edges and the shape looks cut off.
+        self._wave_env = [
+            math.sin(math.pi * (i + 0.5) / self._wave_num_bars) ** 0.8
+            for i in range(self._wave_num_bars)
         ]
 
         self._waveform_canvas = tk.Canvas(
@@ -630,18 +641,28 @@ class JarvisConsole:
         r_mid = int(r_out * 0.80)
         line = self.PANEL_LINE
 
+        # The pre-rendered reactor (M98) — created first so everything else
+        # layers above it, empty until its background warm completes.
+        self._orb_img = cv.create_image(cx, cy)
+        self._orb_photos: dict[tuple, object] = {}
+        self._orb_img_mode = False
+        reactor.warm_all(self.ORB_SIZE, self._STATE_COLOR.values())
+
+        # --- vector fallback: hidden the moment images arrive ---
+        self._orb_vec: list[int] = []
         # Bezel ring.
-        cv.create_oval(cx - r_out, cy - r_out, cx + r_out, cy + r_out,
-                       outline=line, width=2)
+        self._orb_vec.append(
+            cv.create_oval(cx - r_out, cy - r_out, cx + r_out, cy + r_out,
+                           outline=line, width=2))
         # 12 clock-style tick marks just inside the bezel.
         for i in range(12):
             a = math.radians(i * 30)
             r1, r2 = r_out - 3, r_out - 11
-            cv.create_line(
+            self._orb_vec.append(cv.create_line(
                 cx + r1 * math.cos(a), cy + r1 * math.sin(a),
                 cx + r2 * math.cos(a), cy + r2 * math.sin(a),
                 fill=line, width=2,
-            )
+            ))
         # Radial glow halo — 4 filled discs, large → small. _draw_orb sets
         # their fills dim → bright each frame to fake a soft radial gradient.
         self._orb_glow: list[int] = []
@@ -651,14 +672,11 @@ class JarvisConsole:
                 cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
                                fill=self.BG, outline="")
             )
+        self._orb_vec.extend(self._orb_glow)
         # Mid ring — drawn after the halo so it stays visible on top of it.
-        cv.create_oval(cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid,
-                       outline=line, width=1)
-        # Core.
-        self._orb_core_r = max(9, int(r_out * 0.16))
-        r = self._orb_core_r
-        self._orb_core = cv.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                        fill=self.ACCENT, outline="")
+        self._orb_vec.append(
+            cv.create_oval(cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid,
+                           outline=line, width=1))
         # Two counter-rotating arcs (on top).
         self._orb_arc_out = cv.create_arc(
             cx - r_out, cy - r_out, cx + r_out, cy + r_out,
@@ -668,6 +686,39 @@ class JarvisConsole:
             cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid,
             start=180, extent=60, style="arc", outline=self.ACCENT, width=2,
         )
+        self._orb_vec.extend((self._orb_arc_out, self._orb_arc_mid))
+
+        # --- live overlays, drawn in BOTH modes ---
+        # A pre-rendered frame cannot vary with the voice, so the two things
+        # that react to it stay cheap canvas primitives on top.
+        self._orb_core_r = max(9, int(self.ORB_SIZE * 0.055))
+        r = self._orb_core_r
+        self._orb_core = cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                        fill=self.ACCENT, outline="")
+        self._orb_amp_ring = cv.create_oval(cx, cy, cx, cy, outline="", width=2)
+
+    def _orb_frame(self, color: str, t: float) -> bool:
+        """Blit the current rotation frame. False if not warmed yet."""
+        cycle = reactor.frames(self.ORB_SIZE, color)
+        if cycle is None:
+            return False
+        rate = {State.IDLE: 1.2, State.LISTENING: 3.0,
+                State.THINKING: 6.0, State.SPEAKING: 4.0}.get(self._state, 2.0)
+        i = int(t * rate) % len(cycle)
+        key = (color, i)
+        photo = self._orb_photos.get(key)
+        if photo is None:
+            # Held forever on purpose: Tk only weak-references images, so a
+            # PhotoImage that loses its last Python ref is collected and the
+            # canvas silently draws nothing (same trap as _thumbnail_refs).
+            photo = ImageTk.PhotoImage(cycle[i])
+            self._orb_photos[key] = photo
+        self._orb.itemconfig(self._orb_img, image=photo)
+        if not self._orb_img_mode:
+            self._orb_img_mode = True
+            for item in self._orb_vec:
+                self._orb.itemconfigure(item, state="hidden")
+        return True
 
     def _draw_orb(self) -> bool:
         """One animation frame. Colour = state; the core breathes (and, while
@@ -694,23 +745,39 @@ class JarvisConsole:
         ang = (t * speed) % 360
 
         try:
-            self._orb.itemconfig(
-                self._orb_arc_out, start=ang,
-                outline=self._blend(self._dim(base, 0.35), base, pulse),
-            )
-            self._orb.itemconfig(
-                self._orb_arc_mid, start=(-ang * 1.4) % 360,
-                outline=self._dim(base, 0.5 + 0.3 * pulse),
-            )
-            for gid, f in zip(self._orb_glow, (0.18, 0.34, 0.58, 0.92)):
-                self._orb.itemconfig(gid, fill=self._dim(base, f * pulse))
+            cx, cy = self._orb_cx, self._orb_cy
+            if not self._orb_frame(base, t):
+                # Vector fallback — still warming, or no Pillow.
+                self._orb.itemconfig(
+                    self._orb_arc_out, start=ang,
+                    outline=self._blend(self._dim(base, 0.35), base, pulse),
+                )
+                self._orb.itemconfig(
+                    self._orb_arc_mid, start=(-ang * 1.4) % 360,
+                    outline=self._dim(base, 0.5 + 0.3 * pulse),
+                )
+                for gid, f in zip(self._orb_glow, (0.18, 0.34, 0.58, 0.92)):
+                    self._orb.itemconfig(gid, fill=self._dim(base, f * pulse))
+
             self._orb.itemconfig(
                 self._orb_core,
                 fill=self._blend(base, self.ACCENT_HOT, 0.25 + 0.55 * pulse),
             )
             r = self._orb_core_r * (0.78 + 0.5 * pulse)
-            cx, cy = self._orb_cx, self._orb_cy
             self._orb.coords(self._orb_core, cx - r, cy - r, cx + r, cy + r)
+
+            # Amplitude ring — expands with the live TTS level, invisible when
+            # silent (an empty outline is how a canvas item disappears).
+            amp = self._wave_amplitude
+            if amp > 0.02:
+                rr = self.ORB_SIZE * (0.25 + 0.03 * amp)
+                self._orb.coords(self._orb_amp_ring,
+                                 cx - rr, cy - rr, cx + rr, cy + rr)
+                self._orb.itemconfig(
+                    self._orb_amp_ring,
+                    outline=self._blend(base, self.ACCENT_HOT, amp))
+            else:
+                self._orb.itemconfig(self._orb_amp_ring, outline="")
         except tk.TclError:
             return False
         return True
@@ -1039,8 +1106,8 @@ class JarvisConsole:
                 self._wave_displayed[i] += (target - self._wave_displayed[i]) * smoothing
 
                 level = min(1.0, self._wave_displayed[i])
-                height = self._wave_min_height + level * span
-                half = height / 2
+                height = (self._wave_min_height + level * span) * self._wave_env[i]
+                half = max(0.5, height / 2)
                 x1, x2 = self._wave_bar_x[i]
                 self._waveform_canvas.coords(
                     bar_id, x1, mid_y - half, x2, mid_y + half

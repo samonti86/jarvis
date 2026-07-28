@@ -95,6 +95,11 @@ The core listen → process → respond spine:
 - `src/config.py` — loads `.env`, holds all runtime tunables.
 - `src/ui.py` / `src/console.py` / `src/tray.py` / `src/hud.py` — the UI fan-out
   facade and its three sinks (console window, tray, ambient overlay).
+  `src/reactor.py` — the shared arc-reactor renderer behind the console orb and
+  the HUD. Frames are **pre-rendered per (size, colour) on a daemon thread and
+  cached**, never drawn live: drawing one costs 9-25 ms, and at 20-30 fps that
+  would be a permanent 55-74% of a core competing with the audio threads. Both
+  callers keep their vector drawing as a fallback and use it until frames warm.
 - `src/security.py` · `src/sound_detector.py` · `src/speaker_id.py` ·
   `src/face_auth.py` — the sensing subsystems.
 - `src/remote_console.py` / `src/remote_pwa.py` / `src/discord_bot.py` — the
@@ -281,7 +286,7 @@ maintainable. Follow them.
   temp names, Windows `os.replace` retry. The target machine has no UPS, so an
   unclean power loss is a realistic failure mode, not a theoretical one.
 - **A bug that a test would have caught earns a test.** The regression gate grew
-  from a handful of suites to 45 exactly this way.
+  from a handful of suites to 51 exactly this way.
 - **QoL consolidation cadence.** Periodically run a no-new-features hardening
   pass: verify the regression net is green, run read-only audits across the
   tree, then fix in *risk order* (correctness → latent → cosmetic), gating each
@@ -343,7 +348,7 @@ requirement: one intended user is not an English speaker.
 
 ## Current Status
 The project is feature-complete for its intended use and running in production
-as a supervised always-on process. ~88 milestones; the regression gate is at 45
+as a supervised always-on process. ~98 milestones; the regression gate is at 54
 suites and green.
 
 **Working:**
