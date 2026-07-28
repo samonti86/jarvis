@@ -75,9 +75,10 @@ def _too_old(task: dict) -> bool:
 class BackgroundTaskManager:
     """Owns the poll loop. Constructed always; only started when enabled."""
 
-    def __init__(self, api_key: str, announce=None) -> None:
+    def __init__(self, api_key: str, announce=None, ui=None) -> None:
         self._api_key = api_key
         self._announce = announce
+        self._ui = ui
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -151,6 +152,18 @@ class BackgroundTaskManager:
                 error=state.get("error"),
             )
         self.deliver_ready()
+        self._push_ui()
+
+    def _push_ui(self) -> None:
+        """Mirror task state to the ambient overlay. Fail-soft: the HUD is a
+        nicety, the poll loop is not."""
+        if self._ui is None:
+            return
+        try:
+            self._ui.set_research_indicator(
+                len(task_store.active()), len(task_store.undelivered()))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bgtask] ui update failed: {exc}", file=sys.stderr)
 
     def deliver_ready(self) -> None:
         """Speak finished tasks — unless it's quiet hours, in which case leave

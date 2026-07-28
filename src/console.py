@@ -504,6 +504,13 @@ class JarvisConsole:
         if not self._destroyed:
             self.root.after(0, self._apply_armed, bool(on))
 
+    def set_research(self, active: int, pending: int) -> None:
+        """Thread-safe: drive the HUD's background-research line (M97). Called
+        from the BackgroundTaskManager poll thread. HUD-only — the console
+        already prints task events, and a second surface would double-report."""
+        if self._hud is not None:
+            self._hud.set_research(active, pending)
+
     def set_locked(self, on: bool) -> None:
         """Thread-safe: show/hide the '🔒 LOCKED' security-mode indicator
         (M35 follow-on). Called from SecurityWatcher's on_locked_changed

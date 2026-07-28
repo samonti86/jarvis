@@ -356,5 +356,62 @@ finally:
     real_ba._get_client = _orig_client
     os.environ["LOCALAPPDATA"] = _prev_local
 
+
+# =========================================================================
+# 13. M97 — the HUD research line
+# =========================================================================
+# Background research is the ONLY thing Jarvis does with no visible surface:
+# it runs off-box for minutes to hours with no window, no sound, no tray
+# change. The HUD line is the only ambient signal it has.
+reset_store()
+bt.background_agent = fake
+
+seen: list[tuple[int, int]] = []
+
+
+class FakeUI:
+    def set_research_indicator(self, active, pending):
+        seen.append((active, pending))
+
+
+mgr_ui = bt.BackgroundTaskManager("key", fake_announce, ui=FakeUI())
+
+_quiet["value"] = True          # hold the report so `pending` is observable
+bt.execute_start_background_task({"task": "hud wiring check"})
+fake.next_state = {"status": "running", "result": None, "error": None}
+mgr_ui.poll_once()
+check("running task reports 1 active, 0 pending", seen[-1] == (1, 0), str(seen))
+
+fake.next_state = {"status": "done", "result": "Found it.", "error": None}
+mgr_ui.poll_once()
+check("finished-but-held task reports 0 active, 1 pending",
+      seen[-1] == (0, 1), str(seen))
+
+bt.pending_reports()            # briefing drains it
+mgr_ui.poll_once()
+check("after delivery the line clears to 0,0", seen[-1] == (0, 0), str(seen))
+_quiet["value"] = False
+
+
+class BoomUI:
+    def set_research_indicator(self, active, pending):
+        raise RuntimeError("tk is gone")
+
+
+mgr_boom = bt.BackgroundTaskManager("key", fake_announce, ui=BoomUI())
+try:
+    mgr_boom.poll_once()
+    check("a dead UI cannot kill the poll loop", True)
+except Exception as exc:  # noqa: BLE001
+    check("a dead UI cannot kill the poll loop", False, str(exc))
+
+# The HUD renders text, so the rendering rules are worth pinning: no clutter
+# when idle, and correct singular/plural because this sits over the user's work.
+from src import hud as hudmod  # noqa: E402
+
+check("HUD exposes set_research", hasattr(hudmod.JarvisHUD, "set_research"))
+check("HUD has a distinct research colour",
+      hasattr(hudmod, "_RESEARCH") and hudmod._RESEARCH != hudmod._ARMED)
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)

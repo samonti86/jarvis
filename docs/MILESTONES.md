@@ -152,7 +152,7 @@ Written to be read by engineers. Dense on purpose.
 </details>
 
 <details>
-<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (35 entries)</strong></summary>
+<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (36 entries)</strong></summary>
 
 - [Debugging session follow-up — TTS retry on transient edge-tts flake](milestones/part-5.md#debugging-session-follow-up--tts-retry-on-transient-edge-tts-flake)
 - [Reminders → Discord push on fire](milestones/part-5.md#reminders--discord-push-on-fire)
@@ -189,6 +189,7 @@ Written to be read by engineers. Dense on purpose.
 - [M94 — the fix M93 found: transient TLS retries that actually ride out the blip — 2026-07-28](milestones/part-5.md#m94--the-fix-m93-found-transient-tls-retries-that-actually-ride-out-the-blip--2026-07-28)
 - [M95 — Outcomes measured and declined; the prompt fix that beat them — 2026-07-28](milestones/part-5.md#m95--outcomes-measured-and-declined-the-prompt-fix-that-beat-them--2026-07-28)
 - [M96 — structured outputs on the background jobs — 2026-07-28](milestones/part-5.md#m96--structured-outputs-on-the-background-jobs--2026-07-28)
+- [M97 — the HUD learns to show background research — 2026-07-28](milestones/part-5.md#m97--the-hud-learns-to-show-background-research--2026-07-28)
 
 </details>
 
