@@ -24,8 +24,13 @@ from src.reminders import (
 
 schema_props = SET_REMINDER_TOOL["input_schema"]["properties"]
 assert "action" in schema_props, "action field missing from schema"
-assert schema_props["action"]["enum"] == ["briefing", "good_night"]
-print("schema: action field present, enum=[briefing, good_night]")
+# Asserted as a SUPERSET, not equality: this suite is about the M59 briefing
+# action, and pinning the exact enum made it fail every time an unrelated
+# action was added (M92's background_task). Assert what this file is
+# responsible for; good_night_test.py owns the full-set assertion.
+_enum = set(schema_props["action"]["enum"])
+assert {"briefing", "good_night"} <= _enum, _enum
+print(f"schema: action field present, enum={sorted(_enum)}")
 
 rec = add("test briefing", datetime.now() + timedelta(seconds=3600),
           action="briefing")

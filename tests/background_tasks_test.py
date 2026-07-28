@@ -250,5 +250,47 @@ check("refusal is honest about where the work runs",
 check("nothing is dispatched while disabled", len(ts.all_tasks()) == 0)
 bt.background_agent = fake
 
+
+# =========================================================================
+# 11. M92 — scheduled research rides the EXISTING reminder scheduler
+# =========================================================================
+# Deliberately NOT a second scheduler. Recurrence, persistence, catch-up after
+# downtime and voice cancellation all come from the reminder record; the only
+# new part is an action that dispatches instead of composing.
+reset_store()
+bt.background_agent = fake
+from src import reminders as remod  # noqa: E402
+from src.reminders import SET_REMINDER_TOOL, _COMPOSITION_ACTIONS  # noqa: E402
+
+check("background_task is a registered composition action",
+      "background_task" in _COMPOSITION_ACTIONS)
+check("the tool schema offers it",
+      "background_task"
+      in SET_REMINDER_TOOL["input_schema"]["properties"]["action"]["enum"])
+
+# The composer takes the RECORD and uses `message` as the research brief —
+# that is what lets "every Monday, research X" work with no extra field.
+out = remod._compose_background_task(
+    {"message": "research what changed in consumer NAS hardware this week"})
+check("scheduled fire dispatches the task", "bgt_" in out, out)
+check("the reminder's message became the research prompt",
+      bool(fake.dispatched) and "consumer NAS hardware" in fake.dispatched[-1],
+      str(fake.dispatched))
+check("dispatch acknowledges rather than inventing findings",
+      "report back" in out.lower(), out)
+
+# A malformed record must not raise inside the scheduler thread.
+check("a subject-less scheduled task fails honestly",
+      "no subject" in remod._compose_background_task({"message": "  "}).lower())
+
+# The composer signature is SHARED across every action — a regression here
+# breaks briefing and good_night too, which is why it is asserted.
+import inspect  # noqa: E402
+
+for _name, _entry in _COMPOSITION_ACTIONS.items():
+    _params = list(inspect.signature(_entry[0]).parameters)
+    check(f"{_name} composer takes the record (shared signature)",
+          len(_params) == 1, f"got {_params}")
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)

@@ -152,7 +152,7 @@ Written to be read by engineers. Dense on purpose.
 </details>
 
 <details>
-<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (30 entries)</strong></summary>
+<summary><strong>Part 5 — 2026-05-26 to 2026-07-28 (31 entries)</strong></summary>
 
 - [Debugging session follow-up — TTS retry on transient edge-tts flake](milestones/part-5.md#debugging-session-follow-up--tts-retry-on-transient-edge-tts-flake)
 - [Reminders → Discord push on fire](milestones/part-5.md#reminders--discord-push-on-fire)
@@ -184,6 +184,7 @@ Written to be read by engineers. Dense on purpose.
 - [M89 — effort tuning: the voice path stops over-thinking "what's the weather" — 2026-07-28](milestones/part-5.md#m89--effort-tuning-the-voice-path-stops-over-thinking-whats-the-weather--2026-07-28)
 - [M90 — web_search dynamic filtering re-tested: blocker gone, pin stays — 2026-07-28](milestones/part-5.md#m90--web_search-dynamic-filtering-re-tested-blocker-gone-pin-stays--2026-07-28)
 - [M91 — long-horizon background agents: "research it overnight, brief me at breakfast" — 2026-07-28](milestones/part-5.md#m91--long-horizon-background-agents-research-it-overnight-brief-me-at-breakfast--2026-07-28)
+- [M92 — scheduled research: "every Monday, look into X" — 2026-07-28](milestones/part-5.md#m92--scheduled-research-every-monday-look-into-x--2026-07-28)
 
 </details>
 
