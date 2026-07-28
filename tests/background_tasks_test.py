@@ -292,5 +292,69 @@ for _name, _entry in _COMPOSITION_ACTIONS.items():
     check(f"{_name} composer takes the record (shared signature)",
           len(_params) == 1, f"got {_params}")
 
+
+# =========================================================================
+# 12. M95 — the server-side prompt must not silently drift
+# =========================================================================
+# The agent object holds `system` SERVER-SIDE, and ensure_resources returns
+# early when the ids are cached. Before M95 that meant editing _SYSTEM was a
+# silent no-op: you tune the prompt, redeploy, and the agent keeps the old one
+# forever. Caught only by reading the live agent back.
+import hashlib  # noqa: E402
+
+from src import background_agent as real_ba  # noqa: E402
+
+check("the system prompt carries a hard word ceiling, not a target",
+      "HARD LIMIT: 90 words" in real_ba._SYSTEM)
+check("the escape clause that averaged 317 words is gone",
+      "unless the task genuinely needs more" not in real_ba._SYSTEM)
+check("prompt rationale is NOT inside the billed prompt",
+      "Measured" not in real_ba._SYSTEM and "317" not in real_ba._SYSTEM,
+      "history belongs in a comment; the prompt is billed every call")
+
+fp = real_ba._system_fingerprint()
+check("fingerprint is stable across calls", fp == real_ba._system_fingerprint())
+check("fingerprint tracks the prompt",
+      fp == hashlib.sha256(real_ba._SYSTEM.encode("utf-8")).hexdigest()[:16])
+
+# The failure mode that matters: a FAILED update must NOT record the
+# fingerprint, or the drift is marked resolved and never retried.
+import json as _json  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+_prev_local = os.environ["LOCALAPPDATA"]
+os.environ["LOCALAPPDATA"] = _tf.mkdtemp(prefix="jarvis-drift-")
+ids_path = Path(os.environ["LOCALAPPDATA"]) / "Jarvis"
+ids_path.mkdir(parents=True, exist_ok=True)
+(ids_path / "background_agent_ids.json").write_text(
+    _json.dumps({"agent_id": "agent_x", "environment_id": "env_x",
+                 "system_sha": "stale"}), encoding="utf-8")
+
+
+class _BoomClient:
+    class beta:  # noqa: N801
+        class agents:  # noqa: N801
+            @staticmethod
+            def retrieve(_id):
+                raise RuntimeError("api down")
+
+            @staticmethod
+            def update(*a, **k):
+                raise RuntimeError("api down")
+
+
+_orig_client = real_ba._get_client
+real_ba._get_client = lambda _k: _BoomClient()
+try:
+    a_id, e_id = real_ba.ensure_resources("key")
+    check("a failed prompt update still returns the ids (never blocks dispatch)",
+          a_id == "agent_x" and e_id == "env_x", f"{a_id} {e_id}")
+    saved = _json.loads((ids_path / "background_agent_ids.json").read_text(encoding="utf-8"))
+    check("a FAILED update does not record the fingerprint (so it retries)",
+          saved.get("system_sha") == "stale", str(saved))
+finally:
+    real_ba._get_client = _orig_client
+    os.environ["LOCALAPPDATA"] = _prev_local
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)
