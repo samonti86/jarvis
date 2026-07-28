@@ -892,3 +892,68 @@ system-prompt entries 27-29), `src/briefing.py` (`_background_tasks_section`),
 `scripts/background_agent_probe.py` (NEW live instrument), docs.
 
 **Gate:** 50/50 green.
+
+## M92 — scheduled research: "every Monday, look into X" — 2026-07-28
+
+**What shipped.** `set_reminder(action="background_task", repeat=…)` turns a
+recurring reminder into a standing research job. The reminder's `message` IS
+the research brief, handed verbatim to the M91 background agent at fire time.
+Findings arrive on their own — spoken when they land, or folded into the next
+morning briefing if they land overnight.
+
+**This was planned as Managed Agents scheduled deployments. It isn't, and the
+reason is the interesting part.**
+
+The Phase 2 design called for CMA `deployments` — Anthropic firing the session
+on a cron. Two things came out of actually looking:
+
+1. `client.beta.deployments` does not exist in the installed SDK (0.97.0), so
+   it needed either an SDK bump on a production always-on process or hand-rolled
+   raw HTTP.
+2. More decisively — **the project already had a scheduler.** M54 gave reminders
+   interval/weekly/monthly recurrence; M59/M63 gave them an `action` that fires
+   a composition instead of speaking a message. Both are persistent, both are
+   voice-manageable, and `run_scheduler` already *"polls immediately on start,
+   so reminders that came due while Jarvis was off fire right after launch"*.
+
+That last detail removed the one real advantage a hosted cron had. Building
+deployments would have delivered a **second scheduling system** with its own
+list, its own cancel, and its own mental model — two places to answer "what is
+scheduled?" for a user whose whole interface is one voice. The cheaper and more
+coherent answer was one new action on the scheduler that already exists.
+
+**One design decision worth recording.** The composition table mapped
+`action → (composer(), …)` with a **zero-argument** composer, because a briefing
+needs no input. A research task needs its prompt. Rather than special-case it,
+the signature was generalised to `composer(rec)` and the two existing composers
+now accept-and-ignore the record. The table stays one shape; `background_task`
+reads `rec["message"]`, so "every Monday, research the NAS market" needs no new
+field — recurrence, persistence, downtime catch-up and cancellation all come
+free from the reminder record.
+
+Unlike its siblings this composer **composes nothing**: it dispatches and
+returns an acknowledgement. The findings are not available at fire time and it
+must not pretend otherwise — asserted (`dispatch acknowledges rather than
+inventing findings`).
+
+**Three suites caught the signature change, which is the system working.**
+`reminders_test` patched an entry with a zero-arg lambda; `good_night_test`
+asserted the action set was exactly two; `scheduled_briefing_test` asserted the
+schema enum equalled exactly `["briefing", "good_night"]`. The first two were
+found by grepping for `_COMPOSITION_ACTIONS`; the third was not, because it
+asserts on the *schema* instead — it surfaced only when the full gate ran.
+
+The third was fixed by **loosening the assertion to a superset**, not by adding
+the new value: that suite is about the M59 briefing, and pinning an exact enum
+made it fail every time an unrelated action was added. `good_night_test` owns
+the full-set assertion; a test should assert what its own subject is
+responsible for.
+
+**Files:** `src/reminders.py` (generalised composer signature,
+`_compose_background_task`, table entry, enum + validation), `src/llm.py`
+(system-prompt guidance for scheduled research),
+`tests/background_tasks_test.py` (+9 assertions, 50 total),
+`tests/reminders_test.py`, `tests/good_night_test.py`,
+`tests/scheduled_briefing_test.py`.
+
+**Gate:** 50/50 green.

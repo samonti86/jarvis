@@ -288,9 +288,11 @@ check("_push: None and raising sink both swallowed (no exception escaped)", True
 # composer to be instant + deterministic; the fire spawns a worker thread.
 # NOTE: patch the _COMPOSITION_ACTIONS entry, not the module attr — the dict
 # captured the original function reference at definition time.
+# The composer takes the RECORD (M92): background_task reads its prompt from
+# rec['message'], so the shared signature passes it to every action.
 _orig_brief = remod._COMPOSITION_ACTIONS["briefing"]
 remod._COMPOSITION_ACTIONS["briefing"] = (
-    (lambda: "WEATHER: clear. NEWS: none.",) + _orig_brief[1:]
+    (lambda rec: "WEATHER: clear. NEWS: none.",) + _orig_brief[1:]
 )
 spoke3, pushed3 = [], []
 _fire_one({"id": "rbrief", "message": "morning briefing", "action": "briefing",

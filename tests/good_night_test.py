@@ -209,10 +209,12 @@ if saved_home is not None:
 print("\nreminders dispatch (M63 share with M59):")
 
 schema_props = SET_REMINDER_TOOL["input_schema"]["properties"]
-check("action enum lists both briefing and good_night",
-      set(schema_props["action"]["enum"]) == {"briefing", "good_night"})
-check("_COMPOSITION_ACTIONS contains both",
-      set(_COMPOSITION_ACTIONS.keys()) == {"briefing", "good_night"})
+check("action enum lists every composition action",
+      set(schema_props["action"]["enum"])
+      == {"briefing", "good_night", "background_task"})
+check("_COMPOSITION_ACTIONS matches the enum (M92 added background_task)",
+      set(_COMPOSITION_ACTIONS.keys())
+      == {"briefing", "good_night", "background_task"})
 
 check("_action_label(briefing, cap=True) -> 'Scheduled briefing'",
       _action_label("briefing", capitalised=True) == "Scheduled briefing")

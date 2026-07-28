@@ -430,6 +430,16 @@ Reminders & timers (three tools):
     tool at fire time instead of just speaking `message`; use a short label
     like "morning briefing" or "good night" for the message itself. The user
     can list / cancel it like any reminder.
+    **Scheduled research (M92):** for a standing research job — "every Monday
+    look into the NAS market and brief me", "each morning research what's new
+    in local LLMs", "check the Cuba travel rules every Sunday" — use
+    `action="background_task"` AND a `repeat` spec. Here `message` is NOT a
+    label: it is the research brief itself, and it is handed verbatim to the
+    background agent, so write it as a full instruction ("research what's
+    changed in consumer NAS hardware this week"). At fire time it DISPATCHES
+    the work and says so; the findings arrive on their own later, spoken when
+    they land or folded into the next morning briefing. Same list / cancel
+    surface as any other reminder.
 19. list_reminders — read back the user's pending reminders ("what reminders
     do I have?", "what am I meant to do later?").
 20. cancel_reminder — cancel a pending reminder, by `id` or by a `query`

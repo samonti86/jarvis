@@ -449,7 +449,7 @@ SET_REMINDER_TOOL = {
             },
             "action": {
                 "type": "string",
-                "enum": ["briefing", "good_night"],
+                "enum": ["briefing", "good_night", "background_task"],
                 "description": (
                     "M59 + M63 — OPTIONAL. When set, the reminder TRIGGERS a "
                     "composition tool at fire time instead of just speaking "
@@ -569,7 +569,7 @@ def execute_set_reminder(params: dict) -> str:
     # are rejected here (vs. silently stored) so a typo gives the user a
     # clear error instead of a silent never-firing-as-expected.
     action = (params.get("action") or "").strip().lower() or None
-    if action and action not in {"briefing", "good_night"}:
+    if action and action not in {"briefing", "good_night", "background_task"}:
         return (f"I don't know the '{action}' action, sir — only "
                 f"'briefing' and 'good_night' are supported right now.")
 
@@ -705,14 +705,32 @@ def _greeting_for(hour: int) -> str:
     return "Good evening, sir."
 
 
-def _compose_briefing() -> str:
+def _compose_briefing(rec: dict) -> str:  # noqa: ARG001 — signature is shared
     from src.briefing import execute_briefing_tool  # noqa: PLC0415 — lazy
     return execute_briefing_tool({})
 
 
-def _compose_good_night() -> str:
+def _compose_good_night(rec: dict) -> str:  # noqa: ARG001 — signature is shared
     from src.good_night import execute_good_night_tool  # noqa: PLC0415 — lazy
     return execute_good_night_tool({})
+
+
+def _compose_background_task(rec: dict) -> str:
+    """M92 — a scheduled research task. Unlike the other actions this composes
+    NOTHING: it dispatches long-horizon work and returns a one-line
+    acknowledgement. The actual findings arrive minutes-to-hours later through
+    the M91 delivery path (spoken on completion, or folded into the next
+    morning briefing if they land during quiet hours).
+
+    The research prompt is the reminder's own `message`, so "every Monday,
+    research the NAS market" needs no extra field — recurrence, persistence,
+    catch-up-after-downtime and voice cancellation all come from the existing
+    reminder record."""
+    from src.background_tasks import execute_start_background_task  # noqa: PLC0415
+    prompt = (rec.get("message") or "").strip()
+    if not prompt:
+        return "Sir, a scheduled research task had no subject."
+    return execute_start_background_task({"task": prompt})
 
 
 # Dispatch table for composition actions (M59 briefing, M63 good-night). Each
@@ -724,6 +742,9 @@ _COMPOSITION_ACTIONS: dict[str, tuple[Callable[[], str], str, str, str]] = {
                    "Sir, the scheduled briefing failed to compile."),
     "good_night": (_compose_good_night, "evening wrap",       " (good night)",
                    "Sir, the evening wrap failed to compile."),
+    "background_task": (_compose_background_task, "scheduled research",
+                        " (research)",
+                        "Sir, the scheduled research task failed to start."),
 }
 
 
@@ -783,7 +804,7 @@ def _fire_composition(rec: dict, announce: Callable[[str], None],
 
     def _worker() -> None:
         try:
-            text = composer()
+            text = composer(rec)
         except Exception as exc:  # noqa: BLE001 — never propagate to the thread top
             print(f"[reminders] {action} composition failed: {exc}",
                   file=sys.stderr)
