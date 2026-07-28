@@ -663,3 +663,71 @@ serialization, the intent-dispatch extraction (carried).
 at the START of every QA pass, not as an afterthought; and "a thread that must
 never die" needs a supervisor, not just careful code (the same reasoning that
 built the M65 process watchdog, one level down).
+
+## M89 — effort tuning: the voice path stops over-thinking "what's the weather" — 2026-07-28
+
+**What shipped.** `output_config.effort` is now set explicitly per path:
+`medium` for a spoken turn, `high` for engineer mode, overridable via
+`JARVIS_VOICE_EFFORT` / `JARVIS_ENGINEER_EFFORT`. Median turn latency drops
+**6.7s → 4.6s** and time-to-first-token **6.0s → 3.8s**, with no measurable
+cost to tool routing.
+
+**Why it mattered.** Sonnet 5 defaults to `effort: high` when `output_config`
+is unset. Jarvis never set it, so every "what's the weather" was answered at
+the same reasoning depth as a multi-step diagnostic — on an interface whose
+stated design constraint is *first audible word within one second*.
+
+**Why it was measured rather than just set.** Lowering effort is not obviously
+safe here. The voice path runs `thinking: {"type": "disabled"}`, and Sonnet 5
+with thinking off is already less inclined to reach for tools; `effort` pushes
+the same direction. Jarvis's usefulness *is* its routing across ~40 tools, so a
+latency win that quietly costs tool recall is not a win. `scripts/effort_probe.py`
+drives the real `stream_response` — real system prompt, real tool schemas, real
+agentic loop — over 10 representative questions with a known expected tool.
+
+**The measurement was wrong twice before it was right.** Both worth recording:
+
+1. *A stale expected tool name.* The probe graded `get_pc_diagnostics`; the
+   schema name is `pc_diagnostics`. That scored a MISS against a tool that had
+   fired correctly. A grader bug looks exactly like a regression.
+2. *Level order was confounded with wall-clock time.* The first two runs swept
+   all `low`, then all `medium`, then all `high`. Drift in API latency during
+   the run therefore lands on whichever level owned the calm stretch — and
+   because the order was identical, **re-running reproduced the artefact
+   exactly**. Replication is not control. The probe now interleaves levels
+   per query and rotates their order.
+
+The `medium` advantage survived the interleaved re-run, so it is real.
+
+| effort | median latency | median TTFT | output tokens | reply words | routing |
+|---|---|---|---|---|---|
+| low | 7.1s | 6.1s | 116 | 26 | 14/14 |
+| **medium** | **4.6s** | **3.8s** | 130 | 30 | 14/14 |
+| high | 6.7s | 6.0s | 135 | 33 | 14/14 |
+
+**What the data killed.** Two findings from the uncontrolled runs did *not*
+survive: `high` appearing to lose 2 routing cases, and `low` appearing to skip
+`wolfram_query` on a borderline arithmetic question. In the controlled run all
+three levels routed 14/14 and all three answered the arithmetic directly.
+Routing here is probabilistic; run-to-run variance is large enough to invent an
+effect that is not there. Both were nearly written up as effort effects.
+
+**Honest unknown.** The latency curve is **not monotonic** — `medium` is faster
+than both `low` and `high`. With thinking disabled there are no thinking tokens
+for effort to trim, and iteration counts are flat (1.8 across all levels), so
+the usual explanation does not apply. The effect reproduced three times
+including under interleaving, so it is taken; the mechanism is not understood
+and is recorded as unknown rather than guessed. Worth re-measuring on any model
+change.
+
+**Guards.** Haiku 4.5 **rejects** `output_config.effort` with a 400, and the
+background jobs (session summariser, prediction miner) run on Haiku — so effort
+is gated by model, and `scripts/effort_config_test.py` asserts a Haiku turn
+sends no `output_config` at all. An invalid value in `.env` would otherwise be
+a 400 on *every* turn, taking Jarvis off the air, so it logs and falls back to
+the default instead.
+
+**Not changed.** The background Sonnet callers (anticipation, prediction
+resolution, vision description) still use `messages.create` directly and keep
+the API default. They were not measured, and tuning an unmeasured path on a
+hunch is the thing this project keeps learning not to do.

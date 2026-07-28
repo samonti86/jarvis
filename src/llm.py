@@ -34,6 +34,7 @@ about what was discussed in earlier (now-sealed) sessions.
 from __future__ import annotations
 
 import base64
+import os
 import sys
 import threading
 import time
@@ -741,6 +742,52 @@ _LOOP_CAP_FALLBACK = (
 _DEFAULT_MAX_TOKENS = 1024
 _ENGINEER_MAX_TOKENS = 8192   # room for adaptive reasoning + a structured reply
 
+# Effort — how much the model spends thinking AND acting on a turn.
+#
+# Sonnet 5 defaults to `high` when output_config.effort is unset, which is the
+# wrong default for a voice assistant: "what's the weather" was being answered
+# at the same reasoning depth as a multi-step diagnostic. Effort is the single
+# biggest latency/cost lever available without touching the prompt.
+#
+# The values below were MEASURED, not guessed — see scripts/effort_probe.py and
+# the milestone entry. The measurement mattered because effort cuts both ways
+# here: Sonnet 5 with `thinking` disabled is already less inclined to reach for
+# tools, and lowering effort pushes the same direction. On a 40-tool assistant
+# whose usefulness *is* its tool routing, a latency win that quietly costs tool
+# recall is not a win.
+_VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+
+
+def _env_effort(name: str, default: str) -> str:
+    """Read an effort override, rejecting junk rather than 400-ing at runtime.
+
+    An invalid effort is a hard API error on every turn — i.e. a typo in .env
+    would take the assistant completely off the air. Fail soft to the default
+    and log, per the project's contract.
+    """
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw not in _VALID_EFFORT:
+        print(f"[llm] ignoring {name}={raw!r} - expected one of "
+              f"{', '.join(_VALID_EFFORT)}; using {default}", file=sys.stderr)
+        return default
+    return raw
+
+
+_VOICE_EFFORT = _env_effort("JARVIS_VOICE_EFFORT", "medium")
+_ENGINEER_EFFORT = _env_effort("JARVIS_ENGINEER_EFFORT", "high")
+
+# Models that accept output_config.effort. Haiku 4.5 REJECTS it with a 400, and
+# the background jobs (summariser, prediction miner) run on Haiku — so this is
+# a real guard, not defensive decoration.
+def _supports_effort(model: str) -> bool:
+    m = (model or "").lower()
+    if "haiku" in m:
+        return False
+    return any(k in m for k in ("sonnet-5", "opus-5", "opus-4-8", "opus-4-7",
+                                "sonnet-4-6", "opus-4-6", "fable"))
+
 
 @dataclass
 class TelemetryRecord:
@@ -1088,6 +1135,7 @@ def stream_response(
     speaker_lang: "str | None" = None,
     vocal_cue: "str | None" = None,
     interrupt_event: threading.Event | None = None,
+    effort: "str | None" = None,
 ) -> Iterator[str]:
     """Stream Claude's response, handling client-side tool use transparently.
 
@@ -1233,6 +1281,13 @@ def stream_response(
         "tools": tools,
         "thinking": {"type": "adaptive"} if engineer_mode else {"type": "disabled"},
     }
+
+    # Effort. Unset, Sonnet 5 runs `high` — full reasoning depth on "what's the
+    # weather". `effort` overrides the per-mode default (the probe harness sweeps
+    # it); None keeps the default. Guarded by model, since Haiku 400s on it.
+    chosen_effort = effort or (_ENGINEER_EFFORT if engineer_mode else _VOICE_EFFORT)
+    if chosen_effort and _supports_effort(model):
+        stream_kwargs["output_config"] = {"effort": chosen_effort}
 
     while iterations < _MAX_LOOP_ITERATIONS:
         iterations += 1
