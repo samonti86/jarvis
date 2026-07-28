@@ -19,9 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import main  # noqa: E402 — _is_dismissal lives in the loop module
+from src import listen_loop as _loop  # noqa: E402 — _is_dismissal lives here
 
-_is_dismissal = main._is_dismissal
+_is_dismissal = _loop._is_dismissal
 
 PASSED = 0
 FAILED = 0

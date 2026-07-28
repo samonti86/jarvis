@@ -1,4 +1,4 @@
-r"""Regression test for main.TurnRunner (the QoL Tier-2.1-Step-2 extraction).
+r"""Regression test for src/turn_runner.py :: TurnRunner.
 
 WHY THIS EXISTS
 ---------------
@@ -11,11 +11,29 @@ fail-soft apology path. These are the invariants a future refactor of the
 conversation engine must not break.
 
 Everything is exercised with fakes — no network, no audio, no disk:
-  - main.MemoryStore   -> FakeMemory   (no disk I/O at construction)
-  - main.stream_response -> a fake generator (configurable chunks / raise)
-  - main.speak_streaming / main.speak -> recorded (asserted NOT called on
+  - turn_runner.MemoryStore   -> FakeMemory   (no disk I/O at construction)
+  - turn_runner.stream_response -> a fake generator (configurable chunks / raise)
+  - turn_runner.speak_streaming / turn_runner.speak -> recorded (asserted NOT called on
     silent paths; consumed on the speak path)
-  - main._seal_session -> recorded (the boundary tests assert it fired)
+  - turn_runner._seal_session -> recorded (the boundary tests assert it fired)
+
+THE PATCH TARGET IS LOAD-BEARING
+--------------------------------
+These fakes are installed by rebinding names on the MODULE OBJECT, which only
+works because TurnRunner resolves them from its own module globals at CALL
+time. The target must therefore be the module TurnRunner actually lives in.
+
+When TurnRunner moved out of main.py into src/turn_runner.py (2026-07-28),
+these patches had to move with it in the same commit. Patching `main.*` after
+the move would have rebound names on a module TurnRunner no longer reads —
+every assertion would have exercised the REAL stream_response and the REAL
+speak(), i.e. a green suite testing nothing. (In this instance the move failed
+loudly with AttributeError, but that was luck, not a guarantee.)
+
+If you ever rewrite the imports in src/turn_runner.py to `from src import llm`
++ `llm.stream_response(...)`, or bind a collaborator to `self` in __init__,
+update this file in the same commit — and re-run the mutation check in
+scripts/turn_runner_patch_test.py, which exists to prove these seams still bind.
 
     venv\Scripts\python.exe scripts\turn_runner_test.py     # exit 0 = pass
 """
@@ -28,7 +46,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import main  # noqa: E402
+from src import turn_runner  # noqa: E402
 
 _passed = 0
 _failed = 0
@@ -141,17 +159,17 @@ def _fake_cfg() -> types.SimpleNamespace:
 # --- Test harness wiring --------------------------------------------------
 # Patch the module-level names TurnRunner resolves at call time. MemoryStore
 # is patched before construction (its __init__ builds one).
-main.MemoryStore = FakeMemory
-_orig_seal = main._seal_session
-_orig_stream = main.stream_response
-_orig_speak_streaming = main.speak_streaming
-_orig_speak = main.speak
+turn_runner.MemoryStore = FakeMemory
+_orig_seal = turn_runner._seal_session
+_orig_stream = turn_runner.stream_response
+_orig_speak_streaming = turn_runner.speak_streaming
+_orig_speak = turn_runner.speak
 
 _seal_calls: list = []
-main._seal_session = lambda *a, **k: _seal_calls.append((a, k))
+turn_runner._seal_session = lambda *a, **k: _seal_calls.append((a, k))
 
 _speak_calls: list = []
-main.speak = lambda *a, **k: _speak_calls.append((a, k))
+turn_runner.speak = lambda *a, **k: _speak_calls.append((a, k))
 
 
 _speak_streaming_calls: list = []
@@ -181,12 +199,12 @@ def _consuming_speak_streaming(gen, *a, **k):
     _speak_streaming_calls.append((a, k))
 
 
-main.speak_streaming = _consuming_speak_streaming
+turn_runner.speak_streaming = _consuming_speak_streaming
 
 
 def _new_runner(ui: FakeUI):
     import threading  # noqa: PLC0415
-    return main.TurnRunner(_fake_cfg(), ui, threading.Event())
+    return turn_runner.TurnRunner(_fake_cfg(), ui, threading.Event())
 
 
 # --- Test 1: construction + empty state -----------------------------------
@@ -203,7 +221,7 @@ FakeMemory.summaries_to_return = []
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["Hello, ", "sir."]
-main.stream_response = stream
+turn_runner.stream_response = stream
 _speak_streaming_calls.clear()
 ret = runner.process_question("hi", "en", origin="phone_text")
 check("normal turn -> returns False (no barge-in)", ret is False)
@@ -224,7 +242,7 @@ check("phone_text turn -> stream_response got restricted=True",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["ok"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("hi", "en", origin="console")
 check("console turn -> stream_response got restricted=False",
       stream.last_kwargs.get("restricted") is False)
@@ -237,7 +255,7 @@ check("console turn -> stream_response got restricted=False",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["ok"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("hola", "es", origin="voice",
                         speaker_name="Bob", speaker_lang="es")
 check("voice turn -> stream_response got speaker_name",
@@ -251,7 +269,7 @@ check("M82: voice turn -> speaker tagged on the recorded turn",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["ok"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("hi", "en", origin="phone_text")
 check("turn with no speaker -> stream_response speaker_name defaults None",
       stream.last_kwargs.get("speaker_name") is None)
@@ -263,7 +281,7 @@ check("turn with no speaker -> stream_response speaker_lang defaults None",
 ui = FakeUI(); ui.muted = False
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["spoken ", "reply"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 _speak_streaming_calls.clear()
 runner.process_question("say something", "en", origin="console")
 check("console+unmuted -> speak_streaming WAS called (speak path)",
@@ -279,9 +297,9 @@ import threading as _threading  # noqa: E402
 
 ui = FakeUI(); ui.muted = False
 pc_ev = _threading.Event()
-runner = main.TurnRunner(_fake_cfg(), ui, _threading.Event(), pc_speaking=pc_ev)
+runner = turn_runner.TurnRunner(_fake_cfg(), ui, _threading.Event(), pc_speaking=pc_ev)
 stream = FakeStream(); stream.chunks = ["hi"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 _pc_event_ref[0] = pc_ev
 _pc_observed["set_during_speak"] = None
 runner.process_question("speak up", "en", origin="console")
@@ -291,10 +309,10 @@ check("audible turn -> pc_speaking CLEARED after the turn", not pc_ev.is_set())
 _pc_event_ref[0] = None
 
 pc_ev_silent = _threading.Event()
-runner_s = main.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
+runner_s = turn_runner.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
                            pc_speaking=pc_ev_silent)
 stream = FakeStream(); stream.chunks = ["hi"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner_s.process_question("quietly", "en", origin="phone_text")
 check("silent (phone_text) turn -> pc_speaking never set",
       not pc_ev_silent.is_set())
@@ -307,10 +325,10 @@ check("silent (phone_text) turn -> pc_speaking never set",
 # gated, turn replies were not). A SILENT turn never sets it.
 ui = FakeUI(); ui.muted = False
 ann_ev = _threading.Event()
-runner = main.TurnRunner(_fake_cfg(), ui, _threading.Event(),
+runner = turn_runner.TurnRunner(_fake_cfg(), ui, _threading.Event(),
                          announce_speaking=ann_ev)
 stream = FakeStream(); stream.chunks = ["hi"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 _ann_event_ref[0] = ann_ev
 _ann_observed["set_during_speak"] = None
 runner.process_question("speak up", "en", origin="console")
@@ -321,10 +339,10 @@ check("audible turn -> announce_speaking CLEARED after the turn",
 _ann_event_ref[0] = None
 
 ann_ev_silent = _threading.Event()
-runner_s = main.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
+runner_s = turn_runner.TurnRunner(_fake_cfg(), FakeUI(), _threading.Event(),
                            announce_speaking=ann_ev_silent)
 stream = FakeStream(); stream.chunks = ["hi"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner_s.process_question("quietly", "en", origin="phone_text")
 check("silent (phone_text) turn -> announce_speaking never set",
       not ann_ev_silent.is_set())
@@ -334,7 +352,7 @@ check("silent (phone_text) turn -> announce_speaking never set",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = []          # nothing comes back
-main.stream_response = stream
+turn_runner.stream_response = stream
 ret = runner.process_question("hi", "en", origin="phone_text")
 check("empty response -> history left empty (orphan user popped)",
       runner._history == [])
@@ -346,7 +364,7 @@ check("empty response -> returns False", ret is False)
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.raises = RuntimeError("boom")
-main.stream_response = stream
+turn_runner.stream_response = stream
 _speak_calls.clear()
 ret = runner.process_question("hi", "en", origin="phone_text")
 check("exception -> history left empty (user popped)", runner._history == [])
@@ -359,7 +377,7 @@ check("exception -> returns False", ret is False)
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.raises = RuntimeError("boom")
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("hola", "es", origin="phone_text")
 check("exception (es) -> Spanish apology surfaced",
       "Disculpe" in ui.jarvis_texts[0])
@@ -369,7 +387,7 @@ check("exception (es) -> Spanish apology surfaced",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["one"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("first", "en", origin="phone_text")     # history -> 2
 _seal_calls.clear()
 runner._reset_event.set()
@@ -385,7 +403,7 @@ check("reset -> history holds only the new pair",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["one"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("first", "en", origin="phone_text")     # history -> 2
 runner._last_turn_time = 0.0                                    # far in the past
 _seal_calls.clear()
@@ -398,7 +416,7 @@ check("idle elapsed -> seal fired before the new turn", len(_seal_calls) == 1)
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["ok"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 block = {"type": "image", "source": {"data": "x"}}
 runner.process_question("what is this", "en",
                         attachments=[block], origin="phone_text")
@@ -413,7 +431,7 @@ check("attachments -> user content is a block list (attachment first)",
 ui = FakeUI()
 runner = _new_runner(ui)
 stream = FakeStream(); stream.chunks = ["x"]
-main.stream_response = stream
+turn_runner.stream_response = stream
 runner.process_question("hi", "en", origin="phone_text")
 FakeMemory.summaries_to_return = ["reloaded"]
 runner.seal_and_refresh()
@@ -425,10 +443,10 @@ FakeMemory.summaries_to_return = []
 
 
 # --- Restore patched globals (tidy, in case of import reuse) --------------
-main._seal_session = _orig_seal
-main.stream_response = _orig_stream
-main.speak_streaming = _orig_speak_streaming
-main.speak = _orig_speak
+turn_runner._seal_session = _orig_seal
+turn_runner.stream_response = _orig_stream
+turn_runner.speak_streaming = _orig_speak_streaming
+turn_runner.speak = _orig_speak
 
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)
