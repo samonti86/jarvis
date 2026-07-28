@@ -35,6 +35,13 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
 
+# Transient-TLS retry policy (M94). Derived from measurement, not taste — see
+# the note in _fetch_events_ical. 8s is generous for a handshake that normally
+# completes in well under a second; the exponential gap is what makes each
+# retry sample a genuinely later moment instead of the same dead network.
+_FETCH_TIMEOUT_SEC = 8.0
+_FETCH_BACKOFF_SEC = 1.0
+
 
 # --- Configuration ---------------------------------------------------------
 
@@ -84,24 +91,43 @@ def _fetch_events_ical(start_utc: datetime, end_utc: datetime) -> tuple[list[Cal
     few hours stale. Acceptable for v1; the alternative (polling more
     aggressively) would burn bandwidth for no real benefit since the
     user's calendar doesn't change minute-to-minute."""
-    # 2026-07-02 QA: one retry after a short backoff (the http_util pattern) —
-    # the live log shows several transient TLS-handshake timeouts per day on
-    # this uplink, and this path had ZERO retries while weather had one: a
-    # single blip failed an on-demand "what's on my calendar?" outright.
+    # 2026-07-02 QA added one retry at a flat 0.5s. M93's cross-session review
+    # showed that was not enough: this remained the single most frequent fault
+    # in the whole log — 47 occurrences across 16 separate sessions in 30 days,
+    # and 34 of them exhausted the retry rather than recovering.
+    #
+    # WHY THE OLD POLICY COULDN'T WORK. The failure is a TLS handshake timeout,
+    # so attempt 1 burns the FULL 15s timeout before the backoff even begins.
+    # Sleeping a further 0.5s puts attempt 2 about 15.5s in — still inside the
+    # same blip. Measured shape of the real outages: 44 distinct bursts over 35
+    # days, half of them a single event, the largest 10 events across 1.6 min.
+    #
+    # WHY THIS IS STRICTLY BETTER, NOT JUST MORE PATIENT. A handshake that has
+    # not completed in 8s is not going to (a healthy one is well under 1s), so
+    # the per-attempt timeout drops 15s -> 8s and buys a third attempt with an
+    # exponential gap. Worst case actually FALLS:
+    #     before   15 + 0.5 + 15          = 30.5s over 2 attempts
+    #     after     8 + 1 + 8 + 2 + 8      = 27.0s over 3 attempts
+    # More chances to catch a good moment, less time spent failing — which
+    # matters because this path also serves the on-demand "what's on my
+    # calendar?" voice turn, where a user is waiting in silence.
     resp = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3):
         try:
-            resp = httpx.get(ICAL_URL, follow_redirects=True, timeout=15.0)
+            resp = httpx.get(ICAL_URL, follow_redirects=True,
+                             timeout=_FETCH_TIMEOUT_SEC)
             break
         except httpx.HTTPError as exc:
+            wait = _FETCH_BACKOFF_SEC * (2 ** (attempt - 1))
             print(f"[outlook] ical fetch failed: "
                   f"{type(exc).__name__}: {exc}"
-                  + (" — retrying in 0.5s" if attempt == 1 else ""),
+                  + (f" — retrying in {wait}s (attempt {attempt + 1}/3)"
+                     if attempt < 3 else " — gave up after 3 attempts"),
                   file=sys.stderr)
-            if attempt == 2:
+            if attempt == 3:
                 return (None,
                         "I couldn't reach the Outlook iCal feed just now, sir.")
-            time.sleep(0.5)
+            time.sleep(wait)
     if resp.status_code != 200:
         print(f"[outlook] ical HTTP {resp.status_code}: {resp.text[:200]}",
               file=sys.stderr)

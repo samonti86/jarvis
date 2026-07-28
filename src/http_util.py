@@ -46,6 +46,9 @@ import httpx
 # slower, without changing the shared default everyone else relies on.
 _HTTP_TIMEOUT_SEC = 10.0
 _RETRY_BACKOFF_SEC = 0.5
+# One try plus one retry. Unchanged default: every current caller here is an
+# interactive voice tool, and a user waiting in silence is the worse failure.
+_DEFAULT_ATTEMPTS = 2
 
 
 def http_get_with_retry(
@@ -55,10 +58,18 @@ def http_get_with_retry(
     tag: str,
     timeout: float = _HTTP_TIMEOUT_SEC,
     backoff: float = _RETRY_BACKOFF_SEC,
+    attempts: int = _DEFAULT_ATTEMPTS,
     follow_redirects: bool = True,
 ) -> httpx.Response | None:
-    """GET with one retry on transport errors. Returns None on final failure
+    """GET with retries on transport errors. Returns None on final failure
     or any non-2xx response. Caller checks for None.
+
+    `attempts` defaults to 2 — one try plus one retry, exactly the historical
+    behaviour — because EVERY caller of this helper is an interactive voice
+    tool (weather, news, sports, tmdb, games). A user is waiting in silence
+    during those, so patience is the wrong trade: latency is this project's
+    first constraint. Only a BACKGROUND poller, where nobody is waiting,
+    should raise it.
 
     `tag` is the short tool name used as the stderr log prefix (`[games]`,
     `[tmdb]`, ...). Keyword-only and required so every caller is identifiable
@@ -73,7 +84,7 @@ def http_get_with_retry(
     "retry transport errors only, never 4xx/5xx" contract is unaffected.
     """
     last_exc: Exception | None = None
-    for attempt in (1, 2):
+    for attempt in range(1, max(attempts, 1) + 1):
         try:
             r = httpx.get(url, params=params, timeout=timeout,
                           follow_redirects=follow_redirects)
@@ -84,16 +95,23 @@ def http_get_with_retry(
             print(f"[{tag}] HTTP {exc.response.status_code} on {url}", file=sys.stderr)
             return None
         except httpx.RequestError as exc:
-            # Timeout, connect error, DNS — worth one retry.
+            # Timeout, connect error, DNS — worth retrying.
             last_exc = exc
-            if attempt == 1:
-                print(
-                    f"[{tag}] {type(exc).__name__} on {url} — retrying in "
-                    f"{backoff}s",
-                    file=sys.stderr,
-                )
-                time.sleep(backoff)
-                continue
-            break
-    print(f"[{tag}] gave up after retry: {last_exc}", file=sys.stderr)
+            if attempt >= max(attempts, 1):
+                break
+            # EXPONENTIAL, not flat. A flat 0.5s is calibrated for a momentary
+            # hiccup; the failure this actually hits is a TLS handshake timeout,
+            # where the ATTEMPT ITSELF burns the full timeout before the backoff
+            # even starts. Sleeping a further 0.5s re-attempts inside the same
+            # blip. Growing the gap makes each retry sample a genuinely later
+            # moment. (Measured: 44 distinct outage bursts over 35 days, the
+            # largest 10 events across 1.6 minutes.)
+            wait = backoff * (2 ** (attempt - 1))
+            print(
+                f"[{tag}] {type(exc).__name__} on {url} — retrying in "
+                f"{wait}s (attempt {attempt + 1}/{attempts})",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+    print(f"[{tag}] gave up after {attempts} attempts: {last_exc}", file=sys.stderr)
     return None
