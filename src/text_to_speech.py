@@ -341,6 +341,19 @@ def speak_streaming(
         # a cross-space COM call that HARD-crashes the process (the
         # original M52 bug; cf. project_wasapi_thread_audio_owner — WASAPI is
         # thread-affine). The monitor now only sets interrupt_event.
+        # 2026-08-02 — measured, for whoever tries to tune the stutter here:
+        # sd.play forwards **kwargs to its OutputStream, but latency='high' is
+        # a NO-OP because sd.default.latency is already ['high','high'].
+        # Granted playback latency on this box: default 182.9 ms, 'high'
+        # 182.9 ms, explicit 0.4 -> 401.3 ms. Only an explicit NUMERIC value
+        # deepens the ring.
+        #
+        # That knob is deliberately NOT turned yet: a deeper output ring buys
+        # underrun immunity by delaying first audio, and the project's latency
+        # target is "first audible TTS chunk within 1 s". Trading a permanent
+        # ~200 ms against a stutter that only occurs while armed needs armed-
+        # mode underrun counts first — which _report_output_underflow below now
+        # provides for the first time.
         sd.play(samples, samplerate=sample_rate, blocking=False)
         # Hard cap well past the real duration so a misbehaving stream can't
         # hang the loop; normal exit is the .active check or the interrupt.
@@ -358,6 +371,8 @@ def speak_streaming(
             sd.stop()  # owner-thread cut: ends the sentence on a barge-in,
         except Exception as exc:  # or tidies the finished stream otherwise
             print(f"[tts] sd.stop failed: {exc}", file=sys.stderr)
+        # Report AFTER stop, so the flags cover the whole sentence's playback.
+        _report_output_underflow()
 
         # Stop the ticker promptly so it doesn't run past playback end. The
         # console's own decay logic settles bars back to flat from here.
@@ -427,6 +442,40 @@ def _compute_envelope(
     return np.clip(rms / 32768.0, 0.0, 1.0).astype(np.float32)
 
 
+# 2026-08-02: output-underrun visibility. Until now the stutter was INAUDIBLE
+# to the logs — sd.play's OutputStream has no status callback of ours, so every
+# underrun that the user actually heard left no trace, and the armed-mode input
+# overflow was the only measurable proxy for it. sd.get_status() exposes the
+# CallbackFlags accumulated over the last play(), which closes that gap with no
+# change to the thread-affine stream handling. Rate-limited for the same reason
+# the capture-side print is: a per-event log on a starved path feeds the stall.
+_UNDERFLOW_LOG_INTERVAL_SEC = 30.0
+_underflow_count = 0
+_underflow_last_log = 0.0
+
+
+def _report_output_underflow() -> None:
+    """Log (rate-limited) if the last sd.play underran its output buffer.
+
+    An underrun here IS the audible stutter, so this is the metric to watch
+    when tuning armed-mode CPU load. Never raises — diagnostics must not be
+    able to break playback."""
+    global _underflow_count, _underflow_last_log
+    try:
+        status = sd.get_status()
+    except Exception:
+        return  # no playback yet / backend without status — nothing to report
+    if not status.output_underflow:
+        return
+    _underflow_count += 1
+    now = time.monotonic()
+    if now - _underflow_last_log >= _UNDERFLOW_LOG_INTERVAL_SEC:
+        print(f"[tts] output underflow — audible stutter "
+              f"(x{_underflow_count} since last report)", file=sys.stderr)
+        _underflow_count = 0
+        _underflow_last_log = now
+
+
 def _run_envelope_ticker(
     envelope: np.ndarray,
     window_sec: float,
@@ -468,6 +517,7 @@ def _speak_edge_tts(text: str, voice: str) -> None:
         samples = samples.reshape(-1, decoded.nchannels)
 
     sd.play(samples, samplerate=decoded.sample_rate, blocking=True)
+    _report_output_underflow()
 
 
 # edge-tts talks to Microsoft's voice endpoint over a websocket; a transient

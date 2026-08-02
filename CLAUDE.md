@@ -307,6 +307,13 @@ maintainable. Follow them.
   unclean power loss is a realistic failure mode, not a theoretical one.
 - **A bug that a test would have caught earns a test.** The regression gate grew
   from a handful of suites to 51 exactly this way.
+- **Fix the failure mode, not the instance.** When a fix lands on a component,
+  find its peers and ask whether they share the defect. M99 cost a milestone to
+  a `latency="high"` + throttled-callback-log fix that was applied to the
+  acoustic capture stream and not to the main microphone — in the same commit
+  that touched both files. Symmetric components (the two capture streams, the
+  capture and playback rings, every origin in the tool gate) fail symmetrically;
+  a fix to one is a checklist for the rest, not a closed ticket.
 - **QoL consolidation cadence.** Periodically run a no-new-features hardening
   pass: verify the regression net is green, run read-only audits across the
   tree, then fix in *risk order* (correctness → latent → cosmetic), gating each
@@ -368,7 +375,7 @@ requirement: one intended user is not an English speaker.
 
 ## Current Status
 The project is feature-complete for its intended use and running in production
-as a supervised always-on process. ~98 milestones; the regression gate is at 54
+as a supervised always-on process. ~99 milestones; the regression gate is at 55
 suites and green.
 
 **Working:**
@@ -413,6 +420,24 @@ suites and green.
 - **Audio device selection.** Multi-device machines need `JARVIS_MIC_DEVICE`
   pinned; note that budget microphones often enumerate under a generic OEM
   string, so identify the device by unplug-diff rather than by guessing a name.
+- **Armed-mode audio starvation is OPEN, and now instrumented (M99).** While
+  armed, the capture stream drops samples: 565 PortAudio input overflows in a
+  69-minute armed window vs 1 in the 112 unarmed minutes before it. This is a
+  4-core box running openWakeWord, PANNs, YOLO and dlib concurrently, and a
+  single 90 ms YOLO call straddles the 80 ms audio callback budget — so the
+  cost is GIL starvation, not any one subsystem. It degrades speaker ID (0.82
+  unarmed → 0.64 armed) and is the likely source of the armed-only TTS stutter.
+  **Three candidate fixes were measured and rejected — do not re-attempt them
+  blind:** `latency="high"` is a no-op (`sd.default.latency` is already
+  `['high','high']`, and an explicit blocksize pins the ring regardless);
+  lowering capture resolution makes YOLO *slower*; bounding the capture queue
+  would gap the STT clip. The remaining real levers are less armed CPU work, or
+  an explicit numeric ring depth traded against the "first audio within 1 s"
+  target. **Take armed-mode numbers before choosing** — `[audio] status: input
+  overflow` (capture, with queue depth) and `[tts] output underflow` (playback;
+  this one is literally the audible stutter and was invisible until M99). Both
+  logs are rate-limited, because a per-event log inside a starved audio callback
+  feeds the stall it reports.
 - **Fully hands-free talk-over** (interrupting without the wake word) was built
   and shelved: once the assistant's own echo is cancelled, an energy gate fires
   on *any* residual sound, because it detects the presence of sound, not the

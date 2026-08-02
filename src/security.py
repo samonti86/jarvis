@@ -107,6 +107,23 @@ _MIN_PERSON_HEIGHT_RATIO = 0.30
 # Capture resolution — smaller than cameras.py's 1280×720 because YOLO
 # resizes to 640×640 internally anyway, so a 640×480 source saves the
 # downsample step + halves the JPEG-decode work.
+#
+# 2026-08-02 — MEASURED: the C920e IGNORES this request. cap.set() returns True
+# for both width and height, but the driver keeps delivering 1920×1080 (the log
+# has said "frame 1080px" since May; evidence JPEGs are ~330 KB). Setting
+# CAP_PROP_FOURCC=MJPG first — the usual DSHOW workaround — does not change it
+# either. Both were probed directly against the hardware.
+#
+# Do NOT "fix" this by downscaling after the read. Also measured, same session:
+#   YOLO @1080p  89.9 ms   |  YOLO @640×480  105.5 ms  (+ 9.7 ms for the resize)
+# ultralytics letterboxes to 640 regardless, so a smaller source buys nothing
+# and the resize is pure added cost. Only the JPEG encode gets cheaper (11.6 →
+# 2.0 ms), which happens once per challenge and is irrelevant to sustained load.
+#
+# The armed-mode audio starvation this was suspected of causing is NOT a
+# resolution problem — it is GIL burstiness (one 90 ms YOLO call straddles an
+# 80 ms audio callback slot). The fix is the deep capture/playback buffers in
+# audio.py + text_to_speech.py, not fewer pixels. Left as-is deliberately.
 _CAPTURE_WIDTH = 640
 _CAPTURE_HEIGHT = 480
 

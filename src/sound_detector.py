@@ -620,13 +620,22 @@ class SoundDetector:
                 blocksize=BLOCK_SAMPLES,
                 device=self._device,
                 callback=self._on_audio,
-                # 2026-07-02 QA: nothing downstream is latency-sensitive (the
-                # consumer assembles 2 s windows), but the sounddevice default
-                # requests the device's LOW-latency ring — a few tens of ms —
-                # which the armed-mode PANNs+YOLO bursts overflowed every ~3-4 s
-                # for the entire armed window (dropped samples = gap-corrupted
-                # detection windows). 'high' gives PortAudio a deep host buffer
-                # that absorbs those bursts; detection semantics are unchanged.
+                # 2026-07-02 QA: added to absorb the armed-mode PANNs+YOLO
+                # bursts that overflowed this stream every ~3-4 s.
+                #
+                # 2026-08-02 CORRECTION — this never worked, and the log said
+                # so: "[acoustic] stream status: input overflow (x14 since last
+                # report)" was still firing throughout the 2026-08-02 armed
+                # window, a month after this shipped. Measured cause:
+                # sd.default.latency is ALREADY ['high','high'], so passing
+                # 'high' changes nothing; and with an explicit blocksize the
+                # host buffer is pinned to one block regardless of the hint
+                # (granted latency identical across default/'low'/'high'/0.5).
+                #
+                # Kept only so the next reader finds this note instead of
+                # re-deriving the same placebo. The real cause is GIL
+                # starvation under armed CPU load — see the matching note in
+                # src/audio.py. Do not copy this line to a third stream.
                 latency="high",
             )
             self._stream.start()

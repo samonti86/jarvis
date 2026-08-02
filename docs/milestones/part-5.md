@@ -1350,3 +1350,150 @@ Decoration must never be able to take down an always-on assistant.
 `tests/reactor_test.py` (NEW, 26 assertions).
 
 **Gate:** 54/54 green.
+
+## M99 — the night Jarvis called the police on his owner, and three fixes that weren't — 2026-08-02
+
+Two symptoms, reported together: Jarvis stutters when armed — at the moment of
+arming and again when he detects someone — and disarming by voice had stopped
+working. One is now fixed. The other is now *understood and instrumented*, which
+is a smaller claim than this entry originally made, and the difference is the
+point of the milestone.
+
+**The log settled the diagnosis before any code was read.** Correlating
+`[audio] status: input overflow` against the armed window:
+
+| Window | Duration | Overflows |
+|---|---|---|
+| Unarmed 10:57 to 12:49 | 112 min | **1** |
+| Armed 12:49:54 to 13:58:53 | 69 min | **565** |
+
+The first lands three seconds after arming, the last one second before the
+process was killed. `input overflow` means PortAudio's capture ring filled
+before Python drained it — the callback missed its 80 ms budget. On a 4-core box
+running openWakeWord, PANNs, YOLO and dlib concurrently, a single 90 ms YOLO
+call straddles that budget. It is GIL starvation, and it degrades everything
+downstream of the microphone.
+
+### The bug that was fixed: authentication that fails exactly when it is needed
+
+At 13:58 the log shows the owner standing in front of the armed camera speaking
+the passphrase — and Jarvis answering *"Identity not confirmed. Authorities have
+been notified."*
+
+Degraded capture dropped the M69 speaker-ID score from 0.82 (unarmed, same day)
+to 0.64 and 0.67. The voice lock sits **in front of** the security handoff in
+`listen_loop`, so both passphrase attempts were dropped before
+`handle_transcript` ever ran. The challenge timed out, the deterrent fired, and
+with voice disarm unreachable the only way to stand down was to kill the process
+— which the watchdog recorded as `child exited cleanly (user quit)`.
+
+The code had anticipated this and been overtaken by configuration. The comment
+at the gate reads: *"the threshold sits below the user's rough-voice floor, so a
+degraded real-user clip still 'recognizes' and never reaches the drop."* True at
+the 0.60 default; false once `.env` raised it to 0.75.
+
+**The fix is narrow on purpose.** Moving the whole security block above the gate
+would let any unrecognized voice say "stand down" — a privilege regression
+dressed as a bug fix. `_challenge_overrides_voice_lock` re-opens the path *only*
+while a challenge or the post-timeout LOCKED state is live, on the reasoning
+that during a challenge **the passphrase is the credential** — that is what
+`try_authenticate` exists to check, with enrolled-face auth as the parallel
+second factor. Requiring a matching voiceprint *as well* was never a designed
+policy; it was an accident of ordering. It fails closed, and a gate-dropped turn
+now logs *what* was dropped — without that, the drop and the deterrent looked
+like unrelated events in the log, which is why this took a deep dive to find.
+
+### Three fixes that measurement killed
+
+Everything proposed for the stutter was probed against the hardware first. All
+three were wrong, and one of them was already in the tree.
+
+**1. `latency="high"` on the capture stream — a placebo, for the second time.**
+The plan was to copy a fix `sound_detector.py` received on 2026-07-03 (commit
+`6e8e227`) for this exact symptom, which that commit had applied to one of the
+two capture streams and not the other. Measured granted input latency on this
+box, MOVO MC1000 over MME:
+
+| blocksize | latency= | granted |
+|---|---|---|
+| 1280 | default / `low` / `high` / `0.5` | **80.0 ms in all four cases** |
+
+An explicit blocksize pins the host buffer to one block, so the hint is ignored
+— and `sd.default.latency` is *already* `['high','high']`, so the argument
+changes nothing anywhere. The July fix never did anything, and **the log had
+been saying so for a month**: `[acoustic] stream status: input overflow (x14)`
+was still firing on 2026-08-02. The asymmetry was real; the fix on the other
+side of it was imaginary. Both call sites now carry the measurement instead.
+
+**2. Capture resolution — the opposite of an optimization.** The code requests
+640x480 and the log has said `frame 1080px` since May, so every YOLO inference
+was running on 4.7x the intended pixels. Probed: `cap.set()` returns `True` on
+both axes and the C920e delivers 1920x1080 regardless; `CAP_PROP_FOURCC=MJPG`
+first — the standard DSHOW workaround — changes nothing. And downscaling after
+the read is *worse than useless*: **YOLO @1080p 89.9 ms vs @640x480 105.5 ms**,
+plus 9.7 ms for the resize, because ultralytics letterboxes to 640 either way.
+
+**3. Bounding the capture queue — a regression in disguise.** Drop-oldest is
+right for the acoustic path but wrong here: the STT path reads this queue to
+assemble one contiguous question clip, so dropping from it would inject the very
+gaps the milestone exists to remove. The overflow happens at the device ring
+*before* the queue anyway. Instrumented instead — max depth now rides along in
+the status line, distinguishing "callback was late" (depth ~0) from "consumer
+fell behind" (depth grows).
+
+### What actually shipped for the stutter
+
+Two things, both honest about their scope.
+
+*The self-amplifying diagnostic is gone.* The capture callback used to `print()`
+on **every** status — 565 timestamped file writes executed inside the 80 ms
+realtime callback, each one lengthening the very callback whose lateness caused
+the overflow. Now rate-limited with a count. This genuinely reduces callback
+work; it does not by itself fix the starvation.
+
+*The stutter is a metric for the first time.* TTS plays through `sd.play()`,
+whose `OutputStream` has no status callback of ours — so every underrun the user
+actually **heard** left no trace whatsoever, and the input overflow was only ever
+a proxy. `sd.get_status()` exposes the accumulated `CallbackFlags` after
+playback, so `[tts] output underflow` now appears in the log. Measured: playback
+ring is 182.9 ms by default and only an explicit *numeric* latency deepens it
+(`0.4` gives 401.3 ms). That knob is deliberately **not turned yet** — it buys
+underrun immunity by delaying first audio, against a standing "first audible
+chunk within 1 s" target, and trading a permanent ~200 ms for a stutter that only
+occurs while armed needs armed-mode counts first. Those counts now exist.
+
+### The lesson
+
+The project rule is *measure before you tune*, and this milestone is it turned on
+its own author. The pixel-count argument was arithmetic, not measurement, and it
+was wrong. The `latency="high"` argument was documentation, not measurement, and
+it was wrong — twice, a month apart, in the same codebase. The queue-bounding
+argument was pattern-matching from a sibling module, and it was wrong.
+
+What was *right* was the `.env` comment recording an earlier measurement (media
+false-matches up to 0.70), which is the only reason a threshold change didn't
+re-open a solved bug. **Prior measurements written down are what make later
+diagnosis cheap** — which is why every one of the negative results above is now
+a comment at the exact call site where someone would next be tempted.
+
+A corollary earned the engineering rules: **fix the failure mode, not the
+instance.** Symmetric components fail symmetrically; a fix to one is a checklist
+for the rest. That is true — it just turned out the item to copy was worthless,
+which only the measurement revealed.
+
+**Files:** `src/listen_loop.py` (`_challenge_overrides_voice_lock`, dropped-turn
+logging), `src/audio.py` (rate-limited callback print, queue-depth
+instrumentation, measured no-op documented), `src/text_to_speech.py` (underrun
+reporting, ring-depth measurements), `src/sound_detector.py` (correction: its
+2026-07-03 fix was a placebo), `src/security.py` (measured negative result on
+capture resolution), `docs/ENV_VARS.md` (the missing threshold-tuning note the
+table had been pointing at), `tests/challenge_voice_lock_test.py` (NEW, 7
+assertions pinning both edges of the security boundary).
+
+**Gate:** 55/55 green.
+
+**Open:** the armed-mode capture starvation itself. Root cause is understood
+(GIL contention, not resolution, not buffer depth); the remaining levers are
+less armed CPU work or an explicit numeric ring depth traded against the latency
+target. Next session should start from real `[audio] status` / `[tts] output
+underflow` counts from a live armed window.

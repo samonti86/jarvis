@@ -127,6 +127,34 @@ def _is_dismissal(text: str) -> bool:
     return False
 
 
+def _challenge_overrides_voice_lock(security_watcher: object) -> bool:
+    """True when a security challenge is live and must receive the transcript
+    even from a voice the speaker gate does not recognize.
+
+    The 2026-08-02 bug this exists to prevent: the M69 voice-lock sits in front
+    of the security handoff, so while armed — where CPU load degrades the
+    voiceprint (0.82 unarmed → 0.64 armed) — the user's spoken passphrase was
+    dropped before `handle_transcript` ever saw it, the challenge timed out, and
+    Jarvis fired the intruder deterrent at his own owner. During a challenge the
+    passphrase IS the credential; requiring a matching voiceprint on top of it
+    was never a designed policy.
+
+    Deliberately narrow: this covers ONLY the challenge/locked window Jarvis
+    himself opened. Arm/disarm intents stay behind the voice lock, so an
+    unrecognized voice still cannot say "stand down".
+
+    Fails CLOSED — a watcher that raises leaves the voice lock in force, since
+    face auth and the tray disarm remain as recovery paths."""
+    if security_watcher is None:
+        return False
+    try:
+        return bool(
+            security_watcher.is_in_challenge() or security_watcher.is_locked()
+        )
+    except Exception:  # noqa: BLE001 — a broken watcher must not break the loop
+        return False
+
+
 def listen_loop(
     cfg: Config,
     ui: JarvisUI,
@@ -718,8 +746,60 @@ def listen_loop(
                             print(f"[speaker] unrecognized voice "
                                   f"(best={_who.score:.2f})", file=sys.stderr)
                             if speaker_gate is not None and speaker_gate.is_set():
+                                # 2026-08-02: ONE exception to the voice-lock
+                                # drop — an active CHALLENGE / LOCKED state.
+                                #
+                                # Diagnosed from jarvis.log 2026-08-02 13:58: the
+                                # user stood in front of the camera speaking the
+                                # passphrase, scored 0.64 and 0.67 against a 0.75
+                                # threshold (armed-mode capture degradation — see
+                                # the measured notes in audio.py), and BOTH
+                                # attempts were dropped before security ever saw
+                                # them. The challenge timed out and Jarvis played
+                                # the "authorities have been notified" deterrent
+                                # at its own owner, who then had to kill the
+                                # process because voice disarm was unreachable.
+                                #
+                                # During a challenge the PASSPHRASE is the
+                                # credential — that is what try_authenticate
+                                # exists to check, with enrolled-face auth as the
+                                # parallel second factor. Requiring a matching
+                                # voiceprint *as well* was never a designed
+                                # policy; it is an accident of this gate sitting
+                                # in front of the security handoff, and it makes
+                                # authentication impossible exactly when armed
+                                # CPU load has degraded the voiceprint.
+                                #
+                                # Deliberately NARROW: arm/disarm intents stay
+                                # behind the gate (below), so a stranger still
+                                # cannot say "stand down" and walk in. This only
+                                # re-opens the path Jarvis himself just demanded
+                                # an answer on.
+                                if _challenge_overrides_voice_lock(security_watcher):
+                                    print("[speaker] unrecognized, but a security "
+                                          "challenge is active → routing to "
+                                          "passphrase auth", file=sys.stderr)
+                                    try:
+                                        security_watcher.handle_transcript(
+                                            transcript.text)
+                                    except Exception as exc:
+                                        print("[main] security.handle_transcript "
+                                              f"raised: {exc}", file=sys.stderr)
+                                    ui.add_user_text(transcript.text,
+                                                     transcript.language)
+                                    ui.set_state(State.IDLE)
+                                    followup = False
+                                    continue
+                                # 2026-08-02: log WHAT was dropped. Without this
+                                # a gate-dropped turn left no trace of its
+                                # content, so the challenge failure above was
+                                # invisible in the log — the drop and the
+                                # deterrent looked unrelated. Truncated to keep
+                                # background-media drops from bloating the log.
                                 print("[speaker] voice-lock active → ignoring "
-                                      "unrecognized turn", file=sys.stderr)
+                                      f"unrecognized turn: "
+                                      f"{transcript.text[:80]!r}",
+                                      file=sys.stderr)
                                 # 2026-07-02 QA: a gate-dropped turn is NOT the
                                 # user — count it toward the conversation-mode
                                 # idle exit, else background media (TV/YouTube)

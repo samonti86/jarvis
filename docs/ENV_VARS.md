@@ -86,6 +86,36 @@ Whisper — and intentionally not an env var.)*
 | `JARVIS_SPEAKER_GATE` | `""` (off) | config.py | Voice lock: drop confidently-unrecognized **voice** turns. Typed input is never gated. |
 | `JARVIS_TONE` | `1` (on) | config.py | Tonal awareness — reads volume/pace/pauses from the STT clip into a descriptive cue. `0` disables. |
 
+### Note — tuning `JARVIS_SPEAKER_THRESHOLD`
+
+Measured cosine bands on this setup (Resemblyzer d-vectors, MOVO MC1000):
+
+| Source | Observed score |
+|---|---|
+| Enrolled user, clean capture | 0.82 – 0.90 |
+| Enrolled user, rough/hoarse voice | ~0.66 |
+| Enrolled user, **degraded capture** (armed CPU load, 2026-08-02) | 0.64 – 0.67 |
+| Background media (YouTube/TV) | up to 0.70 |
+
+The user band and the media band **overlap once capture degrades**, which is why
+this knob has been moved twice. The lesson (2026-08-02): a wave of rejected
+real-user turns is not automatically a threshold problem. Armed turns scored
+0.64–0.67 while unarmed turns the same day scored 0.82 — the cause was the mic
+stream dropping samples under armed CPU load (565 PortAudio input overflows in
+69 armed minutes vs 1 in the preceding 112 unarmed minutes). **That capture
+problem is still open** — the obvious buffer-depth fix measured as a no-op (see
+the note in `src/audio.py`) — so armed-mode scores may still dip below this
+threshold. **Correlate a score with its capture conditions before touching this
+number**: with clean audio there is ~0.12 of headroom, and with degraded audio
+no threshold is simultaneously safe against media and fair to the user.
+
+Raising it toward 0.75 favours rejecting media; lowering it toward 0.68 favours
+never ignoring the real user. Security challenges no longer depend on this at
+all — `_challenge_overrides_voice_lock` (`src/listen_loop.py`) routes a
+challenge-time transcript to the passphrase comparator regardless of score, so a
+degraded voice can still authenticate. Arm/disarm intents *do* stay behind the
+gate, so a stranger cannot say "stand down".
+
 ## Proactive intelligence (M78.2 / M79 / M83)
 
 | Variable | Default | Read in | Purpose |
