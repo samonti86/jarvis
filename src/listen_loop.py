@@ -598,6 +598,11 @@ def listen_loop(
                         threshold=cfg.wake_word_threshold,
                         shutdown_event=ui.shutdown,
                         reset_event=reset_event,
+                        # 2026-08-02: armed-only listening heartbeat, so a
+                        # "he couldn't hear me while armed" report can be
+                        # settled from the log instead of guessed at.
+                        armed_probe=(security_watcher.is_armed
+                                     if security_watcher is not None else None),
                     )
                     if ui.shutdown.is_set():
                         break

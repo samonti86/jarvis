@@ -382,6 +382,12 @@ class SecurityWatcher:
         self._challenge_active = False
         self._challenge_started_at = 0.0
         self._cooldown_until = 0.0
+        # 2026-08-02: set when _enter_challenge declined to act PURELY because
+        # of the cooldown. The watcher re-tries once the cooldown expires, so a
+        # person who walked in during the dead window still gets challenged.
+        # Without it the EMPTY→PERSON latch below swallows them permanently
+        # (see the re-try block in _watch_loop for the full diagnosis).
+        self._presence_deferred_by_cooldown = False
         # M35-LOCKED: after a deterrent fires, instead of returning to
         # the normal ARMED+cooldown state, we enter LOCKED — _challenge_active
         # stays True (so listen_loop keeps diverting transcripts to the
@@ -663,6 +669,15 @@ class SecurityWatcher:
         self._stop.clear()
         self._armed_at = time.monotonic()
         self._person_present = False
+        # 2026-08-02: a fresh arm is a fresh security session — do not inherit
+        # the PREVIOUS arm's challenge cooldown. Observed live: authenticating
+        # at 14:59:17 set a 60 s cooldown, the user disarmed and re-armed at
+        # 14:59:43, and the motion at 15:00:16 was refused with "1.1s left" —
+        # stale state from an arming session that had already ended. The 30 s
+        # arm grace is the correct protection against immediately re-challenging
+        # someone who just armed and is still in frame; the cooldown is not.
+        self._cooldown_until = 0.0
+        self._presence_deferred_by_cooldown = False
         # M39: refresh the enrolled face encoding from disk at each arm.
         # Cheap (~1ms numpy load) and picks up re-enrollment without a
         # Jarvis restart. None on any failure (no path configured, no
@@ -737,8 +752,27 @@ class SecurityWatcher:
     def _watch_loop(self) -> None:
         """Daemon: poll camera, detect, enter challenge on person, fire
         deterrent on timeout. Exits when _stop fires."""
-        # First iteration: lazy-load the model. Failure auto-disarms with
-        # an announcement so the user isn't left thinking they're protected.
+        # 2026-08-02: wait for the arm announcements to finish BEFORE loading
+        # YOLO. The cooperative speech gate covered the watcher's steady-state
+        # poll and the dlib warm, but NOT the model load — so arming reliably
+        # stuttered its own confirmation. Caught by the M99 output-underflow
+        # metric on its first live outing: "[tts] output underflow" at 14:58:38,
+        # between "[security] YOLO loaded" (14:58:37) and "Standing watch, sir."
+        # (14:58:38), with the acoustic announce still playing over the top.
+        #
+        # Costs nothing operationally: the 30 s arm grace already suppresses
+        # detection for far longer than the few seconds of announcement, so the
+        # watcher is live well before it is allowed to act. Settle briefly first
+        # so the Announcer has actually picked the queued item up (it races our
+        # thread start), then wait — bounded, so a wedged announce degrades to
+        # "load anyway" rather than never arming.
+        if self._stop.wait(0.3):
+            return
+        if self._wait_for_quiet(timeout=20.0):
+            return
+
+        # Lazy-load the model. Failure auto-disarms with an announcement so the
+        # user isn't left thinking they're protected.
         if not self._ensure_model():
             return
 
@@ -834,6 +868,35 @@ class SecurityWatcher:
                     if not self._person_present:
                         # Transition empty → person.
                         self._person_present = True
+                        self._handle_person_first_seen(frame, now)
+                    elif (
+                        self._presence_deferred_by_cooldown
+                        and now >= self._cooldown_until
+                        and not self._challenge_active
+                        and not self._locked
+                    ):
+                        # 2026-08-02 — the cooldown/presence deadlock, observed
+                        # live. A person arriving DURING the cooldown is logged
+                        # and skipped, but _person_present has already latched
+                        # True. Since they are still standing there,
+                        # _person_last_seen keeps refreshing, so the 30 s
+                        # presence-clear never elapses and no second
+                        # EMPTY→PERSON transition ever occurs — the challenge
+                        # is suppressed for the WHOLE remaining armed window.
+                        # Missing the window by 1.1 s did exactly that on
+                        # 2026-08-02 15:00:16.
+                        #
+                        # This is a security hole, not just a UX wrinkle: an
+                        # intruder who walks in during a cooldown is never
+                        # challenged as long as they stay in frame. Re-try the
+                        # instant the cooldown lapses.
+                        #
+                        # Only fires for a presence we NEVER challenged: a
+                        # successfully authenticated person leaves the flag
+                        # False, so they are not re-challenged for standing at
+                        # their own desk.
+                        print("[security] cooldown lapsed and the person is "
+                              "still present — re-challenging", file=sys.stderr)
                         self._handle_person_first_seen(frame, now)
                     self._person_last_seen = now
                 else:
@@ -962,12 +1025,20 @@ class SecurityWatcher:
         """
         if now < self._cooldown_until:
             remaining = self._cooldown_until - now
+            # 2026-08-02: remember that we DECLINED, so the watcher can re-try
+            # when the cooldown lapses. The caller has already latched
+            # _person_present = True, so without this flag the person is never
+            # re-considered while they stay in frame — a 1.1 s miss observed
+            # live (2026-08-02 15:00:16) silenced the challenge for the entire
+            # remaining armed window.
+            self._presence_deferred_by_cooldown = True
             print(
                 f"[security] motion ({source}) but in cooldown "
-                f"({remaining:.1f}s left) — skipping alert",
+                f"({remaining:.1f}s left) — will re-check when it lapses",
                 file=sys.stderr,
             )
             return
+        self._presence_deferred_by_cooldown = False
 
         if not self._passphrase:
             print(f"[security] motion ({source}) — firing announcement (M34 mode)",

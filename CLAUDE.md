@@ -296,6 +296,11 @@ maintainable. Follow them.
   A gate is only as complete as (a) every *consumer* that opts into yielding and
   (b) every *producer* — every code path that speaks — that raises it. Both
   halves have been the source of a regression; both are now tested.
+  **And it must cover STARTUP, not just the steady state (M99.1).** The gate
+  covered the watcher's poll loop and the dlib warm but not the YOLO *model
+  load*, so arming stuttered its own confirmation every single time — the one
+  burst that is guaranteed to coincide with speech, because arming is what
+  triggers both. When adding a subsystem, gate its load path, not only its loop.
 - **Cost discipline.** Sonnet by default, Haiku for background jobs, prompt
   caching on the system prompt. Escalate deliberately, not reflexively.
 - **Latency over cleverness.** Short replies. This is voice.
@@ -375,7 +380,7 @@ requirement: one intended user is not an English speaker.
 
 ## Current Status
 The project is feature-complete for its intended use and running in production
-as a supervised always-on process. ~99 milestones; the regression gate is at 55
+as a supervised always-on process. ~99 milestones; the regression gate is at 56
 suites and green.
 
 **Working:**

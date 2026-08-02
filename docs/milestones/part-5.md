@@ -1497,3 +1497,122 @@ assertions pinning both edges of the security boundary).
 less armed CPU work or an explicit numeric ring depth traded against the latency
 target. Next session should start from real `[audio] status` / `[tts] output
 underflow` counts from a live armed window.
+
+## M99.1 — the first live armed run after M99: one fix confirmed, one freeze found — 2026-08-02
+
+M99 shipped instrumentation and asked for live armed numbers. They arrived the
+same afternoon, from two consecutive arm cycles, and settled three things.
+
+**The output-underflow metric paid for itself on its first outing.** M99 added
+`[tts] output underflow` precisely because the audible stutter had never left a
+trace in the log. First armed run after shipping it:
+
+```
+14:58:34  [acoustic] model loaded in 2.4s
+14:58:34  [announce] Acoustic awareness on, sir.      <- speech starts
+14:58:37  [security] YOLO loaded in 0.1s              <- ungated burst, mid-speech
+14:58:37  [security] watcher loop started
+14:58:38  [tts] output underflow — audible stutter    <- the stutter, in the log
+14:58:38  [announce] Standing watch, sir.
+```
+
+**The gate had a hole at exactly one moment: startup.** The cooperative speech
+gate covered the watcher's steady-state poll (2026-05-19) and the dlib warm
+(`_warm_face_auth` already waits for quiet), but never the *model load* — so
+`_ensure_model()` ran YOLO's load while the arm announcement was playing, every
+single time. That is why the stutter was reliably at the *start* of arming.
+`_watch_loop` now settles and waits for quiet before loading, the same shape
+`_warm_face_auth` has used since M34. It costs nothing operationally: the 30 s
+arm grace already suppresses detection far longer than the announcements last.
+
+**The M99 challenge fix was NOT exercised — be precise about what was validated.**
+Run 1 challenged at 14:59:05 and cleared by passphrase at 14:59:17. But the log
+shows `[speaker] recognized Saul (score=0.79)` on that turn — the *normal* path,
+not `_challenge_overrides_voice_lock`. The override never fired, because the
+score cleared the threshold on its own. So M99's security fix remains correct
+and tested, but **live-unproven**; it needs a challenge attempt whose score lands
+under the gate. Recording this rather than claiming a live validation the log
+does not support.
+
+### The freeze: a 1.1-second miss that silenced the whole armed window
+
+Run 2 is the interesting one. The user re-armed, walked back into frame, and
+Jarvis never challenged him — he reported it as a freeze.
+
+```
+14:59:17  CHALLENGE cleared by voice auth        <- sets a 60s cooldown
+14:59:43  [security] watcher loop started        <- RE-ARMED (new session)
+15:00:16  motion (local) but in cooldown (1.1s left) — skipping alert
+          ... nothing, for the rest of the armed window
+```
+
+Two independent defects compounded:
+
+**1. A fresh arm inherited the previous arm's cooldown.** `_cooldown_until` was
+set by the 14:59:17 authentication and never reset by `activate()`, so an arming
+session that began at 14:59:43 was still honouring state from one that had
+already ended. It missed by 1.1 seconds.
+
+**2. The presence latch swallowed him permanently.** `_watch_loop` sets
+`_person_present = True` *before* calling into `_enter_challenge`, which then
+early-returned on the cooldown. Because he was still standing there,
+`_person_last_seen` kept refreshing, the 30 s presence-clear never elapsed, and
+no second EMPTY→PERSON transition ever occurred. One skipped challenge became a
+permanently skipped challenge.
+
+**This is a security hole, not a UX wrinkle.** An intruder who walks in during a
+cooldown window is never challenged for as long as they stay in frame — and
+"stays in frame" is what an intruder does. Fixed by recording that a challenge
+was declined *purely* for cooldown (`_presence_deferred_by_cooldown`) and
+re-trying the moment it lapses. Deliberately scoped: an *authenticated* presence
+never sets the flag, so nobody gets re-challenged for sitting at their own desk
+60 s after identifying themselves. Both directions are pinned by
+`tests/challenge_cooldown_test.py`.
+
+### The symptom that could not be diagnosed, and what was done about it
+
+The third report — "voice detection wasn't working at all, couldn't hear
+anything, as if the mic wasn't working" — **could not be settled from the log,
+and no cause is being claimed.** What the log does establish: the mic stream was
+alive (the 10 s `READ_STALL_SEC` watchdog never fired), audio was being consumed
+(queue depth max 3 late in the window), and the wake word simply never scored
+≥ 0.8 for 104 seconds.
+
+What it cannot establish is *why*, because `wait_for_wake_word` only ever logged
+on a **successful** detection. Silence in the log is identical for "no audio
+reached us", "audio arrived but scored 0.31", and "nobody actually spoke" —
+three very different faults with three different fixes.
+
+So the loop now emits an armed-only, rate-limited heartbeat:
+`[wake_word] armed heartbeat: peak_score=0.31 (threshold 0.80) peak_amp=899`.
+A peak amplitude near zero means audio is not arriving (stream/device fault); a
+healthy amplitude with a low peak score means audio arrives but detection is
+failing (threshold, accent, or corruption from dropped samples). Armed-only
+because this is the tightest loop in the process and an unconditional heartbeat
+would add ~700 lines a day to answer a question that is live perhaps 1% of the
+time.
+
+One genuinely new number did surface: **queue depth peaked at 75 chunks — six
+seconds of backlogged audio — during the arm-time model loads.** That is the
+consumer being starved, not the device ring overflowing, and it is a plausible
+contributor to "deaf at the moment of arming". It is also the metric M99 added
+on a hunch that the queue was worth watching; it was.
+
+**Also excluded by measurement:** the two concurrent input streams on the same
+physical mic (16 kHz capture + 32 kHz acoustic, both MME, armed-only) are *not*
+the cause of the overflow. Probed with both streams open and no ML loaded:
+**0 overflows across 20 s, in all three phases.** Device contention alone is
+innocent; it takes the ML load. One more hypothesis retired rather than left
+hanging.
+
+**Files:** `src/security.py` (gate the model load; reset cooldown on arm;
+cooldown-deferred presence re-try), `src/wake_word.py` (armed listening
+heartbeat), `src/listen_loop.py` (thread `armed_probe` through),
+`tests/challenge_cooldown_test.py` (NEW, 8 assertions).
+
+**Gate:** 56/56 green.
+
+**Still open:** the armed-mode capture starvation, unchanged from M99 — root
+cause understood (GIL contention), levers known, still needs a decision on
+trading ring depth against the first-audio latency target. And the M99 challenge
+override remains live-unproven.

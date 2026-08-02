@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 
+import numpy as np
 import openwakeword
 from openwakeword.model import Model
 
@@ -50,11 +52,27 @@ def _get_model() -> Model:
     return _model
 
 
+# 2026-08-02: armed-mode listening heartbeat. The user reported Jarvis "couldn't
+# hear anything, as if the mic wasn't working" during an armed window — and the
+# log could not settle it, because this loop only EVER logs on a successful
+# detection. Silence in the log is identical for "no audio reached us", "audio
+# arrived but scored 0.3", and "nobody actually spoke". Those need very
+# different fixes, so the loop now periodically reports the peak score and peak
+# input amplitude it has seen.
+#
+# Armed-only and rate-limited by design: this is the tightest loop in the
+# process and runs all day, so an unconditional heartbeat would add ~700 lines
+# a day for the ~1% of the time the question is live. `armed_probe` keeps it to
+# exactly the window where the symptom occurs.
+_HEARTBEAT_SEC = 30.0
+
+
 def wait_for_wake_word(
     session: AudioSession,
     threshold: float = 0.5,
     shutdown_event: threading.Event | None = None,
     reset_event: threading.Event | None = None,
+    armed_probe: "callable | None" = None,
 ) -> None:
     """Block reading from `session` until the wake word scores >= threshold,
     or until shutdown_event / reset_event is set. Caller distinguishes the
@@ -62,10 +80,19 @@ def wait_for_wake_word(
 
     Audio chunks arrive every ~80ms, so the event checks at loop top mean
     quits and resets propagate within one chunk — fast enough to feel
-    instant, and slow enough that we don't burn CPU spinning."""
+    instant, and slow enough that we don't burn CPU spinning.
+
+    `armed_probe` (optional) — a zero-arg predicate, normally
+    SecurityWatcher.is_armed. While it returns True, log a periodic
+    peak-score/peak-amplitude heartbeat so an "is it deaf?" report can be
+    settled from the log. Never called if None; any failure is swallowed
+    (a diagnostic must not be able to break the listening loop)."""
     model = _get_model()
 
     print("[wake_word] listening for 'Hey Jarvis'...", file=sys.stderr)
+    peak_score = 0.0
+    peak_amp = 0
+    last_beat = time.monotonic()
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             return
@@ -77,6 +104,32 @@ def wait_for_wake_word(
         if score >= threshold:
             print(f"[wake_word] detected (score={score:.2f})", file=sys.stderr)
             return
+
+        if armed_probe is not None:
+            if score > peak_score:
+                peak_score = score
+            try:
+                amp = int(np.abs(chunk).max()) if chunk.size else 0
+            except Exception:  # noqa: BLE001 — diagnostics never break the loop
+                amp = 0
+            if amp > peak_amp:
+                peak_amp = amp
+            now = time.monotonic()
+            if now - last_beat >= _HEARTBEAT_SEC:
+                last_beat = now
+                try:
+                    armed = bool(armed_probe())
+                except Exception:  # noqa: BLE001
+                    armed = False
+                if armed:
+                    # peak_amp ~0 => no audio is reaching us (mic/stream fault).
+                    # peak_amp healthy + low peak_score => audio is arriving but
+                    # the wake word isn't firing (detection/threshold problem).
+                    print(f"[wake_word] armed heartbeat: peak_score="
+                          f"{peak_score:.2f} (threshold {threshold:.2f}) "
+                          f"peak_amp={peak_amp}", file=sys.stderr)
+                peak_score = 0.0
+                peak_amp = 0
 
 
 # M52 — barge-in. The monitor below runs openWakeWord *concurrently* with TTS
