@@ -380,7 +380,7 @@ requirement: one intended user is not an English speaker.
 
 ## Current Status
 The project is feature-complete for its intended use and running in production
-as a supervised always-on process. ~99 milestones; the regression gate is at 56
+as a supervised always-on process. ~100 milestones; the regression gate is at 57
 suites and green.
 
 **Working:**

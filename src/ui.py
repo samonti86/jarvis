@@ -99,6 +99,9 @@ class JarvisUI:
         # from main() AFTER the mic is released, so the new instance
         # doesn't race the old one for the audio device.
         self._relaunch_mode: str | None = None  # None | "normal" | "elevated"
+        # 2026-08-04: latch so a dead/not-yet-running Tk loop is reported ONCE
+        # rather than on every fan-out. See _console_call.
+        self._console_fanout_broken = False
 
     def set_on_reset(self, callback: Callable[[], None]) -> None:
         """Wire a reset callback. Called when the tray menu's Reset item fires."""
@@ -124,6 +127,42 @@ class JarvisUI:
         main.py only when JARVIS_REMOTE_TOKEN is set."""
         self._remote = remote
 
+    def _console_call(self, method: str, *args: object) -> None:
+        """Fan a facade event to the console window — DEFENSIVELY.
+
+        Same contract `_remote_call` has had all along, finally applied to the
+        other sink. The console is decoration; it must never be able to kill a
+        worker thread.
+
+        It did exactly that on 2026-07-30 19:17:59 (found by `self_review`):
+        a catch-up reminder was announced ~1 s after the Announcer thread
+        started, before Tk's mainloop was up. `console.add_system_text` ->
+        `root.after` raised RuntimeError("main thread is not in main loop"),
+        which escaped `_announcer_loop`'s per-item body and **killed the
+        Announcer thread**. Jarvis then ran for the next 12+ hours — overnight —
+        unable to speak a single proactive announcement: no reminders, no
+        weather alerts, no homelab alerts, and no SECURITY alerts. Nothing in
+        the log said so; it just went quiet.
+
+        Tk's threading errors surface as RuntimeError, and they are expected
+        during the startup and shutdown windows, so those are latched to a
+        single log line. Anything else is logged per-occurrence but still
+        swallowed — the project's "fail soft, never crash the loop" rule
+        applies most strongly to the thread whose job is to talk."""
+        try:
+            getattr(self.console, method)(*args)
+        except RuntimeError as exc:
+            # "main thread is not in main loop" / "application has been
+            # destroyed" — the mainloop isn't available. Expected at the edges
+            # of the process lifetime; log once so it can't spam a hot path.
+            if not self._console_fanout_broken:
+                self._console_fanout_broken = True
+                print(f"[ui] console fan-out unavailable ({method}: {exc}) — "
+                      f"continuing without the window; further occurrences "
+                      f"suppressed", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — decoration never breaks a caller
+            print(f"[ui] console fan-out {method} failed: {exc}", file=sys.stderr)
+
     def _remote_call(self, method: str, *args: object) -> None:
         """Fan a facade event to the remote, if any. Defensive by
         contract: a remote/network hiccup must NEVER break the console or
@@ -137,7 +176,7 @@ class JarvisUI:
             print(f"[remote] fan-out {method} failed: {exc}", file=sys.stderr)
 
     def set_state(self, state: State) -> None:
-        self.console.set_state(state)
+        self._console_call("set_state", state)
         t = self._tray
         if t is not None:
             t.set_state(state)
@@ -150,42 +189,42 @@ class JarvisUI:
         self._remote_call("update_state", state.name.lower())
 
     def add_user_text(self, text: str, language: str = "en") -> None:
-        self.console.add_user_text(text, language)
+        self._console_call("add_user_text", text, language)
         self._remote_call("push_line", "user", text)
 
     def add_jarvis_text(self, text: str) -> None:
-        self.console.add_jarvis_text(text)
+        self._console_call("add_jarvis_text", text)
         self._remote_call("push_line", "jarvis", text)
 
     def add_system_text(self, text: str) -> None:
-        self.console.add_system_text(text)
+        self._console_call("add_system_text", text)
         self._remote_call("push_line", "system", text)
 
     def set_amplitude(self, level: float) -> None:
         """Thread-safe pass-through to the console's waveform visualizer.
         Called ~30x/s by speak_streaming during TTS playback."""
-        self.console.set_amplitude(level)
+        self._console_call("set_amplitude", level)
 
     # ------------------------------------------------------------------
     # SRE status / telemetry — pass-throughs to the console's status bar.
     # ------------------------------------------------------------------
 
     def set_model_name(self, model: str) -> None:
-        self.console.set_model_name(model)
+        self._console_call("set_model_name", model)
 
     def set_integration(self, name: str, enabled: bool) -> None:
-        self.console.set_integration(name, enabled)
+        self._console_call("set_integration", name, enabled)
 
     def add_session_tokens(self, n: int) -> None:
-        self.console.add_session_tokens(n)
+        self._console_call("add_session_tokens", n)
 
     def add_telemetry_chip(self, text: str) -> None:
-        self.console.add_telemetry_chip(text)
+        self._console_call("add_telemetry_chip", text)
 
     def add_image_thumbnail(self, image_bytes: bytes, label: str) -> None:
         """Embed a thumbnail of an image into the transcript. Called when a
         vision tool (camera_snapshot, screen_snapshot) successfully captures."""
-        self.console.add_image_thumbnail(image_bytes, label)
+        self._console_call("add_image_thumbnail", image_bytes, label)
 
     # ------------------------------------------------------------------
     # Mute toggle. Voice INPUT and console text both keep working when
@@ -205,8 +244,8 @@ class JarvisUI:
             self.mute_event.set()
         else:
             self.mute_event.clear()
-        self.console.set_muted(muted)
-        self.console.add_system_text("muted — Jarvis will respond in text only." if muted
+        self._console_call("set_muted", muted)
+        self._console_call("add_system_text", "muted — Jarvis will respond in text only." if muted
                                      else "unmuted — Jarvis will speak again.")
 
     def _handle_toggle_mute(self) -> None:
@@ -231,8 +270,8 @@ class JarvisUI:
             self.engineer_event.set()
         else:
             self.engineer_event.clear()
-        self.console.set_engineer(on)
-        self.console.add_system_text(
+        self._console_call("set_engineer", on)
+        self._console_call("add_system_text", 
             "engineer mode on — deeper, structured replies + extended thinking."
             if on else "engineer mode off — back to concise."
         )
@@ -257,14 +296,14 @@ class JarvisUI:
         that dies on a Tk teardown would silently stop delivering finished
         research, which is the one failure this feature cannot have."""
         try:
-            self.console.set_research(active, pending)
+            self._console_call("set_research", active, pending)
         except Exception:  # noqa: BLE001 — a UI sink must never break the poller
             pass
 
     def set_armed_indicator(self, on: bool) -> None:
         """Thread-safe pass-through to the console's armed indicator.
         Called from SecurityWatcher's on_armed_changed callback."""
-        self.console.set_armed(on)
+        self._console_call("set_armed", on)
         # Fan to the phone so its ARMED badge tracks arming from ANY source
         # (phone control, tray toggle, or voice "activate security").
         self._remote_call("update_armed", bool(on))
@@ -273,7 +312,7 @@ class JarvisUI:
         """Thread-safe pass-through to the console's locked indicator
         (M35 follow-on). Called from SecurityWatcher's on_locked_changed
         callback when the post-deterrent LOCKED state enters/exits."""
-        self.console.set_locked(on)
+        self._console_call("set_locked", on)
 
     def set_on_security_toggle(
         self, on_activate: Callable[[], None], on_deactivate: Callable[[], None],
@@ -489,14 +528,14 @@ class JarvisUI:
             if autostart.is_enabled():
                 autostart.disable()
                 print("[autostart] disabled")
-                self.console.add_system_text("autostart disabled.")
+                self._console_call("add_system_text", "autostart disabled.")
             else:
                 autostart.enable()
                 print(f"[autostart] enabled ({autostart.shortcut_path()})")
-                self.console.add_system_text("autostart enabled.")
+                self._console_call("add_system_text", "autostart enabled.")
         except Exception as exc:
             print(f"[autostart] toggle failed: {exc}")
-            self.console.add_system_text(f"autostart toggle failed: {exc}")
+            self._console_call("add_system_text", f"autostart toggle failed: {exc}")
 
     def _handle_quit(self) -> None:
         # Fires on tray's thread when user clicks Quit. Coordinate teardown:
@@ -523,7 +562,7 @@ class JarvisUI:
         path; main() picks up the flag after worker.join() and fires the
         actual relaunch from there."""
         self._relaunch_mode = "normal"
-        self.console.add_system_text("restarting Jarvis…")
+        self._console_call("add_system_text", "restarting Jarvis…")
         print("[ui] restart requested — will relaunch after shutdown completes")
         self._handle_quit()
 
@@ -537,7 +576,7 @@ class JarvisUI:
         shutting down by then) but no new instance starts. That's the
         "occasional sudo" tradeoff documented in the M41 milestone."""
         self._relaunch_mode = "elevated"
-        self.console.add_system_text("restarting Jarvis (Administrator)…")
+        self._console_call("add_system_text", "restarting Jarvis (Administrator)…")
         print("[ui] elevated restart requested — UAC will fire after shutdown")
         self._handle_quit()
 
@@ -550,10 +589,10 @@ class JarvisUI:
             path = autostart.create_desktop_shortcut()
         except Exception as exc:
             print(f"[shortcut] create failed: {exc}")
-            self.console.add_system_text(f"desktop shortcut failed: {exc}")
+            self._console_call("add_system_text", f"desktop shortcut failed: {exc}")
             return
 
-        self.console.add_system_text(
+        self._console_call("add_system_text", 
             f"desktop shortcut created: {path.name}. "
             "Right-click it → Pin to taskbar."
         )

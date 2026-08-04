@@ -1616,3 +1616,114 @@ heartbeat), `src/listen_loop.py` (thread `armed_probe` through),
 cause understood (GIL contention), levers known, still needs a decision on
 trading ring depth against the first-audio latency target. And the M99 challenge
 override remains live-unproven.
+
+## M100 — the M94 follow-up verifies the fix, and finds a mute Jarvis — 2026-08-04
+
+M94 (2026-07-28) replaced the outlook iCal retry with one that "actually rides
+out the blip", and the session set a reminder to check it a week later against a
+recorded baseline. The reminder fired today. This is what a scheduled
+verification is *for*: the fix is confirmed, and the check surfaced an unrelated
+failure nobody had noticed.
+
+### M94: confirmed, on the metric that actually matters
+
+Baseline (2026-07-28): 12 iCal timeout occurrences across 6 sessions in 7 days;
+47 across 16 sessions in 30 days.
+
+| Window | Runs | Occurrences | **Terminal failures** |
+|---|---|---|---|
+| Baseline 7 d (07-21 → 07-27) | 16 | 12 | **3** |
+| Current 7 d (07-28 → 08-04) | 25 | 3 | **1** (and that one pre-dates the fix) |
+
+Raw occurrences fell 12 → 3 despite *more* runs in the window (16 → 25), so the
+per-run rate fell 0.75 → 0.12.
+
+But the raw count is the wrong metric, and it is worth being precise about why.
+M94 added **retries**, so a logged "ical fetch failed" is now often a transient
+blip that was subsequently ridden out — a line in the log, but no user-visible
+failure. What matters is whether the fetch ultimately *gave up*. The log
+distinguishes them: a retry carries a `— retrying in …` suffix, a terminal
+failure does not.
+
+The pattern change is unambiguous. Before:
+
+```
+08:47:01  ical fetch failed: ConnectTimeout — retrying in 0.5s
+08:47:17  ical fetch failed: ConnectTimeout            <- no suffix: GAVE UP
+```
+
+After:
+
+```
+2026-07-30 09:43:19  ReadTimeout    — retrying in 1.0s (attempt 2/3)
+2026-07-30 11:42:38  ConnectTimeout — retrying in 1.0s (attempt 2/3)
+2026-08-02 11:10:51  ConnectTimeout — retrying in 1.0s (attempt 2/3)
+```
+
+Every post-fix occurrence is a retry with **no terminal line following it** —
+the blip was absorbed. Since the fix landed there have been **zero** terminal
+iCal failures. The old 0.5 s single retry was simply too short for a TLS
+handshake timeout; 1.0 s with three attempts clears it.
+
+Verdict: M94 works. The remaining log lines are the fix doing its job, not the
+fault recurring — worth remembering before someone "fixes" the noise.
+
+### The thing the check actually found: Jarvis was mute for 12 hours
+
+`self_review` also reported *1 of 23 runs ended in an unhandled exception*.
+Tracing it:
+
+```
+19:17:06  --- Jarvis started ---
+19:17:58  [announcer] worker thread started
+19:17:58  [announce] Sir, a belated reminder — have your pre-workout meal.
+19:17:59  Exception in thread Announcer:
+            ui.add_system_text  ->  console.add_system_text  ->  root.after
+            RuntimeError: main thread is not in main loop
+2026-07-31 08:11:00  --- Jarvis started ---     <- the NEXT log line. 12h later.
+```
+
+The Announcer thread died **one second after starting**, on its very first item,
+and the process then ran until the next morning. For those twelve-plus hours —
+overnight, unattended — Jarvis could not speak a single proactive announcement:
+no reminders, no weather alerts, no homelab alerts, and **no security alerts**.
+Nothing in the log said so. It just went quiet.
+
+**Cause:** a catch-up reminder ("due while I was away") is queued at startup and
+announced immediately — before Tk's mainloop is up. `root.after` from a worker
+thread without a running mainloop raises `RuntimeError`. That call sat *outside*
+`_announcer_loop`'s `try`, so it escaped the `while` and killed the thread.
+
+**Two guards, because there were two independent defects.**
+
+*The UI facade was asymmetric.* `_remote_call` has always been defensive, with a
+docstring stating a remote hiccup "must NEVER break the console or the listen
+loop". The console sink — the *other* fan-out target — had no such guard, so
+every one of 24 display pass-throughs could propagate a Tk error into whichever
+worker thread happened to call it. The Announcer is merely the thread where that
+was most expensive. `_console_call` now mirrors `_remote_call`, with the Tk
+RuntimeError latched to a single log line so a dead window cannot spam a hot
+path. This is the M99 rule applied on purpose: **fix the failure mode, not the
+instance** — the Announcer was one caller of many.
+
+*The announcer loop trusted its callees.* The per-item body is now fully
+guarded, so no callee can kill the one thread by which Jarvis speaks unprompted.
+
+**A test caught a third thing during implementation.** With only the outer guard,
+a UI failure was swallowed but the announcement was still *lost* — the exception
+happened before `speak_streaming`. That inverts the priority: the console line is
+decoration, the speech is the product. The transcript call is now guarded
+separately so a dead window costs a log line and never an announcement. The
+assertion that failed is the one that made this visible; it is kept.
+
+**Files:** `src/ui.py` (`_console_call`; 24 pass-throughs routed through it),
+`src/bootstrap.py` (guarded per-item body; separately guarded transcript line),
+`tests/announcer_survives_test.py` (NEW, 6 assertions).
+
+**Gate:** 57/57 green.
+
+**The meta-point.** M93 built `self_review` to find faults that hide across
+sessions and restarts. M94 fixed the first thing it found. This entry is M94's
+scheduled verification — and it caught a *second*, more serious fault that no
+one had reported, because a silent Jarvis produces no symptom to report. The
+loop closes: build the instrument, schedule the check, read the output.

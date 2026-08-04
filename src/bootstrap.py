@@ -174,32 +174,55 @@ def build_announcer(ui: JarvisUI, pc_speaking: threading.Event) -> Announcer:
             if item is None or announce_stop.is_set():
                 break
             text, on_done, label = item
-            print(f"[announce] {text}")
-            ui.add_system_text(f"{label} {text}")
-            # Bracket actual playback so the watcher's cooperative gate
-            # (security._is_announcing) defers heavy bursts for exactly the
-            # window speech is on the wire. Cleared in finally so a TTS
-            # failure can't leave the watcher permanently throttled.
-            announce_speaking.set()
-            pc_speaking.set()  # suppress voice-capture self-hearing of the announce
+            # 2026-08-04: the ENTIRE per-item body is guarded. This thread is
+            # the only path by which Jarvis speaks unprompted — reminders,
+            # weather, homelab, and security alerts — so its death is silent
+            # and total. It died exactly once, on 2026-07-30 19:17:59, when
+            # ui.add_system_text (then unguarded, and outside the try below)
+            # hit Tk before the mainloop was up; Jarvis ran mute for the next
+            # 12+ hours overnight and nothing in the log said so. The UI facade
+            # is now defensive too (ui._console_call), which fixes that
+            # specific fault — this guard is the structural version: no callee
+            # gets to kill the announcer, whether or not it was polite.
             try:
-                speak_streaming(
-                    iter([text]),
-                    "en",
-                    on_first_audio=lambda: ui.set_state(State.SPEAKING),
-                    on_amplitude=ui.set_amplitude,
-                )
-            except Exception as exc:
-                print(f"[announce] TTS failed: {exc}", file=sys.stderr)
-            finally:
-                announce_speaking.clear()
-                pc_speaking.clear()
-                ui.set_state(State.IDLE)
-                if on_done is not None:
-                    try:
-                        on_done()
-                    except Exception as exc:
-                        print(f"[announce] on_done callback raised: {exc}", file=sys.stderr)
+                print(f"[announce] {text}")
+                # The console line is DECORATION; the speech is the product.
+                # Guarded separately so a dead window costs a transcript line,
+                # never the announcement itself — the regression test asserts
+                # that a UI failure still lets this item be spoken.
+                try:
+                    ui.add_system_text(f"{label} {text}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[announce] transcript line skipped ({exc})",
+                          file=sys.stderr)
+                # Bracket actual playback so the watcher's cooperative gate
+                # (security._is_announcing) defers heavy bursts for exactly the
+                # window speech is on the wire. Cleared in finally so a TTS
+                # failure can't leave the watcher permanently throttled.
+                announce_speaking.set()
+                pc_speaking.set()  # suppress voice-capture self-hearing
+                try:
+                    speak_streaming(
+                        iter([text]),
+                        "en",
+                        on_first_audio=lambda: ui.set_state(State.SPEAKING),
+                        on_amplitude=ui.set_amplitude,
+                    )
+                except Exception as exc:
+                    print(f"[announce] TTS failed: {exc}", file=sys.stderr)
+                finally:
+                    announce_speaking.clear()
+                    pc_speaking.clear()
+                    ui.set_state(State.IDLE)
+                    if on_done is not None:
+                        try:
+                            on_done()
+                        except Exception as exc:
+                            print(f"[announce] on_done callback raised: {exc}",
+                                  file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 — the loop MUST survive
+                print(f"[announce] item failed ({type(exc).__name__}: {exc}) — "
+                      f"announcer continuing", file=sys.stderr)
         print("[announcer] worker thread exited", file=sys.stderr)
 
     threading.Thread(

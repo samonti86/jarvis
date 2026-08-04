@@ -152,7 +152,7 @@ Written to be read by engineers. Dense on purpose.
 </details>
 
 <details>
-<summary><strong>Part 5 — 2026-05-19 to 2026-08-02 (39 entries)</strong></summary>
+<summary><strong>Part 5 — 2026-05-19 to 2026-08-04 (40 entries)</strong></summary>
 
 - [Debugging session follow-up — TTS retry on transient edge-tts flake](milestones/part-5.md#debugging-session-follow-up--tts-retry-on-transient-edge-tts-flake)
 - [Reminders → Discord push on fire](milestones/part-5.md#reminders--discord-push-on-fire)
@@ -193,6 +193,7 @@ Written to be read by engineers. Dense on purpose.
 - [M98 — the arc reactor becomes hardware — 2026-07-28](milestones/part-5.md#m98--the-arc-reactor-becomes-hardware--2026-07-28)
 - [M99 — the night Jarvis called the police on his owner, and three fixes that weren't — 2026-08-02](milestones/part-5.md#m99--the-night-jarvis-called-the-police-on-his-owner-and-three-fixes-that-werent--2026-08-02)
 - [M99.1 — the first live armed run after M99: one fix confirmed, one freeze found — 2026-08-02](milestones/part-5.md#m991--the-first-live-armed-run-after-m99-one-fix-confirmed-one-freeze-found--2026-08-02)
+- [M100 — the M94 follow-up verifies the fix, and finds a mute Jarvis — 2026-08-04](milestones/part-5.md#m100--the-m94-follow-up-verifies-the-fix-and-finds-a-mute-jarvis--2026-08-04)
 
 </details>
 
