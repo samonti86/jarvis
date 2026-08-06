@@ -259,10 +259,17 @@ maintainable. Follow them.
 
 - **Never commit `.env`.** `.gitignore` enforces it.
 - **Fail soft, never crash the loop.** Every optional component (TTS backend,
-  model download, a network tool, an MCP subprocess) must log and degrade. The
-  listening loop is the one thing that must not die. A component that cannot do
-  its job returns an honest "not configured" / "unavailable" string rather than
-  raising.
+  model download, a network tool, an MCP subprocess) must log and degrade. A
+  component that cannot do its job returns an honest "not configured" /
+  "unavailable" string rather than raising.
+  **TWO threads must not die, not one (M100).** The listening loop is the
+  obvious one. The other is the **Announcer** — the single path by which Jarvis
+  speaks unprompted, so its death takes reminders, weather, homelab *and every
+  security alert* with it, silently and with no symptom anyone can report. It
+  died once, one second into a session, on an unguarded Tk call, and the machine
+  ran mute for twelve hours overnight. Both loops now guard their whole per-item
+  body; the UI fan-out sinks (`_console_call`, `_remote_call`) are defensive on
+  both sides, because decoration must never be able to kill a worker thread.
 - **Least privilege, enforced server-side.** Remote origins (phone, Discord) get
   a *restricted tool surface*: no shell, no system control, no filesystem, no
   code execution, no self-update. This is enforced at **two gates** — the tool
